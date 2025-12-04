@@ -403,10 +403,8 @@ class EVRebalancer:
                     # Get the peer's fee to route to us
                     ppm = channel.get("fee_per_millionth", 0)
                     
-                    # Add some buffer for network routing (500 PPM average)
-                    network_fee_estimate = 500
-                    
-                    return ppm + network_fee_estimate
+                    # Add buffer for network routing (configurable via inbound_fee_estimate_ppm)
+                    return ppm + self.config.inbound_fee_estimate_ppm
             
         except Exception as e:
             self.plugin.log(f"Could not estimate inbound fee: {e}", level='debug')

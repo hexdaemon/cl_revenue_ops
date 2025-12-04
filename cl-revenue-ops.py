@@ -218,6 +218,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         try:
             plugin.log("Running scheduled flow analysis...")
             run_flow_analysis()
+            
+            # Run cleanup on each iteration (it's a fast DELETE query)
+            # Keeps history tables from growing unbounded over months
+            if database:
+                database.cleanup_old_data(days_to_keep=30)
+                
         except Exception as e:
             plugin.log(f"Error in flow analysis: {e}", level='error')
         # Reschedule for next interval

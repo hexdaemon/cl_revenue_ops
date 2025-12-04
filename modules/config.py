@@ -54,6 +54,7 @@ class Config:
     low_liquidity_threshold: float = 0.2  # Below 20% = low outbound
     high_liquidity_threshold: float = 0.8 # Above 80% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
+    inbound_fee_estimate_ppm: int = 500  # Network routing cost estimate in PPM
     
     # clboss integration
     clboss_enabled: bool = True    # Whether to use clboss-unmanage
