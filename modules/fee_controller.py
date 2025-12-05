@@ -433,6 +433,7 @@ class PIDFeeController:
         Calculate the economic floor fee for a channel.
         
         The floor ensures we never charge less than the channel costs us.
+        Uses live mempool fee rates when available for accurate cost estimation.
         
         floor_ppm = (open_cost + close_cost) / estimated_lifetime_volume * 1M
         
@@ -442,7 +443,82 @@ class PIDFeeController:
         Returns:
             Minimum fee in PPM
         """
+        # Try to get dynamic chain costs from feerates RPC
+        dynamic_costs = self._get_dynamic_chain_costs()
+        
+        if dynamic_costs:
+            open_cost = dynamic_costs.get("open_cost_sats", ChainCostDefaults.CHANNEL_OPEN_COST_SATS)
+            close_cost = dynamic_costs.get("close_cost_sats", ChainCostDefaults.CHANNEL_CLOSE_COST_SATS)
+            
+            total_chain_cost = open_cost + close_cost
+            estimated_lifetime_volume = ChainCostDefaults.DAILY_VOLUME_SATS * ChainCostDefaults.CHANNEL_LIFETIME_DAYS
+            
+            if estimated_lifetime_volume > 0:
+                floor_ppm = (total_chain_cost / estimated_lifetime_volume) * 1_000_000
+                return max(1, int(floor_ppm))
+        
+        # Fallback to static defaults
         return ChainCostDefaults.calculate_floor_ppm(capacity_sats)
+    
+    def _get_dynamic_chain_costs(self) -> Optional[Dict[str, int]]:
+        """
+        Get dynamic chain cost estimates from feerates RPC.
+        
+        Uses current mempool fee rates to estimate:
+        - Channel open cost (funding tx, ~140 vbytes typical)
+        - Channel close cost (commitment tx, ~200 vbytes typical)
+        
+        Returns:
+            Dict with open_cost_sats and close_cost_sats, or None if unavailable
+        """
+        try:
+            # Query feerates - prefer 'perkb' style for calculations
+            feerates = self.plugin.rpc.feerates(style="perkb")
+            
+            # Get a medium-term estimate (12 blocks ~2 hours)
+            perkb = feerates.get("perkb", {})
+            
+            # Try different fee rate estimates in order of preference
+            sat_per_kvb = (
+                perkb.get("opening") or      # CLN's channel opening estimate
+                perkb.get("mutual_close") or  # Mutual close estimate  
+                perkb.get("unilateral_close") or  # Unilateral close estimate
+                perkb.get("floor") or         # Minimum relay fee
+                1000                          # Fallback 1 sat/vbyte
+            )
+            
+            # Convert to sat/vbyte
+            sat_per_vbyte = sat_per_kvb / 1000
+            
+            # Typical transaction sizes (conservative estimates)
+            # Funding tx: ~140 vbytes (1 input, 2 outputs)
+            # Mutual close: ~170 vbytes  
+            # Unilateral close: ~200 vbytes (with anchor outputs)
+            FUNDING_TX_VBYTES = 140
+            CLOSE_TX_VBYTES = 200  # Use unilateral as worst case
+            
+            open_cost_sats = int(sat_per_vbyte * FUNDING_TX_VBYTES)
+            close_cost_sats = int(sat_per_vbyte * CLOSE_TX_VBYTES)
+            
+            # Sanity bounds
+            open_cost_sats = max(500, min(50000, open_cost_sats))
+            close_cost_sats = max(300, min(50000, close_cost_sats))
+            
+            self.plugin.log(
+                f"Dynamic chain costs: open={open_cost_sats} sats, close={close_cost_sats} sats "
+                f"(at {sat_per_vbyte:.1f} sat/vB)",
+                level='debug'
+            )
+            
+            return {
+                "open_cost_sats": open_cost_sats,
+                "close_cost_sats": close_cost_sats,
+                "sat_per_vbyte": sat_per_vbyte
+            }
+            
+        except Exception as e:
+            self.plugin.log(f"Error getting feerates: {e}", level='debug')
+            return None
     
     def _get_pid_state(self, channel_id: str) -> PIDState:
         """

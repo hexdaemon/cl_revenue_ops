@@ -373,6 +373,50 @@ class Database:
             return row['last_time']
         return None
     
+    def get_rebalance_history_by_peer(self, peer_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Get rebalance history for channels belonging to a specific peer.
+        
+        Joins rebalance_history with channel_states to find channels
+        for the given peer, then returns rebalances to those channels.
+        
+        Args:
+            peer_id: The peer node ID
+            limit: Maximum records to return
+            
+        Returns:
+            List of rebalance records with fee and amount info
+        """
+        conn = self._get_connection()
+        
+        # First get all channels for this peer
+        peer_channels = conn.execute("""
+            SELECT channel_id FROM channel_states WHERE peer_id = ?
+        """, (peer_id,)).fetchall()
+        
+        if not peer_channels:
+            return []
+        
+        channel_ids = [row['channel_id'] for row in peer_channels]
+        placeholders = ','.join('?' * len(channel_ids))
+        
+        # Get rebalances to these channels
+        rows = conn.execute(f"""
+            SELECT 
+                to_channel,
+                amount_sats,
+                actual_fee_sats as fee_paid_msat,
+                amount_sats * 1000 as amount_msat,
+                status,
+                timestamp
+            FROM rebalance_history 
+            WHERE to_channel IN ({placeholders})
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        """, (*channel_ids, limit)).fetchall()
+        
+        return [dict(row) for row in rows]
+    
     # =========================================================================
     # Forward Tracking Methods
     # =========================================================================

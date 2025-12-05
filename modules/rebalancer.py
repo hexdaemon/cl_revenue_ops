@@ -627,6 +627,7 @@ class EVRebalancer:
         1. Has enough excess liquidity
         2. Ideally a channel that's filling (sink state)
         3. Low fees (so we're not wasting good outbound)
+        4. Peer is connected and reliable
         
         Args:
             sources: List of source channel candidates
@@ -638,12 +639,25 @@ class EVRebalancer:
         best_source = None
         best_score = -1
         
+        # Get peer connection status for reliability scoring
+        peer_status = self._get_peer_connection_status()
+        
         for channel_id, info, outbound_ratio in sources:
             spendable = info.get("spendable_sats", 0)
+            peer_id = info.get("peer_id", "")
             
             # Check if has enough liquidity
             if spendable < amount_needed:
                 continue
+            
+            # Check if peer is connected - skip disconnected peers
+            if peer_id and peer_id in peer_status:
+                if not peer_status[peer_id].get("connected", False):
+                    self.plugin.log(
+                        f"Skipping source {channel_id}: peer not connected",
+                        level='debug'
+                    )
+                    continue
             
             # Calculate score (higher = better source)
             # Prefer channels with:
@@ -659,11 +673,52 @@ class EVRebalancer:
             if state and state.get("state") == "sink":
                 score += 20
             
+            # Bonus for reliable peers (connected with features)
+            if peer_id and peer_id in peer_status:
+                ps = peer_status[peer_id]
+                if ps.get("connected"):
+                    score += 10  # Connected bonus
+                    
+                    # Additional bonus for peers with more channels (established)
+                    num_channels = ps.get("num_channels", 1)
+                    score += min(5, num_channels)  # Up to +5 for multi-channel peers
+            
             if score > best_score:
                 best_score = score
                 best_source = (channel_id, info)
         
         return best_source
+    
+    def _get_peer_connection_status(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get connection status for all peers.
+        
+        Uses listpeers to check which peers are currently connected
+        and gather reliability metrics.
+        
+        Returns:
+            Dict mapping peer_id to status info
+        """
+        status = {}
+        
+        try:
+            result = self.plugin.rpc.listpeers()
+            
+            for peer in result.get("peers", []):
+                peer_id = peer.get("id", "")
+                if not peer_id:
+                    continue
+                
+                status[peer_id] = {
+                    "connected": peer.get("connected", False),
+                    "num_channels": len(peer.get("channels", [])),
+                    "features": peer.get("features", "")
+                }
+                
+        except Exception as e:
+            self.plugin.log(f"Error getting peer status: {e}", level='debug')
+        
+        return status
     
     def execute_rebalance(self, candidate: RebalanceCandidate) -> Dict[str, Any]:
         """

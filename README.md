@@ -224,7 +224,7 @@ Every 30 minutes (configurable), the plugin:
 1. Calculates error: `Error = TargetFlow - ActualFlow`
 2. Applies PID formula: `Output = Kp*error + Ki*integral + Kd*derivative`
 3. Adjusts fees based on output and liquidity level
-4. Enforces floor (economic minimum) and ceiling
+4. Enforces floor (using live `feerates` RPC for dynamic chain cost estimates) and ceiling
 
 ### EV Rebalancing
 
@@ -234,10 +234,12 @@ Every 15 minutes (configurable), the plugin:
 2. **CRITICAL: Checks flow state first**
    - If target is a **SINK**: SKIP (it fills itself for free!)
    - If target is a **SOURCE**: HIGH PRIORITY (keep it full!)
-3. Calculates spread: `Spread = OutboundFeePPM - InboundFeePPM`
-4. Computes max fee as PPM: `MaxPPM = (MaxBudget / Amount) * 1,000,000`
-5. Only executes if spread is positive and profit > minimum
-6. Calls circular via RPC with strict `maxppm` constraint
+3. Estimates inbound fees using `getroute` probes (or historical data, or peer gossip)
+4. Calculates spread: `Spread = OutboundFeePPM - InboundFeePPM`
+5. Computes max fee as PPM: `MaxPPM = (MaxBudget / Amount) * 1,000,000`
+6. Selects source channel considering peer connection status and reliability
+7. Only executes if spread is positive and profit > minimum
+8. Calls circular via RPC with strict `maxppm` constraint
 
 ### Circular Integration (Strategist & Driver Pattern)
 
@@ -270,9 +272,10 @@ After a successful rebalance, the plugin keeps the peer unmanaged from clboss's 
 The profitability analyzer tracks the economic performance of each channel:
 
 **Cost Tracking:**
-- Opening costs from **bookkeeper plugin** (actual on-chain fees paid)
+- Opening costs from **bookkeeper plugin** (`bkpr-listaccountevents` onchain_fee events)
+- Channel open timestamps from bookkeeper `channel_open` events (or estimated from SCID block height)
+- Rebalancing costs from bookkeeper invoice events with `fees_msat`
 - Falls back to database cache, then config estimate if bookkeeper unavailable
-- Accumulated rebalancing costs (fees paid to move liquidity in)
 
 **Revenue Tracking:**
 - Routing fees earned from forwards through the channel
