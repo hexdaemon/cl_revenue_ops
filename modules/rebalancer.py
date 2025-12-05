@@ -344,11 +344,13 @@ class EVRebalancer:
         # Estimated profit = expected income - max budget (worst case fee)
         expected_profit = expected_fee_income - max_budget_sats
         
-        # Check if profitable enough to bother
-        if max_budget_sats < self.config.rebalance_min_profit:
+        # CRITICAL: Check if expected profit meets minimum threshold
+        # This is the EV check - only rebalance if we expect to profit
+        if expected_profit < self.config.rebalance_min_profit:
             self.plugin.log(
-                f"Skipping {dest_channel}: spread too small "
-                f"(max_budget={max_budget_sats}sats < min={self.config.rebalance_min_profit}sats)"
+                f"Skipping {dest_channel}: not profitable enough "
+                f"(expected_profit={expected_profit}sats < min={self.config.rebalance_min_profit}sats, "
+                f"fee_income={expected_fee_income}sats, max_cost={max_budget_sats}sats)"
             )
             return None
         
