@@ -223,7 +223,7 @@ class ChannelProfitabilityAnalyzer:
             funding_txid = channel_info.get("funding_txid", "")
             
             # Get costs from database
-            costs = self._get_channel_costs(channel_id, peer_id, funding_txid)
+            costs = self._get_channel_costs(channel_id, peer_id, funding_txid, capacity)
             
             # Get revenue from routing history
             revenue = self._get_channel_revenue(channel_id)
@@ -658,7 +658,7 @@ class ChannelProfitabilityAnalyzer:
         return None
     
     def _get_channel_costs(self, channel_id: str, peer_id: str, 
-                          funding_txid: str) -> ChannelCosts:
+                          funding_txid: str, capacity_sats: int = 0) -> ChannelCosts:
         """
         Get costs for a channel from bookkeeper and database.
         
@@ -683,7 +683,9 @@ class ChannelProfitabilityAnalyzer:
             
             # Cache it in database for future lookups
             if open_cost is not None:
-                self.database.record_channel_open_cost(channel_id, open_cost)
+                self.database.record_channel_open_cost(
+                    channel_id, peer_id, open_cost, capacity_sats
+                )
         
         if open_cost is None:
             # Final fallback: use estimated cost from config
