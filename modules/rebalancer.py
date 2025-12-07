@@ -163,8 +163,31 @@ class EVRebalancer:
         # Track pending rebalances to avoid duplicates
         self._pending: Dict[str, int] = {}  # channel_id -> timestamp
         
+        # Track consecutive failures for adaptive backoff (Task 3)
+        # Maps channel_id -> failure_count
+        self._failure_counts: Dict[str, int] = {}
+        
+        # Cache our node ID (fetched lazily on first use)
+        self._our_node_id: Optional[str] = None
+        
         # Optional profitability analyzer - set via setter to avoid circular imports
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
+    
+    def _get_our_node_id(self) -> str:
+        """
+        Get our node ID, caching it for future use.
+        
+        Returns:
+            Our node's public key (hex string)
+        """
+        if self._our_node_id is None:
+            try:
+                info = self.plugin.rpc.getinfo()
+                self._our_node_id = info.get("id", "")
+            except Exception as e:
+                self.plugin.log(f"Error getting our node ID: {e}", level='error')
+                self._our_node_id = ""
+        return self._our_node_id
     
     def set_profitability_analyzer(self, analyzer: 'ChannelProfitabilityAnalyzer') -> None:
         """Set the profitability analyzer instance."""
@@ -223,8 +246,10 @@ class EVRebalancer:
         
         # Analyze each depleted channel for rebalance EV
         for dest_id, dest_info, dest_ratio in depleted_channels:
-            # Skip if recently attempted (in-memory pending check)
-            if self._is_pending(dest_id):
+            # ADAPTIVE FAILURE BACKOFF (Task 3)
+            # Use exponential backoff for channels that keep failing
+            # This prevents wasting resources on "stuck" channels
+            if self._is_pending_with_backoff(dest_id):
                 continue
             
             # Skip if within cooldown period from DB (successful rebalance cooldown)
@@ -340,9 +365,59 @@ class EVRebalancer:
         capacity = dest_info.get("capacity", 0)
         spendable = dest_info.get("spendable_sats", 0)
         
-        # Target: bring to 50% (balanced)
-        target_spendable = capacity // 2
+        # DYNAMIC LIQUIDITY TARGETING (Task 1)
+        # The old approach targeted 50% for all channels - the "Balance Fallacy".
+        # Different channel types need different target balances:
+        #
+        # SOURCE (Draining): Target 85% Outbound
+        #   - These channels drain quickly via routing
+        #   - Keep them full so they can keep earning
+        #   - We WANT outbound liquidity here
+        #
+        # BALANCED: Target 50% Outbound
+        #   - Standard equilibrium target
+        #   - Let natural flow determine direction
+        #
+        # SINK (Filling): Target 15% Outbound
+        #   - These channels fill themselves for free via routing
+        #   - Only rebalance if critically low
+        #   - Waste of fees to fill what will fill naturally
+        #
+        # Note: We already skip pure SINK channels above, but this handles
+        # channels that are "slightly sink" or transitioning states.
+        
+        if dest_flow_state == "source":
+            # SOURCE channels are money printers - keep them full (85% outbound)
+            target_ratio = 0.85
+            target_spendable = int(capacity * target_ratio)
+            self.plugin.log(
+                f"Channel {dest_channel[:12]}... is SOURCE: targeting {target_ratio:.0%} outbound",
+                level='debug'
+            )
+        elif dest_flow_state == "sink":
+            # SINK channels fill naturally - only rebalance if critical (15% outbound)
+            # Note: Pure sinks are already skipped above, this is for edge cases
+            target_ratio = 0.15
+            target_spendable = int(capacity * target_ratio)
+            self.plugin.log(
+                f"Channel {dest_channel[:12]}... is SINK: targeting only {target_ratio:.0%} outbound",
+                level='debug'
+            )
+        else:
+            # BALANCED or UNKNOWN - use standard 50% target
+            target_ratio = 0.50
+            target_spendable = capacity // 2
+        
         amount_needed = target_spendable - spendable
+        
+        # If we're already above target, no need to rebalance
+        if amount_needed <= 0:
+            self.plugin.log(
+                f"Skipping {dest_channel}: already at or above target "
+                f"({spendable} >= {target_spendable} sats, target={target_ratio:.0%})",
+                level='debug'
+            )
+            return None
         
         # Clamp to configured limits
         rebalance_amount = max(
@@ -556,11 +631,18 @@ class EVRebalancer:
         """
         Estimate the fee we'll pay to route to ourselves via a peer.
         
-        Uses multiple methods in priority order:
-        1. getroute probe - most accurate, shows actual network fees
-        2. Historical rebalance data - what we've actually paid before
-        3. Peer's channel fees to us - known from gossip
-        4. Fallback default - conservative estimate
+        REWRITTEN (Task 2): Last Hop Cost + Network Buffer
+        
+        The previous implementation was too generic and often underestimated costs.
+        The new approach explicitly looks at the peer's fee policy towards us
+        (the "last hop" cost) and adds a buffer for the rest of the network path.
+        
+        Priority Order:
+        1. Last Hop Cost: Peer's explicit fee to route TO US (from listchannels)
+           + Network buffer for hops 1 to N-1
+        2. Historical data: What we've actually paid before
+        3. getroute probe: Network fees (may not reflect actual circular path)
+        4. Fallback default: Conservative estimate
         
         Args:
             peer_id: The peer we're routing through
@@ -569,28 +651,101 @@ class EVRebalancer:
         Returns:
             Estimated inbound fee in PPM
         """
-        # Method 1: Use getroute to probe actual network fees
-        route_fee = self._get_route_fee_estimate(peer_id, amount_msat)
-        if route_fee is not None:
-            return route_fee
+        # Method 1 (PRIORITY): Get the LAST HOP COST explicitly
+        # This is the fee the peer charges to route TO US
+        # It's the most important component and was previously underweighted
+        last_hop_fee = self._get_last_hop_fee(peer_id)
+        if last_hop_fee is not None:
+            # Add network buffer for hops 1 to N-1
+            # The last hop is the peer -> us, but we also need to pay
+            # for the network path from us -> ... -> peer
+            network_buffer = self.config.inbound_fee_estimate_ppm
+            total_estimate = last_hop_fee + network_buffer
+            
+            self.plugin.log(
+                f"Inbound fee estimate for {peer_id[:12]}...: {total_estimate} PPM "
+                f"(last_hop={last_hop_fee}ppm + network_buffer={network_buffer}ppm)",
+                level='debug'
+            )
+            return total_estimate
         
         # Method 2: Check historical rebalance costs from database
         historical_fee = self._get_historical_inbound_fee(peer_id)
         if historical_fee is not None:
             return historical_fee
         
-        # Method 3: Get peer's direct channel fee to us from gossip
-        peer_fee = self._get_peer_fee_to_us(peer_id)
-        if peer_fee is not None:
-            # Add network routing buffer
-            return peer_fee + self.config.inbound_fee_estimate_ppm
+        # Method 3: Use getroute to probe actual network fees
+        # Note: This may not reflect actual circular path costs accurately
+        route_fee = self._get_route_fee_estimate(peer_id, amount_msat)
+        if route_fee is not None:
+            return route_fee
         
         # Method 4: Fallback default
         self.plugin.log(
             f"Using default inbound fee estimate for peer {peer_id[:12]}...",
             level='debug'
         )
-        return 1000  # Conservative default
+        return 1000  # Conservative default (1000 ppm)
+    
+    def _get_last_hop_fee(self, peer_id: str) -> Optional[int]:
+        """
+        Get the peer's fee to route TO US (the "last hop" cost).
+        
+        This queries listchannels for channels from the peer to us,
+        and extracts the fee_per_millionth they charge.
+        
+        This is the most accurate component of inbound fee estimation
+        because it's the explicit fee policy for the final hop.
+        
+        Args:
+            peer_id: Peer node ID
+            
+        Returns:
+            Peer's fee to us in PPM, or None if not found/not public
+        """
+        try:
+            our_node_id = self._get_our_node_id()
+            if not our_node_id:
+                return None
+            
+            # Query channels FROM peer (peer as source)
+            channels = self.plugin.rpc.listchannels(source=peer_id)
+            
+            for channel in channels.get("channels", []):
+                # Find the channel where destination is US
+                if channel.get("destination") == our_node_id:
+                    fee_ppm = channel.get("fee_per_millionth", 0)
+                    fee_base_msat = channel.get("base_fee_millisatoshi", 0)
+                    
+                    # For better accuracy with base fee:
+                    # Effective PPM = fee_ppm + (base_fee_msat * 1000 / amount_msat)
+                    # But for simplicity and since amounts vary, we use fee_ppm
+                    # plus a small adjustment for base fee
+                    if fee_base_msat > 0:
+                        # Add ~1 ppm per 1 msat base fee (rough adjustment)
+                        fee_ppm += fee_base_msat // 1000
+                    
+                    self.plugin.log(
+                        f"Last hop fee from {peer_id[:12]}... to us: {fee_ppm} PPM "
+                        f"(base={fee_base_msat}msat)",
+                        level='debug'
+                    )
+                    return fee_ppm
+            
+            # Channel not found - might be private or not announced
+            self.plugin.log(
+                f"No public channel from {peer_id[:12]}... to us found in gossip",
+                level='debug'
+            )
+            return None
+                    
+        except Exception as e:
+            self.plugin.log(
+                f"Error getting last hop fee for {peer_id[:12]}...: {e}",
+                level='debug'
+            )
+        
+        return None
     
     def _get_route_fee_estimate(self, peer_id: str, amount_msat: int) -> Optional[int]:
         """
@@ -699,41 +854,6 @@ class EVRebalancer:
         except Exception as e:
             self.plugin.log(
                 f"Error getting historical fees for {peer_id[:12]}...: {e}",
-                level='debug'
-            )
-        
-        return None
-    
-    def _get_peer_fee_to_us(self, peer_id: str) -> Optional[int]:
-        """
-        Get the peer's channel fee to route to us from gossip data.
-        
-        Args:
-            peer_id: Peer node ID
-            
-        Returns:
-            Peer's fee in PPM, or None if not found
-        """
-        try:
-            # Get our node ID
-            info = self.plugin.rpc.getinfo()
-            our_node_id = info.get("id", "")
-            
-            # Look for channels from peer to us in gossip
-            channels = self.plugin.rpc.listchannels(source=peer_id)
-            
-            for channel in channels.get("channels", []):
-                if channel.get("destination") == our_node_id:
-                    ppm = channel.get("fee_per_millionth", 0)
-                    self.plugin.log(
-                        f"Peer {peer_id[:12]}... fee to us: {ppm} PPM",
-                        level='debug'
-                    )
-                    return ppm
-                    
-        except Exception as e:
-            self.plugin.log(
-                f"Error getting peer fee for {peer_id[:12]}...: {e}",
                 level='debug'
             )
         
@@ -949,6 +1069,9 @@ class EVRebalancer:
                 result["actual_profit_sats"] = actual_profit
                 result["message"] = "Rebalance completed successfully"
                 
+                # ADAPTIVE BACKOFF: Reset failure count on success
+                self._failure_counts[candidate.to_channel] = 0
+                
                 # ANTI-THRASHING: Keep clboss unmanaged for extended period
                 # This prevents clboss from immediately "fixing" the balance
                 # we just paid fees to establish
@@ -964,11 +1087,30 @@ class EVRebalancer:
                     error_message=error
                 )
                 result["message"] = f"Rebalance failed: {error}"
-                self.plugin.log(f"Rebalance failed: {error}", level='warn')
+                
+                # ADAPTIVE BACKOFF: Increment failure count
+                current_failures = self._failure_counts.get(candidate.to_channel, 0)
+                self._failure_counts[candidate.to_channel] = current_failures + 1
+                
+                # Calculate next backoff time for logging
+                base_cooldown = 600  # 10 minutes base
+                next_cooldown = base_cooldown * (2 ** (current_failures + 1))
+                next_cooldown_mins = next_cooldown // 60
+                
+                self.plugin.log(
+                    f"Rebalance failed: {error}. "
+                    f"Failure #{current_failures + 1} for {candidate.to_channel[:12]}..., "
+                    f"next attempt backoff: {next_cooldown_mins} minutes",
+                    level='warn'
+                )
                 
         except Exception as e:
             result["message"] = f"Error: {str(e)}"
             self.plugin.log(f"Error executing rebalance: {e}", level='error')
+            
+            # ADAPTIVE BACKOFF: Also count exceptions as failures
+            current_failures = self._failure_counts.get(candidate.to_channel, 0)
+            self._failure_counts[candidate.to_channel] = current_failures + 1
         finally:
             # Clear pending status after some time
             pass
@@ -1256,9 +1398,67 @@ class EVRebalancer:
         
         return channels
     
+    def _is_pending_with_backoff(self, channel_id: str) -> bool:
+        """
+        Check if a channel should be skipped due to pending status or adaptive backoff.
+        
+        ADAPTIVE FAILURE BACKOFF (Task 3):
+        Instead of a fixed 10-minute cooldown, we use exponential backoff
+        based on consecutive failures:
+        
+        - 0 failures: 10 min base cooldown
+        - 1 failure:  20 min (10 * 2^1)
+        - 2 failures: 40 min (10 * 2^2)
+        - 3 failures: 80 min (10 * 2^3)
+        - etc.
+        
+        This prevents wasting resources on "stuck" channels that keep failing,
+        while still allowing quick retries for channels that just had a one-off issue.
+        
+        Args:
+            channel_id: Channel to check
+            
+        Returns:
+            True if channel should be skipped (pending or in backoff)
+        """
+        pending_time = self._pending.get(channel_id, 0)
+        if pending_time == 0:
+            return False
+        
+        # Calculate dynamic cooldown based on failure count
+        failure_count = self._failure_counts.get(channel_id, 0)
+        base_cooldown = 600  # 10 minutes base
+        
+        # Exponential backoff: base * 2^failures
+        # Cap at ~2.7 hours (10 min * 2^4 = 160 min) to prevent infinite waits
+        max_failures_for_backoff = 4
+        effective_failures = min(failure_count, max_failures_for_backoff)
+        cooldown = base_cooldown * (2 ** effective_failures)
+        
+        time_since_attempt = int(time.time()) - pending_time
+        
+        if time_since_attempt > cooldown:
+            # Cooldown expired, clear pending status
+            del self._pending[channel_id]
+            return False
+        
+        # Still in cooldown
+        if failure_count > 0:
+            remaining = cooldown - time_since_attempt
+            self.plugin.log(
+                f"Skipping {channel_id[:12]}...: in backoff after {failure_count} failures "
+                f"({remaining // 60} min remaining)",
+                level='debug'
+            )
+        
+        return True
+    
     def _is_pending(self, channel_id: str, timeout: int = 600) -> bool:
         """
         Check if a channel has a pending rebalance.
+        
+        DEPRECATED: Use _is_pending_with_backoff() for adaptive backoff.
+        Kept for backward compatibility.
         
         Args:
             channel_id: Channel to check
@@ -1277,3 +1477,25 @@ class EVRebalancer:
             return False
         
         return True
+    
+    def reset_failure_count(self, channel_id: str) -> None:
+        """
+        Manually reset the failure count for a channel.
+        
+        Use this when manually intervening or when conditions change.
+        
+        Args:
+            channel_id: Channel to reset
+        """
+        if channel_id in self._failure_counts:
+            del self._failure_counts[channel_id]
+            self.plugin.log(f"Reset failure count for {channel_id}")
+    
+    def get_failure_counts(self) -> Dict[str, int]:
+        """
+        Get all current failure counts.
+        
+        Returns:
+            Dict mapping channel_id to failure count
+        """
+        return dict(self._failure_counts)
