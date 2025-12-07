@@ -52,16 +52,21 @@ class HillClimbState:
     """
     State of the Hill Climbing fee optimizer for one channel.
     
+    UPDATED: Uses rate-based feedback (revenue per hour) instead of
+    absolute revenue to eliminate lag from using 7-day averages.
+    
     Attributes:
-        last_revenue_sats: Revenue observed in the previous period
+        last_revenue_rate: Revenue rate in sats/hour observed since last fee change
         last_fee_ppm: Fee that was in effect during last period
         trend_direction: Current search direction (1 = increasing, -1 = decreasing)
+        step_ppm: Current step size in PPM (subject to wiggle dampening)
         last_update: Timestamp of last update
         consecutive_same_direction: How many times we've moved in same direction
     """
-    last_revenue_sats: int = 0
+    last_revenue_rate: float = 0.0  # Revenue rate in sats/hour
     last_fee_ppm: int = 0
     trend_direction: int = 1  # 1 = try increasing fee, -1 = try decreasing
+    step_ppm: int = 50  # Current step size (decays on reversal)
     last_update: int = 0
     consecutive_same_direction: int = 0
 
@@ -118,11 +123,13 @@ class HillClimbingFeeController:
     """
     
     # Hill Climbing parameters
-    STEP_PPM = 50           # Fixed step size in PPM
+    STEP_PPM = 50           # Initial step size in PPM
     STEP_PERCENT = 0.05     # Percentage step size (5%)
-    MIN_STEP_PPM = 10       # Minimum step size
+    MIN_STEP_PPM = 10       # Minimum step size (floor for dampening)
     MAX_STEP_PPM = 200      # Maximum step size
     MAX_CONSECUTIVE = 5     # Max consecutive moves in same direction before reducing step
+    DAMPENING_FACTOR = 0.8  # Step size decay factor on direction reversal (wiggle dampening)
+    MIN_OBSERVATION_HOURS = 1.0  # Minimum hours between fee changes for valid signal
     
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
                  clboss_manager: ClbossManager,
@@ -201,12 +208,21 @@ class HillClimbingFeeController:
         """
         Adjust fee for a single channel using Hill Climbing optimization.
         
+        UPDATED: Rate-Based Feedback with Wiggle Dampening
+        
+        Key Changes from Previous Version:
+        1. Rate-Based Feedback: Uses volume since last fee change (not 7-day average)
+           to measure revenue per hour, eliminating lag in the feedback loop.
+        2. Wiggle Dampening: When the algorithm reverses direction (overshot peak),
+           the step size is decayed by DAMPENING_FACTOR to converge on the optimum.
+        
         Hill Climbing (Perturb & Observe) Algorithm:
-        1. Calculate current revenue (volume * fee)
-        2. Compare to last period's revenue
-        3. If revenue increased: continue in same direction
-        4. If revenue decreased: reverse direction
-        5. Apply step change in calculated direction
+        1. Get volume since last fee change via get_volume_since()
+        2. Calculate revenue RATE (sats/hour) = (volume * fee) / hours_elapsed
+        3. Compare current revenue rate to last period's rate
+        4. If rate increased: continue in same direction
+        5. If rate decreased: reverse direction AND reduce step (dampening)
+        6. Apply step change in calculated direction
         
         Args:
             channel_id: Channel to adjust
@@ -227,12 +243,34 @@ class HillClimbingFeeController:
         
         now = int(time.time())
         
-        # Calculate current revenue for this observation window
-        # Revenue = Volume * Fee_PPM / 1_000_000
-        daily_volume = state.get("sats_in", 0) + state.get("sats_out", 0)
-        daily_volume = daily_volume // max(self.config.flow_window_days, 1)
+        # RATE-BASED FEEDBACK: Get volume SINCE LAST FEE CHANGE (not 7-day average)
+        # This eliminates the lag from averaging that made the controller blind
+        volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
         
-        current_revenue_sats = (daily_volume * current_fee_ppm) // 1_000_000
+        # Calculate time elapsed since last update
+        if hc_state.last_update > 0:
+            hours_elapsed = (now - hc_state.last_update) / 3600.0
+        else:
+            hours_elapsed = 0.0
+        
+        # EDGE CASE: Protect against division by zero or very small time windows
+        # If the user manually triggers analysis twice instantly, hours_elapsed could be tiny
+        if hours_elapsed < self.MIN_OBSERVATION_HOURS:
+            self.plugin.log(
+                f"Skipping {channel_id[:12]}...: observation window too short "
+                f"({hours_elapsed:.2f}h < {self.MIN_OBSERVATION_HOURS}h minimum)",
+                level='debug'
+            )
+            # Still too early for valid signal - skip this channel for now
+            if hc_state.last_update > 0:  # Only skip if we have prior state
+                return None
+            # First run - continue with initialization
+            hours_elapsed = 1.0  # Use 1 hour as default for first run
+        
+        # Calculate REVENUE RATE (sats/hour) - this is our feedback signal
+        # Revenue = Volume * Fee_PPM / 1_000_000
+        revenue_sats = (volume_since_sats * current_fee_ppm) // 1_000_000
+        current_revenue_rate = revenue_sats / hours_elapsed if hours_elapsed > 0 else 0.0
         
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity", 1)
@@ -268,37 +306,51 @@ class HillClimbingFeeController:
         
         ceiling_ppm = self.config.max_fee_ppm
         
-        # HILL CLIMBING DECISION
-        # Compare current revenue to last observed revenue
-        revenue_change = current_revenue_sats - hc_state.last_revenue_sats
+        # HILL CLIMBING DECISION (Rate-Based)
+        # Compare current revenue RATE to last observed revenue RATE
+        rate_change = current_revenue_rate - hc_state.last_revenue_rate
         last_direction = hc_state.trend_direction
-        previous_revenue = hc_state.last_revenue_sats  # Save for logging before update
+        previous_rate = hc_state.last_revenue_rate  # Save for logging before update
         
-        # Determine new direction based on revenue change
+        # Get current step size from state (may have been dampened)
+        step_ppm = hc_state.step_ppm
+        if step_ppm <= 0:
+            step_ppm = self.STEP_PPM  # Reset to default if invalid
+        
+        # Determine new direction based on revenue rate change
         if hc_state.last_update == 0:
             # First run - start by trying to increase (default direction)
             new_direction = 1
             decision_reason = "initial"
-        elif revenue_change > 0:
-            # Revenue increased! Keep going in same direction
+            step_ppm = self.STEP_PPM  # Use default step for first run
+        elif rate_change > 0:
+            # Revenue rate increased! Keep going in same direction
             new_direction = last_direction
-            decision_reason = f"revenue_up_{revenue_change}sats_continue"
+            decision_reason = f"rate_up_{rate_change:.2f}sats_hr_continue"
             hc_state.consecutive_same_direction += 1
-        elif revenue_change < 0:
-            # Revenue decreased! Reverse direction
+        elif rate_change < 0:
+            # Revenue rate decreased! Reverse direction
             new_direction = -last_direction
-            decision_reason = f"revenue_down_{abs(revenue_change)}sats_reverse"
+            decision_reason = f"rate_down_{abs(rate_change):.2f}sats_hr_reverse"
             hc_state.consecutive_same_direction = 0
+            
+            # WIGGLE DAMPENING: Decay step size on reversal
+            # We overshot the peak, so reduce step to converge on optimal fee
+            step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
+            decision_reason += f"_dampen_step_to_{step_ppm}"
         else:
-            # Revenue unchanged - try opposite direction (we may be at optimum)
+            # Revenue rate unchanged - try opposite direction (we may be at optimum)
             new_direction = -last_direction
-            decision_reason = "revenue_flat_try_opposite"
+            decision_reason = "rate_flat_try_opposite"
             hc_state.consecutive_same_direction = 0
+            
+            # Also apply dampening when flat - we're close to optimum
+            step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
         
-        # Calculate step size
-        # Use percentage OR fixed PPM, whichever is larger
+        # Apply percentage-based minimum to step (ensures meaningful changes at high fees)
         step_percent = max(current_fee_ppm * self.STEP_PERCENT, self.MIN_STEP_PPM)
-        step_ppm = min(max(self.STEP_PPM, step_percent), self.MAX_STEP_PPM)
+        step_ppm = max(step_ppm, int(step_percent))
+        step_ppm = min(step_ppm, self.MAX_STEP_PPM)
         
         # Reduce step if we've been moving in same direction too long
         # (we might be oscillating around the optimum)
@@ -319,10 +371,11 @@ class HillClimbingFeeController:
         fee_change = abs(new_fee_ppm - current_fee_ppm)
         min_change = max(5, current_fee_ppm * 0.03)  # 3% or 5 ppm minimum
         
-        # Always update state for tracking
-        hc_state.last_revenue_sats = current_revenue_sats
+        # Always update state for tracking (with rate-based values)
+        hc_state.last_revenue_rate = current_revenue_rate
         hc_state.last_fee_ppm = current_fee_ppm
         hc_state.trend_direction = new_direction
+        hc_state.step_ppm = step_ppm  # Persist dampened step size
         hc_state.last_update = now
         self._save_hill_climb_state(channel_id, hc_state)
         
@@ -330,8 +383,8 @@ class HillClimbingFeeController:
             # Not enough change to warrant update
             return None
         
-        # Build reason string
-        reason = (f"HillClimb: revenue={current_revenue_sats}sats ({decision_reason}), "
+        # Build reason string (with rate info)
+        reason = (f"HillClimb: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}), "
                  f"direction={'up' if new_direction > 0 else 'down'}, "
                  f"step={step_ppm}ppm, state={flow_state}, "
                  f"liquidity={bucket} ({outbound_ratio:.0%}), "
@@ -348,13 +401,14 @@ class HillClimbingFeeController:
                 new_fee_ppm=new_fee_ppm,
                 reason=reason,
                 hill_climb_values={
-                    "current_revenue_sats": current_revenue_sats,
-                    "previous_revenue_sats": previous_revenue,
-                    "revenue_change": revenue_change,
+                    "current_revenue_rate": current_revenue_rate,
+                    "previous_revenue_rate": previous_rate,
+                    "rate_change": rate_change,
+                    "volume_since_sats": volume_since_sats,
+                    "hours_elapsed": hours_elapsed,
                     "direction": new_direction,
                     "step_ppm": step_ppm,
-                    "consecutive_same_direction": hc_state.consecutive_same_direction,
-                    "daily_volume": daily_volume
+                    "consecutive_same_direction": hc_state.consecutive_same_direction
                 }
             )
         
@@ -549,6 +603,7 @@ class HillClimbingFeeController:
         Get Hill Climbing state for a channel.
         
         Checks in-memory cache first, then database.
+        Updated to use rate-based feedback (last_revenue_rate) and step_ppm.
         """
         if channel_id in self._hill_climb_states:
             return self._hill_climb_states[channel_id]
@@ -557,9 +612,10 @@ class HillClimbingFeeController:
         db_state = self.database.get_fee_strategy_state(channel_id)
         
         hc_state = HillClimbState(
-            last_revenue_sats=db_state.get("last_revenue_sats", 0),
+            last_revenue_rate=db_state.get("last_revenue_rate", 0.0),
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
             trend_direction=db_state.get("trend_direction", 1),
+            step_ppm=db_state.get("step_ppm", self.STEP_PPM),
             last_update=db_state.get("last_update", 0),
             consecutive_same_direction=db_state.get("consecutive_same_direction", 0)
         )
@@ -572,9 +628,10 @@ class HillClimbingFeeController:
         self._hill_climb_states[channel_id] = state
         self.database.update_fee_strategy_state(
             channel_id=channel_id,
-            last_revenue_sats=state.last_revenue_sats,
+            last_revenue_rate=state.last_revenue_rate,
             last_fee_ppm=state.last_fee_ppm,
             trend_direction=state.trend_direction,
+            step_ppm=state.step_ppm,
             consecutive_same_direction=state.consecutive_same_direction
         )
     

@@ -100,12 +100,15 @@ class Database:
         
         # NEW: Fee Strategy State table for Hill Climbing controller
         # Stores state for the revenue-maximizing Perturb & Observe algorithm
+        # UPDATED: Uses last_revenue_rate (REAL) for rate-based feedback instead of
+        # last_revenue_sats to measure revenue per hour since last fee change.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS fee_strategy_state (
                 channel_id TEXT PRIMARY KEY,
-                last_revenue_sats INTEGER NOT NULL DEFAULT 0,
+                last_revenue_rate REAL NOT NULL DEFAULT 0.0,
                 last_fee_ppm INTEGER NOT NULL DEFAULT 0,
                 trend_direction INTEGER NOT NULL DEFAULT 1,  -- 1 = increase, -1 = decrease
+                step_ppm INTEGER NOT NULL DEFAULT 50,  -- Current step size (for dampening)
                 consecutive_same_direction INTEGER NOT NULL DEFAULT 0,
                 last_update INTEGER NOT NULL DEFAULT 0
             )
@@ -298,7 +301,7 @@ class Database:
             channel_id: Channel to get state for
             
         Returns:
-            Dict with last_revenue_sats, last_fee_ppm, trend_direction, etc.
+            Dict with last_revenue_rate, last_fee_ppm, trend_direction, step_ppm, etc.
         """
         conn = self._get_connection()
         row = conn.execute(
@@ -307,20 +310,30 @@ class Database:
         ).fetchone()
         
         if row:
-            return dict(row)
+            result = dict(row)
+            # Handle migration: old schema had last_revenue_sats (int)
+            # New schema uses last_revenue_rate (float)
+            if 'last_revenue_sats' in result and 'last_revenue_rate' not in result:
+                result['last_revenue_rate'] = float(result.get('last_revenue_sats', 0))
+            # Ensure step_ppm is present (may be missing from old schema)
+            if 'step_ppm' not in result:
+                result['step_ppm'] = 50  # Default step size
+            return result
         
         # Return default state if not found
         return {
             'channel_id': channel_id,
-            'last_revenue_sats': 0,
+            'last_revenue_rate': 0.0,  # Revenue rate in sats/hour
             'last_fee_ppm': 0,
             'trend_direction': 1,  # Default: try increasing fee
+            'step_ppm': 50,  # Default step size for dampening
             'consecutive_same_direction': 0,
             'last_update': 0
         }
     
-    def update_fee_strategy_state(self, channel_id: str, last_revenue_sats: int,
+    def update_fee_strategy_state(self, channel_id: str, last_revenue_rate: float,
                                    last_fee_ppm: int, trend_direction: int,
+                                   step_ppm: int = 50,
                                    consecutive_same_direction: int = 0):
         """
         Update Hill Climbing fee strategy state for a channel.
@@ -330,9 +343,10 @@ class Database:
         
         Args:
             channel_id: Channel to update
-            last_revenue_sats: Revenue observed in this period
+            last_revenue_rate: Revenue rate in sats/hour observed since last change
             last_fee_ppm: Fee that was in effect
             trend_direction: Direction we were moving (1 = up, -1 = down)
+            step_ppm: Current step size (for wiggle dampening)
             consecutive_same_direction: How many times we've moved same way
         """
         conn = self._get_connection()
@@ -340,11 +354,11 @@ class Database:
         
         conn.execute("""
             INSERT OR REPLACE INTO fee_strategy_state 
-            (channel_id, last_revenue_sats, last_fee_ppm, trend_direction,
-             consecutive_same_direction, last_update)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (channel_id, last_revenue_sats, last_fee_ppm, trend_direction,
-              consecutive_same_direction, now))
+            (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
+             step_ppm, consecutive_same_direction, last_update)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
+              step_ppm, consecutive_same_direction, now))
     
     def get_all_fee_strategy_states(self) -> List[Dict[str, Any]]:
         """Get fee strategy state for all channels."""
@@ -550,6 +564,32 @@ class Database:
             'in_msat': row_in['total_in_msat'] if row_in else 0,
             'out_msat': row_out['total_out_msat'] if row_out else 0
         }
+    
+    def get_volume_since(self, channel_id: str, timestamp: int) -> int:
+        """
+        Get total outbound volume for a channel since a specific timestamp.
+        
+        This is used by the Fee Controller to measure volume specifically
+        since the last fee change, rather than using a 7-day average which
+        dilutes the signal of recent fee changes.
+        
+        Args:
+            channel_id: Channel to get volume for
+            timestamp: Unix timestamp to start counting from
+            
+        Returns:
+            Total outbound volume in satoshis since the timestamp
+        """
+        conn = self._get_connection()
+        
+        row = conn.execute("""
+            SELECT COALESCE(SUM(out_msat), 0) as total_out_msat
+            FROM forwards
+            WHERE out_channel = ? AND timestamp > ?
+        """, (channel_id, timestamp)).fetchone()
+        
+        # Convert msat to sats
+        return (row['total_out_msat'] // 1000) if row else 0
     
     def get_daily_volume(self, days: int = 7) -> int:
         """Get total routing volume over the past N days."""

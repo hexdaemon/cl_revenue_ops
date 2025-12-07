@@ -75,8 +75,9 @@ class RebalanceCandidate:
         amount_msat: Amount in millisatoshis (for RPC calls)
         outbound_fee_ppm: Fee we charge on destination channel
         inbound_fee_ppm: Estimated fee to route to us
-        source_fee_ppm: Fee we charge on source channel (opportunity cost)
-        spread_ppm: Net spread after opportunity cost
+        source_fee_ppm: Fee we charge on source channel (raw opportunity cost)
+        weighted_opp_cost_ppm: Opportunity cost weighted by source turnover (7-day projection)
+        spread_ppm: Net spread after weighted opportunity cost
         max_budget_sats: Maximum fee we should pay
         max_budget_msat: Maximum fee in msat (for RPC calls)
         max_fee_ppm: Maximum fee as PPM (for circular)
@@ -95,6 +96,7 @@ class RebalanceCandidate:
     outbound_fee_ppm: int
     inbound_fee_ppm: int
     source_fee_ppm: int
+    weighted_opp_cost_ppm: int  # NEW: Weighted opportunity cost (source_fee * turnover_weight)
     spread_ppm: int
     max_budget_sats: int
     max_budget_msat: int
@@ -116,6 +118,7 @@ class RebalanceCandidate:
             "outbound_fee_ppm": self.outbound_fee_ppm,
             "inbound_fee_ppm": self.inbound_fee_ppm,
             "source_fee_ppm": self.source_fee_ppm,
+            "weighted_opp_cost_ppm": self.weighted_opp_cost_ppm,
             "spread_ppm": self.spread_ppm,
             "max_budget_sats": self.max_budget_sats,
             "max_budget_msat": self.max_budget_msat,
@@ -364,29 +367,54 @@ class EVRebalancer:
         
         source_id, source_info = best_source
         
-        # NEW: Get source channel fee (OPPORTUNITY COST)
+        # Get source channel fee (OPPORTUNITY COST)
         # By draining the source channel, we lose potential routing income
         source_fee_ppm = source_info.get("fee_ppm", 0)
         
-        # NEW: Calculate spread INCLUDING opportunity cost
-        # Old: spread = dest_fee - inbound_cost
-        # New: spread = dest_fee - inbound_cost - source_fee (opportunity cost)
+        # Calculate source turnover rate FIRST (needed for weighted opportunity cost)
+        source_capacity = source_info.get("capacity", 1)
+        source_turnover_rate = self._calculate_turnover_rate(source_id, source_capacity)
+        
+        # WEIGHTED OPPORTUNITY COST (Task 3A)
+        # The full source fee assumes 100% probability the liquidity would have been used.
+        # This is too aggressive for low-volume channels. Weight by actual turnover.
+        # 
+        # weighted_opp_cost = source_fee_ppm * min(1.0, source_turnover_rate * 7)
+        # 
+        # Example:
+        # - High turnover (20%/day * 7 = 140% -> capped at 100%): Full opportunity cost
+        # - Low turnover (2%/day * 7 = 14%): Only 14% of source fee counts as opp cost
         #
-        # Logic: We're "selling" liquidity from Source to "buy" liquidity on Dest.
-        # If Source earns 500ppm and Dest earns 600ppm with 200ppm rebalance cost:
-        #   Old spread: 600 - 200 = 400ppm (looks profitable!)
-        #   New spread: 600 - 200 - 500 = -100ppm (actually a loss!)
-        #
-        # We should only rebalance if the destination channel earns MORE than
-        # the source channel PLUS the rebalancing cost.
-        spread_ppm = outbound_fee_ppm - inbound_fee_ppm - source_fee_ppm
+        # This prevents over-penalizing low-volume source channels that might never
+        # route anyway, while still accounting for opportunity cost on active channels.
+        turnover_weight = min(1.0, source_turnover_rate * 7)  # 7-day projection
+        weighted_opp_cost = int(source_fee_ppm * turnover_weight)
+        
+        # Calculate spread INCLUDING WEIGHTED opportunity cost
+        # Old: spread = dest_fee - inbound_cost - full_source_fee
+        # New: spread = dest_fee - inbound_cost - weighted_opp_cost
+        spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
+        
+        # SANITY CHECK (Task 3B): Don't drain high-fee, active channels for low-fee destinations
+        # If the source channel earns MORE than the destination AND is active (>10% turnover),
+        # we should NOT drain it even if the spread math technically works.
+        # This prevents draining your best channels to feed mediocre ones.
+        if outbound_fee_ppm < source_fee_ppm and source_turnover_rate > 0.10:
+            self.plugin.log(
+                f"Skipping {dest_channel}: SANITY CHECK failed - "
+                f"source channel earns MORE ({source_fee_ppm}ppm) than dest ({outbound_fee_ppm}ppm) "
+                f"AND is highly active ({source_turnover_rate:.1%} daily turnover). "
+                f"Don't drain a money-printing channel to fill a lower-fee one!"
+            )
+            return None
         
         # CRITICAL: Check spread FIRST before any calculations
         # If spread is negative, we LOSE money on every rebalance!
         if spread_ppm <= 0:
             self.plugin.log(
-                f"Skipping {dest_channel}: negative/zero spread after opportunity cost "
-                f"(dest={outbound_fee_ppm}ppm - rebal={inbound_fee_ppm}ppm - source={source_fee_ppm}ppm = {spread_ppm}ppm)"
+                f"Skipping {dest_channel}: negative/zero spread after weighted opportunity cost "
+                f"(dest={outbound_fee_ppm}ppm - rebal={inbound_fee_ppm}ppm - "
+                f"weighted_opp={weighted_opp_cost}ppm [raw={source_fee_ppm}ppm * {turnover_weight:.0%}] = {spread_ppm}ppm)"
             )
             return None
         
@@ -414,12 +442,9 @@ class EVRebalancer:
             )
             return None
         
-        # NEW: Dynamic utilization based on actual channel turnover
-        # OLD: utilization_estimate = 0.10 (hardcoded 10% - unrealistic)
-        # NEW: Use actual turnover rate from channel history
+        # Dynamic utilization based on actual channel turnover
         dest_turnover_rate = self._calculate_turnover_rate(dest_channel, capacity)
-        source_capacity = source_info.get("capacity", 1)
-        source_turnover_rate = self._calculate_turnover_rate(source_id, source_capacity)
+        # Note: source_turnover_rate was already calculated above for weighted opportunity cost
         
         # Project expected routing based on actual turnover, scaled by cooldown period
         # If channel turns over 5% daily and cooldown is 24h, expect ~5% utilization
@@ -432,20 +457,25 @@ class EVRebalancer:
         expected_routing = rebalance_amount * expected_utilization
         expected_fee_income = (expected_routing * outbound_fee_ppm) // 1_000_000
         
-        # Calculate opportunity cost: what we'd lose by draining source
-        expected_source_loss = (expected_routing * source_fee_ppm) // 1_000_000
+        # Calculate WEIGHTED opportunity cost for expected profit calculation
+        # Use the same weighted approach as the spread calculation
+        expected_source_utilization = min(source_turnover_rate * cooldown_days, 1.0)
+        expected_source_utilization = max(expected_source_utilization, 0.05)
+        expected_source_routing = rebalance_amount * expected_source_utilization
+        expected_source_loss = (expected_source_routing * source_fee_ppm * turnover_weight) // 1_000_000
         
-        # Estimated profit = expected income - max budget - opportunity cost
+        # Estimated profit = expected income - max budget - weighted opportunity cost
         expected_profit = expected_fee_income - max_budget_sats - expected_source_loss
         
         # CRITICAL: Check if expected profit meets minimum threshold
         # This is the EV check - only rebalance if we expect to profit
         if expected_profit < self.config.rebalance_min_profit:
             self.plugin.log(
-                f"Skipping {dest_channel}: not profitable enough with opportunity cost "
+                f"Skipping {dest_channel}: not profitable enough with weighted opportunity cost "
                 f"(profit={expected_profit}sats < min={self.config.rebalance_min_profit}sats, "
                 f"fee_income={expected_fee_income}sats, rebal_cost={max_budget_sats}sats, "
-                f"opp_cost={expected_source_loss}sats, turnover={dest_turnover_rate:.2%})"
+                f"weighted_opp_cost={expected_source_loss}sats [weight={turnover_weight:.0%}], "
+                f"dest_turnover={dest_turnover_rate:.2%}, src_turnover={source_turnover_rate:.2%})"
             )
             return None
         
@@ -454,8 +484,8 @@ class EVRebalancer:
             self.plugin.log(
                 f"HIGH PRIORITY: {dest_channel} is a SOURCE (money printer). "
                 f"NetSpread={spread_ppm}ppm (dest={outbound_fee_ppm}ppm, "
-                f"rebal={inbound_fee_ppm}ppm, opp_cost={source_fee_ppm}ppm), "
-                f"turnover={dest_turnover_rate:.2%}"
+                f"rebal={inbound_fee_ppm}ppm, weighted_opp={weighted_opp_cost}ppm [raw={source_fee_ppm}ppm * {turnover_weight:.0%}]), "
+                f"dest_turnover={dest_turnover_rate:.2%}, src_turnover={source_turnover_rate:.2%}"
             )
         
         return RebalanceCandidate(
@@ -468,6 +498,7 @@ class EVRebalancer:
             outbound_fee_ppm=outbound_fee_ppm,
             inbound_fee_ppm=inbound_fee_ppm,
             source_fee_ppm=source_fee_ppm,
+            weighted_opp_cost_ppm=weighted_opp_cost,
             spread_ppm=spread_ppm,
             max_budget_sats=max_budget_sats,
             max_budget_msat=max_budget_msat,
@@ -1125,11 +1156,18 @@ class EVRebalancer:
         dest_turnover_rate = self._calculate_turnover_rate(to_channel, dest_capacity)
         source_turnover_rate = self._calculate_turnover_rate(from_channel, source_capacity)
         
-        # Calculate expected profit including opportunity cost
+        # Calculate weighted opportunity cost (same as automatic rebalance logic)
+        turnover_weight = min(1.0, source_turnover_rate * 7)  # 7-day projection
+        weighted_opp_cost = int(source_fee_ppm * turnover_weight)
+        
+        # Recalculate spread with weighted opportunity cost
+        spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
+        
+        # Calculate expected profit including weighted opportunity cost
         expected_utilization = max(dest_turnover_rate * (self.config.rebalance_cooldown_hours / 24.0), 0.05)
         expected_routing = amount_sats * expected_utilization
         expected_fee_income = (expected_routing * outbound_fee_ppm) // 1_000_000
-        expected_source_loss = (expected_routing * source_fee_ppm) // 1_000_000
+        expected_source_loss = (expected_routing * source_fee_ppm * turnover_weight) // 1_000_000
         expected_profit = expected_fee_income - max_fee_sats - expected_source_loss
         
         # Build candidate
@@ -1143,6 +1181,7 @@ class EVRebalancer:
             outbound_fee_ppm=outbound_fee_ppm,
             inbound_fee_ppm=inbound_fee_ppm,
             source_fee_ppm=source_fee_ppm,
+            weighted_opp_cost_ppm=weighted_opp_cost,
             spread_ppm=spread_ppm,
             max_budget_sats=max_fee_sats,
             max_budget_msat=max_budget_msat,
@@ -1154,11 +1193,12 @@ class EVRebalancer:
             source_turnover_rate=source_turnover_rate
         )
         
-        # Warn if negative EV (including opportunity cost)
+        # Warn if negative EV (including weighted opportunity cost)
         if spread_ppm <= 0:
             self.plugin.log(
-                f"Warning: Manual rebalance has negative EV after opportunity cost "
-                f"(dest={outbound_fee_ppm}ppm - rebal={inbound_fee_ppm}ppm - source={source_fee_ppm}ppm = {spread_ppm}ppm)",
+                f"Warning: Manual rebalance has negative EV after weighted opportunity cost "
+                f"(dest={outbound_fee_ppm}ppm - rebal={inbound_fee_ppm}ppm - "
+                f"weighted_opp={weighted_opp_cost}ppm [raw={source_fee_ppm}ppm * {turnover_weight:.0%}] = {spread_ppm}ppm)",
                 level='warn'
             )
         
