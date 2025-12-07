@@ -48,6 +48,7 @@ from modules.clboss_manager import ClbossManager
 from modules.config import Config
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
+from modules.metrics import PrometheusExporter, MetricNames, METRIC_HELP
 
 # Initialize the plugin
 plugin = Plugin()
@@ -60,6 +61,7 @@ clboss_manager: Optional[ClbossManager] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
+metrics_exporter: Optional[PrometheusExporter] = None
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
@@ -184,6 +186,18 @@ plugin.add_option(
     description='If true, weight volume by peer reputation (success rate) in fee decisions (default: true)'
 )
 
+plugin.add_option(
+    name='revenue-ops-enable-prometheus',
+    default='true',
+    description='If true, start Prometheus metrics exporter HTTP server (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-prometheus-port',
+    default='9800',
+    description='Port for Prometheus HTTP metrics server (default: 9800)'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -199,8 +213,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     2. Initialize the database
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
+    5. Start Prometheus metrics exporter (if enabled)
     """
-    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer
+    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, metrics_exporter
     
     plugin.log("Initializing cl-revenue-ops plugin...")
     
@@ -224,7 +239,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
         htlc_congestion_threshold=float(options['revenue-ops-htlc-congestion-threshold']),
-        enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true'
+        enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
+        enable_prometheus=options['revenue-ops-enable-prometheus'].lower() == 'true',
+        prometheus_port=int(options['revenue-ops-prometheus-port'])
     )
     
     plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "
@@ -235,16 +252,26 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     database = Database(config.db_path, plugin)
     database.initialize()
     
+    # Initialize Prometheus metrics exporter (Phase 2: Observability)
+    if config.enable_prometheus:
+        metrics_exporter = PrometheusExporter(port=config.prometheus_port, plugin=plugin)
+        if not metrics_exporter.start_server():
+            plugin.log("Prometheus metrics disabled due to server startup failure", level='warn')
+            metrics_exporter = None
+    else:
+        metrics_exporter = None
+        plugin.log("Prometheus metrics exporter disabled by configuration")
+    
     # Initialize clboss manager (handles unmanage commands)
     clboss_manager = ClbossManager(plugin, config)
     
-    # Initialize profitability analyzer
-    profitability_analyzer = ChannelProfitabilityAnalyzer(plugin, config, database)
+    # Initialize profitability analyzer (with metrics exporter)
+    profitability_analyzer = ChannelProfitabilityAnalyzer(plugin, config, database, metrics_exporter)
     
-    # Initialize analysis modules with profitability analyzer
+    # Initialize analysis modules with profitability analyzer and metrics exporter
     flow_analyzer = FlowAnalyzer(plugin, config, database)
-    fee_controller = PIDFeeController(plugin, config, database, clboss_manager, profitability_analyzer)
-    rebalancer = EVRebalancer(plugin, config, database, clboss_manager)
+    fee_controller = PIDFeeController(plugin, config, database, clboss_manager, profitability_analyzer, metrics_exporter)
+    rebalancer = EVRebalancer(plugin, config, database, clboss_manager, metrics_exporter)
     rebalancer.set_profitability_analyzer(profitability_analyzer)
     
     # Set up periodic background tasks using threading
@@ -266,6 +293,19 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 if database:
                     days_to_keep = max(8, config.flow_window_days + 1)
                     database.cleanup_old_data(days_to_keep=days_to_keep)
+                
+                # Export peer reputation metrics (Phase 2: Observability)
+                if metrics_exporter and database:
+                    update_peer_reputation_metrics()
+                
+                # Update last run timestamp for health monitoring
+                if metrics_exporter:
+                    metrics_exporter.set_gauge(
+                        MetricNames.SYSTEM_LAST_RUN_TIMESTAMP,
+                        int(time.time()),
+                        {"task": "flow"},
+                        METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
+                    )
                     
             except Exception as e:
                 plugin.log(f"Error in flow analysis: {e}", level='error')
@@ -279,6 +319,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             try:
                 plugin.log("Running scheduled fee adjustment...")
                 run_fee_adjustment()
+                
+                # Update last run timestamp for health monitoring
+                if metrics_exporter:
+                    metrics_exporter.set_gauge(
+                        MetricNames.SYSTEM_LAST_RUN_TIMESTAMP,
+                        int(time.time()),
+                        {"task": "fee"},
+                        METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
+                    )
             except Exception as e:
                 plugin.log(f"Error in fee adjustment: {e}", level='error')
             time.sleep(config.fee_interval)
@@ -291,6 +340,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             try:
                 plugin.log("Running scheduled rebalance check...")
                 run_rebalance_check()
+                
+                # Update last run timestamp for health monitoring
+                if metrics_exporter:
+                    metrics_exporter.set_gauge(
+                        MetricNames.SYSTEM_LAST_RUN_TIMESTAMP,
+                        int(time.time()),
+                        {"task": "rebalance"},
+                        METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
+                    )
             except Exception as e:
                 plugin.log(f"Error in rebalance check: {e}", level='error')
             time.sleep(config.rebalance_interval)
@@ -375,6 +433,60 @@ def run_rebalance_check():
     except Exception as e:
         plugin.log(f"Rebalance check failed: {e}", level='error')
         raise
+
+
+def update_peer_reputation_metrics():
+    """
+    Export peer reputation data to Prometheus metrics.
+    
+    Phase 2: Observability - Track peer reliability scores.
+    
+    Called periodically from flow_analysis_loop to update:
+    - cl_revenue_peer_reputation_score: Success rate (0.0 to 1.0)
+    - cl_revenue_peer_success_count: Total successful forwards
+    - cl_revenue_peer_failure_count: Total failed forwards
+    """
+    if database is None or metrics_exporter is None:
+        return
+    
+    try:
+        reputations = database.get_all_peer_reputations()
+        
+        for rep in reputations:
+            peer_id = rep.get('peer_id', '')
+            if not peer_id:
+                continue
+            
+            labels = {"peer_id": peer_id}
+            
+            # Gauge: Reputation score (success rate 0.0 to 1.0)
+            metrics_exporter.set_gauge(
+                MetricNames.PEER_REPUTATION_SCORE,
+                rep.get('score', 1.0),
+                labels,
+                METRIC_HELP.get(MetricNames.PEER_REPUTATION_SCORE, "")
+            )
+            
+            # Gauge: Success count (using gauge so we can see current state)
+            metrics_exporter.set_gauge(
+                MetricNames.PEER_SUCCESS_COUNT,
+                rep.get('successes', 0),
+                labels,
+                METRIC_HELP.get(MetricNames.PEER_SUCCESS_COUNT, "")
+            )
+            
+            # Gauge: Failure count
+            metrics_exporter.set_gauge(
+                MetricNames.PEER_FAILURE_COUNT,
+                rep.get('failures', 0),
+                labels,
+                METRIC_HELP.get(MetricNames.PEER_FAILURE_COUNT, "")
+            )
+        
+        plugin.log(f"Updated Prometheus metrics for {len(reputations)} peer reputations", level='debug')
+        
+    except Exception as e:
+        plugin.log(f"Error updating peer reputation metrics: {e}", level='warn')
 
 
 # =============================================================================

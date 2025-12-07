@@ -56,6 +56,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
+from .metrics import PrometheusExporter, MetricNames, METRIC_HELP
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -145,7 +146,8 @@ class EVRebalancer:
     """
     
     def __init__(self, plugin: Plugin, config: Config, database: Database,
-                 clboss_manager: ClbossManager):
+                 clboss_manager: ClbossManager,
+                 metrics_exporter: Optional[PrometheusExporter] = None):
         """
         Initialize the rebalancer.
         
@@ -154,11 +156,13 @@ class EVRebalancer:
             config: Configuration object
             database: Database instance
             clboss_manager: ClbossManager for handling overrides
+            metrics_exporter: Optional Prometheus metrics exporter for observability
         """
         self.plugin = plugin
         self.config = config
         self.database = database
         self.clboss = clboss_manager
+        self.metrics = metrics_exporter
         
         # Track pending rebalances to avoid duplicates
         self._pending: Dict[str, int] = {}  # channel_id -> timestamp
@@ -1096,6 +1100,26 @@ class EVRebalancer:
                 result["actual_profit_sats"] = actual_profit
                 result["message"] = "Rebalance completed successfully"
                 
+                # Export metrics on success (Phase 2: Observability)
+                if self.metrics:
+                    labels = {"channel_id": candidate.to_channel}
+                    
+                    # Counter: Total rebalancing cost (fees paid)
+                    self.metrics.inc_counter(
+                        MetricNames.REBALANCE_COST_TOTAL_SATS,
+                        actual_fee,
+                        labels,
+                        METRIC_HELP.get(MetricNames.REBALANCE_COST_TOTAL_SATS, "")
+                    )
+                    
+                    # Counter: Total volume moved via rebalancing
+                    self.metrics.inc_counter(
+                        MetricNames.REBALANCE_VOLUME_TOTAL_SATS,
+                        candidate.amount_sats,
+                        labels,
+                        METRIC_HELP.get(MetricNames.REBALANCE_VOLUME_TOTAL_SATS, "")
+                    )
+                
                 # ADAPTIVE BACKOFF: Reset failure count on success (persisted to DB)
                 self.database.reset_failure_count(candidate.to_channel)
                 
@@ -1114,6 +1138,16 @@ class EVRebalancer:
                     error_message=error
                 )
                 result["message"] = f"Rebalance failed: {error}"
+                
+                # Export failure metric (Phase 2: Observability)
+                if self.metrics:
+                    labels = {"channel_id": candidate.to_channel}
+                    self.metrics.inc_counter(
+                        MetricNames.REBALANCE_FAILURES_TOTAL,
+                        1,
+                        labels,
+                        METRIC_HELP.get(MetricNames.REBALANCE_FAILURES_TOTAL, "")
+                    )
                 
                 # ADAPTIVE BACKOFF: Increment failure count (persisted to DB)
                 new_failure_count = self.database.increment_failure_count(candidate.to_channel)

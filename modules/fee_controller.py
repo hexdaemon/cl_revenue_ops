@@ -42,6 +42,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
+from .metrics import PrometheusExporter, MetricNames, METRIC_HELP
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -134,7 +135,8 @@ class HillClimbingFeeController:
     
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
                  clboss_manager: ClbossManager,
-                 profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None):
+                 profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
+                 metrics_exporter: Optional[PrometheusExporter] = None):
         """
         Initialize the fee controller.
         
@@ -144,12 +146,14 @@ class HillClimbingFeeController:
             database: Database instance
             clboss_manager: ClbossManager for handling overrides
             profitability_analyzer: Optional profitability analyzer for ROI-based adjustments
+            metrics_exporter: Optional Prometheus metrics exporter for observability
         """
         self.plugin = plugin
         self.config = config
         self.database = database
         self.clboss = clboss_manager
         self.profitability = profitability_analyzer
+        self.metrics = metrics_exporter
         
         # In-memory cache of Hill Climbing states (also persisted to DB)
         self._hill_climb_states: Dict[str, HillClimbState] = {}
@@ -426,6 +430,26 @@ class HillClimbingFeeController:
         result = self.set_channel_fee(channel_id, new_fee_ppm, reason=reason)
         
         if result.get("success"):
+            # Export metrics (Phase 2: Observability)
+            if self.metrics:
+                labels = {"channel_id": channel_id, "peer_id": peer_id}
+                
+                # Gauge: Current fee PPM
+                self.metrics.set_gauge(
+                    MetricNames.CHANNEL_FEE_PPM,
+                    new_fee_ppm,
+                    labels,
+                    METRIC_HELP.get(MetricNames.CHANNEL_FEE_PPM, "")
+                )
+                
+                # Gauge: Revenue rate (sats/hour)
+                self.metrics.set_gauge(
+                    MetricNames.CHANNEL_REVENUE_RATE_SATS_HR,
+                    current_revenue_rate,
+                    labels,
+                    METRIC_HELP.get(MetricNames.CHANNEL_REVENUE_RATE_SATS_HR, "")
+                )
+            
             return FeeAdjustment(
                 channel_id=channel_id,
                 peer_id=peer_id,

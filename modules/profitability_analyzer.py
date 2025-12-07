@@ -18,11 +18,14 @@ Classifications:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 import time
 
 from pyln.client import Plugin
+
+if TYPE_CHECKING:
+    from .metrics import PrometheusExporter
 
 
 class ProfitabilityClass(Enum):
@@ -196,7 +199,8 @@ class ChannelProfitabilityAnalyzer:
     ZOMBIE_DAYS_INACTIVE = 30          # No routing for 30 days
     ZOMBIE_MIN_LOSS_SATS = 1000        # Minimum loss to be zombie
     
-    def __init__(self, plugin: Plugin, config, database):
+    def __init__(self, plugin: Plugin, config, database,
+                 metrics_exporter: Optional["PrometheusExporter"] = None):
         """
         Initialize the profitability analyzer.
         
@@ -204,10 +208,12 @@ class ChannelProfitabilityAnalyzer:
             plugin: Reference to the pyln Plugin
             config: Configuration object
             database: Database instance for persistence
+            metrics_exporter: Optional Prometheus metrics exporter for observability
         """
         self.plugin = plugin
         self.config = config
         self.database = database
+        self.metrics = metrics_exporter
         
         # Cache for profitability data (refreshed periodically)
         self._profitability_cache: Dict[str, ChannelProfitability] = {}
@@ -312,7 +318,7 @@ class ChannelProfitabilityAnalyzer:
                 roi, net_profit, last_routed, days_open
             )
             
-            return ChannelProfitability(
+            profitability = ChannelProfitability(
                 channel_id=channel_id,
                 peer_id=peer_id,
                 capacity_sats=capacity,
@@ -326,6 +332,30 @@ class ChannelProfitabilityAnalyzer:
                 days_open=days_open,
                 last_routed=last_routed
             )
+            
+            # Export metrics (Phase 2: Observability)
+            if self.metrics:
+                from .metrics import MetricNames, METRIC_HELP
+                
+                labels = {"channel_id": channel_id, "peer_id": peer_id}
+                
+                # Gauge: Marginal ROI percentage (operational profitability)
+                self.metrics.set_gauge(
+                    MetricNames.CHANNEL_MARGINAL_ROI_PERCENT,
+                    profitability.marginal_roi_percent,
+                    labels,
+                    METRIC_HELP.get(MetricNames.CHANNEL_MARGINAL_ROI_PERCENT, "")
+                )
+                
+                # Gauge: Channel capacity
+                self.metrics.set_gauge(
+                    MetricNames.CHANNEL_CAPACITY_SATS,
+                    capacity,
+                    labels,
+                    METRIC_HELP.get(MetricNames.CHANNEL_CAPACITY_SATS, "")
+                )
+            
+            return profitability
             
         except Exception as e:
             self.plugin.log(
