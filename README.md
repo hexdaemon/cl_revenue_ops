@@ -13,22 +13,30 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - Classifies channels as **SOURCE** (draining), **SINK** (filling), or **BALANCED**
 - Uses bookkeeper plugin data when available, falls back to listforwards
 
-### Module 2: PID Fee Controller
-- Implements a PID (Proportional-Integral-Derivative) controller for dynamic fee adjustment
-- Targets a configurable flow rate per channel
-- Includes liquidity-based fee multipliers
+### Module 2: Hill Climbing Fee Controller
+- Implements a **Hill Climbing (Perturb & Observe)** algorithm for revenue-maximizing fee adjustment
+- Uses **rate-based feedback** (revenue per hour) instead of absolute revenue for faster response
+- Actively seeks the optimal fee point where `Revenue = Volume × Fee` is maximized
+- Includes **wiggle dampening** to reduce step size on direction reversals
+- Applies profitability multipliers based on channel health
 - Never drops below economic floor (based on channel costs)
 
-### Module 3: EV-Based Rebalancing
+### Module 3: EV-Based Rebalancing with Opportunity Cost
 - Only executes rebalances with positive expected value
-- Calculates fee spread between outbound and inbound fees
+- **Weighted opportunity cost**: Accounts for lost revenue from draining source channel
+- **Dynamic liquidity targeting**: Different targets based on flow state
+  - SOURCE channels: Target 85% outbound (keep them full to earn)
+  - BALANCED channels: Target 50% outbound (standard equilibrium)
+  - SINK channels: Target 15% outbound (they fill themselves for free)
+- **Last Hop Cost estimation**: Uses `listchannels` to get peer's actual fee policy toward us
+- **Adaptive failure backoff**: Exponential cooldown for channels that keep failing
 - Sets strict budget caps to ensure profitability
 - Supports both circular and sling rebalancer plugins
 
 ### Module 4: Channel Profitability Analyzer
 - Tracks costs per channel (opening costs + rebalancing costs)
 - Tracks revenue per channel (routing fees earned)
-- Calculates ROI and net profit for each channel
+- Calculates **marginal ROI** to evaluate incremental investment value
 - Classifies channels as **PROFITABLE**, **BREAK_EVEN**, **UNDERWATER**, or **ZOMBIE**
 - Integrates with fee controller and rebalancer for smarter decisions
 
@@ -124,13 +132,12 @@ All options can be set via `lightning-cli` at startup or in your config file:
 | `revenue-ops-min-fee-ppm` | `10` | Minimum fee floor (PPM) |
 | `revenue-ops-max-fee-ppm` | `5000` | Maximum fee ceiling (PPM) |
 | `revenue-ops-rebalance-min-profit` | `10` | Min profit to trigger rebalance (sats) |
-| `revenue-ops-pid-kp` | `0.5` | PID Proportional gain |
-| `revenue-ops-pid-ki` | `0.1` | PID Integral gain |
-| `revenue-ops-pid-kd` | `0.05` | PID Derivative gain |
 | `revenue-ops-flow-window-days` | `7` | Days to analyze for flow |
 | `revenue-ops-clboss-enabled` | `true` | Enable clboss integration |
 | `revenue-ops-rebalancer` | `circular` | Rebalancer plugin (circular/sling) |
 | `revenue-ops-dry-run` | `false` | Log actions without executing |
+
+*Note: The Hill Climbing fee controller manages its own internal state (step size, direction) automatically. PID parameters are kept for legacy compatibility but are not actively used.*
 
 Example config:
 
@@ -232,14 +239,19 @@ Every hour (configurable), the plugin:
    - `FlowRatio < -0.5`: **SINK** (filling up) - These fill for free
    - Otherwise: **BALANCED**
 
-### PID Fee Control
+### Hill Climbing Fee Control
 
 Every 30 minutes (configurable), the plugin:
 
-1. Calculates error: `Error = TargetFlow - ActualFlow`
-2. Applies PID formula: `Output = Kp*error + Ki*integral + Kd*derivative`
-3. Adjusts fees based on output and liquidity level
-4. Enforces floor (economic minimum) and ceiling
+1. **Perturb**: Make a small fee change in a direction
+2. **Observe**: Measure the resulting revenue rate (sats/hour) since last change
+3. **Compare**: Is revenue rate better or worse than before?
+4. **Decide**:
+   - If Revenue Rate Increased: Keep going in the same direction
+   - If Revenue Rate Decreased: Reverse direction (we went too far)
+5. **Dampening**: On direction reversal, reduce step size (wiggle dampening)
+6. Enforce floor (economic minimum) and ceiling constraints
+7. Apply profitability multipliers based on channel health
 
 ### EV Rebalancing
 
@@ -249,10 +261,19 @@ Every 15 minutes (configurable), the plugin:
 2. **CRITICAL: Checks flow state first**
    - If target is a **SINK**: SKIP (it fills itself for free!)
    - If target is a **SOURCE**: HIGH PRIORITY (keep it full!)
-3. Calculates spread: `Spread = OutboundFeePPM - InboundFeePPM`
-4. Computes max fee as PPM: `MaxPPM = (MaxBudget / Amount) * 1,000,000`
-5. Only executes if spread is positive and profit > minimum
-6. Calls circular via RPC with strict `maxppm` constraint
+3. **Dynamic Liquidity Targeting**:
+   - SOURCE channels: Target 85% outbound
+   - BALANCED channels: Target 50% outbound
+   - SINK channels: Target 15% outbound (only if critically low)
+4. **Estimates inbound fee with Last Hop Cost**:
+   - Queries `listchannels(source=peer_id)` to get peer's fee policy toward us
+   - Adds network buffer for intermediate hops
+5. **Calculates weighted opportunity cost**:
+   - Source fee weighted by source channel's turnover rate
+   - Spread = OutboundFee - InboundFee - WeightedOpportunityCost
+6. Only executes if spread is positive and profit > minimum
+7. **Adaptive failure backoff**: Exponential cooldown for failing channels
+8. Calls circular via RPC with strict `maxppm` constraint
 
 ### Circular Integration (Strategist & Driver Pattern)
 
@@ -292,6 +313,11 @@ The profitability analyzer tracks the economic performance of each channel:
 
 **Revenue Tracking:**
 - Routing fees earned from forwards through the channel
+
+**Marginal ROI Analysis:**
+- Calculates marginal ROI: return on the *last* unit of investment
+- Helps decide whether additional investment (rebalancing) is worthwhile
+- Channels with declining marginal ROI may not benefit from more capital
 
 **Classification Logic:**
 - **PROFITABLE**: ROI > 0% and net profit > 0
