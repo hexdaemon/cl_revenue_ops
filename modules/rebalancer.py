@@ -1257,7 +1257,10 @@ class EVRebalancer:
         - Circular (Driver) handles the actual pathfinding and payment execution
         - We tell circular: "Move X sats from A to B, max Y ppm fee. Go."
         
-        Command: circular <outgoing_scid> <incoming_scid> <amount_msat> <maxppm> <retry_count>
+        Circular API signature:
+            circular <out_channel_id> <in_channel_id> <amount> [max_ppm] [max_hops] [timeout]
+        
+        Since circular only does one attempt per call, we wrap in a retry loop.
         
         Args:
             candidate: The RebalanceCandidate with pre-calculated constraints
@@ -1266,6 +1269,9 @@ class EVRebalancer:
             Result dict with success status and fee info
         """
         result = {"success": False}
+        max_attempts = 3
+        max_hops = 10
+        timeout_seconds = 60
         
         self.plugin.log(
             f"Executing circular rebalance: "
@@ -1276,40 +1282,64 @@ class EVRebalancer:
             f"MaxFee={candidate.max_budget_msat}msat ({candidate.max_fee_ppm}ppm)"
         )
         
-        try:
-            # Call circular via RPC with positional arguments:
-            # circular outscid inscid [amount] [maxppm] [attempts] [maxhops]
-            response = self.plugin.rpc.circular(
-                candidate.from_channel,      # outscid - outgoing channel
-                candidate.to_channel,        # inscid - incoming channel
-                candidate.amount_msat,       # amount in msat
-                candidate.max_fee_ppm,       # maxppm - THE CRITICAL CONSTRAINT
-                3,                           # attempts
-                10                           # maxhops
-            )
-            
-            # Analyze Result
-            if response.get("status") == "success":
-                fee_msat = response.get("fee", 0)
-                result["success"] = True
-                result["fee_sats"] = fee_msat // 1000
-                result["fee_msat"] = fee_msat
-                self.plugin.log(f"Circular SUCCESS. Paid: {fee_msat} msat")
-            else:
-                result["error"] = response.get("message", "Rebalance did not complete")
-                self.plugin.log(f"Circular FAILED: {result['error']}")
+        for attempt in range(max_attempts):
+            try:
+                # Call circular via RPC with positional arguments:
+                # circular out_channel_id in_channel_id amount [max_ppm] [max_hops] [timeout]
+                response = self.plugin.rpc.circular(
+                    candidate.from_channel,      # out_channel_id - outgoing channel
+                    candidate.to_channel,        # in_channel_id - incoming channel
+                    candidate.amount_msat,       # amount in msat
+                    candidate.max_fee_ppm,       # max_ppm - THE CRITICAL CONSTRAINT
+                    max_hops,                    # max_hops - maximum route length
+                    timeout_seconds              # timeout - seconds before giving up
+                )
                 
-        except RpcError as e:
-            # Handle case where circular is not installed or crashes
-            error_msg = str(e)
-            if "Unknown command" in error_msg:
-                result["error"] = "circular plugin not installed. Install from: https://github.com/giovannizotta/circular"
-            else:
-                result["error"] = f"RPC Error: {error_msg}"
-            self.plugin.log(f"RPC Error calling circular: {error_msg}", level='error')
-        except Exception as e:
-            result["error"] = str(e)
-            self.plugin.log(f"Error calling circular: {e}", level='error')
+                # Analyze Result
+                if response.get("status") == "success":
+                    fee_msat = response.get("fee", 0)
+                    result["success"] = True
+                    result["fee_sats"] = fee_msat // 1000
+                    result["fee_msat"] = fee_msat
+                    result["attempts"] = attempt + 1
+                    self.plugin.log(f"Circular SUCCESS on attempt {attempt + 1}. Paid: {fee_msat} msat")
+                    break  # Success - exit retry loop
+                else:
+                    error_msg = response.get("message", "Rebalance did not complete")
+                    result["error"] = error_msg
+                    self.plugin.log(
+                        f"Circular attempt {attempt + 1}/{max_attempts} FAILED: {error_msg}",
+                        level='debug'
+                    )
+                    # Continue to next attempt
+                    
+            except RpcError as e:
+                # Handle case where circular is not installed or crashes
+                error_msg = str(e)
+                if "Unknown command" in error_msg:
+                    result["error"] = "circular plugin not installed. Install from: https://github.com/giovannizotta/circular"
+                    self.plugin.log("Circular plugin not installed", level='error')
+                    break  # No point retrying if plugin isn't installed
+                else:
+                    result["error"] = f"RPC Error: {error_msg}"
+                    self.plugin.log(
+                        f"RPC Error on attempt {attempt + 1}/{max_attempts}: {error_msg}",
+                        level='debug' if attempt < max_attempts - 1 else 'error'
+                    )
+                    # Continue to next attempt for transient errors
+                    
+            except Exception as e:
+                result["error"] = str(e)
+                self.plugin.log(
+                    f"Error on attempt {attempt + 1}/{max_attempts}: {e}",
+                    level='debug' if attempt < max_attempts - 1 else 'error'
+                )
+                # Continue to next attempt
+        
+        if not result["success"]:
+            self.plugin.log(
+                f"Circular FAILED after {max_attempts} attempts: {result.get('error', 'Unknown error')}"
+            )
         
         return result
     
