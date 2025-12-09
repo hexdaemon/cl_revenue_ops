@@ -31,6 +31,7 @@ import os
 import sys
 import time
 import json
+import random
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -330,7 +331,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     
             except Exception as e:
                 plugin.log(f"Error in flow analysis: {e}", level='error')
-            time.sleep(config.flow_interval)
+            # Calculate +/- 20% jitter
+            jitter_seconds = int(config.flow_interval * 0.2)
+            sleep_time = config.flow_interval + random.randint(-jitter_seconds, jitter_seconds)
+            plugin.log(f"Flow analysis sleeping for {sleep_time}s")
+            time.sleep(sleep_time)
     
     def fee_adjustment_loop():
         """Background loop for fee adjustment."""
@@ -351,7 +356,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     )
             except Exception as e:
                 plugin.log(f"Error in fee adjustment: {e}", level='error')
-            time.sleep(config.fee_interval)
+            # Calculate +/- 20% jitter
+            jitter_seconds = int(config.fee_interval * 0.2)
+            sleep_time = config.fee_interval + random.randint(-jitter_seconds, jitter_seconds)
+            plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
+            time.sleep(sleep_time)
     
     def rebalance_check_loop():
         """Background loop for rebalance checks."""
@@ -372,7 +381,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     )
             except Exception as e:
                 plugin.log(f"Error in rebalance check: {e}", level='error')
-            time.sleep(config.rebalance_interval)
+            # Calculate +/- 20% jitter
+            jitter_seconds = int(config.rebalance_interval * 0.2)
+            sleep_time = config.rebalance_interval + random.randint(-jitter_seconds, jitter_seconds)
+            plugin.log(f"Rebalance check sleeping for {sleep_time}s")
+            time.sleep(sleep_time)
     
     # Start background threads (daemon=True so they don't block shutdown)
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
