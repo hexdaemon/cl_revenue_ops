@@ -192,6 +192,10 @@ class HillClimbingFeeController:
         # Get current channel info for capacity and balance
         channels = self._get_channels_info()
         
+        # OPTIMIZATION: Hoist feerates RPC call outside the loop
+        # This reduces N RPC calls to 1 per adjust_all_fees cycle
+        chain_costs = self._get_dynamic_chain_costs()
+        
         for state in channel_states:
             channel_id = state.get("channel_id")
             peer_id = state.get("peer_id")
@@ -209,7 +213,8 @@ class HillClimbingFeeController:
                     channel_id=channel_id,
                     peer_id=peer_id,
                     state=state,
-                    channel_info=channel_info
+                    channel_info=channel_info,
+                    chain_costs=chain_costs
                 )
                 
                 if adjustment:
@@ -222,7 +227,8 @@ class HillClimbingFeeController:
     
     def _adjust_channel_fee(self, channel_id: str, peer_id: str,
                            state: Dict[str, Any], 
-                           channel_info: Dict[str, Any]) -> Optional[FeeAdjustment]:
+                           channel_info: Dict[str, Any],
+                           chain_costs: Optional[Dict[str, int]] = None) -> Optional[FeeAdjustment]:
         """
         Adjust fee for a single channel using Hill Climbing optimization.
         
@@ -247,6 +253,7 @@ class HillClimbingFeeController:
             peer_id: Peer node ID
             state: Channel state from flow analysis
             channel_info: Current channel info (capacity, balance, etc.)
+            chain_costs: Pre-fetched chain costs from feerates RPC (optimization)
             
         Returns:
             FeeAdjustment if fee was changed, None otherwise
@@ -386,7 +393,7 @@ class HillClimbingFeeController:
                 marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
         
         # Calculate floor and ceiling
-        floor_ppm = self._calculate_floor(capacity)
+        floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs)
         floor_ppm = max(floor_ppm, self.config.min_fee_ppm)
         # Apply flow state to floor (sinks can go lower)
         floor_ppm = int(floor_ppm * flow_state_multiplier)
@@ -691,7 +698,8 @@ class HillClimbingFeeController:
         
         return result
     
-    def _calculate_floor(self, capacity_sats: int) -> int:
+    def _calculate_floor(self, capacity_sats: int, 
+                         chain_costs: Optional[Dict[str, int]] = None) -> int:
         """
         Calculate the economic floor fee for a channel.
         
@@ -702,12 +710,15 @@ class HillClimbingFeeController:
         
         Args:
             capacity_sats: Channel capacity
+            chain_costs: Pre-fetched chain costs from feerates RPC (optimization).
+                        If None, falls back to static defaults.
             
         Returns:
             Minimum fee in PPM
         """
-        # Try to get dynamic chain costs from feerates RPC
-        dynamic_costs = self._get_dynamic_chain_costs()
+        # Use provided chain_costs (hoisted from adjust_all_fees for efficiency)
+        # Falls back to static defaults if chain_costs is None (RPC failed)
+        dynamic_costs = chain_costs
         
         if dynamic_costs:
             open_cost = dynamic_costs.get("open_cost_sats", ChainCostDefaults.CHANNEL_OPEN_COST_SATS)
