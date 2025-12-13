@@ -482,8 +482,12 @@ class JobManager:
             fee_sats = (amount_transferred * job.max_fee_ppm) // 1_000_000
         
         # Calculate actual profit
+        # The expected_profit was calculated with max_budget_sats as the assumed cost.
+        # Actual profit = expected_profit + (budgeted_cost - actual_cost)
+        # If we paid less than budgeted, profit increases; if more, it decreases.
         expected_profit = job.candidate.expected_profit_sats
-        actual_profit = expected_profit - fee_sats
+        budgeted_fee = job.candidate.max_budget_sats
+        actual_profit = expected_profit + (budgeted_fee - fee_sats)
         
         self.plugin.log(
             f"Rebalance SUCCESS: {job.scid} filled with {amount_transferred} sats. "
@@ -1229,13 +1233,29 @@ class EVRebalancer:
             max_fee_sats = int(amount_sats * (fee_ppm - est_in - src_ppm) / 1e6)
             if max_fee_sats < 0: 
                 max_fee_sats = 100
+        
+        max_fee_ppm = int(max_fee_sats * 1e6 / amount_sats) if amount_sats > 0 else 0
             
         cand = RebalanceCandidate(
-            from_channel, to_channel, f_info.get("peer_id"), t_info.get("peer_id"),
-            amount_sats, amount_sats * 1000, fee_ppm, est_in, src_ppm,
-            0, 0, max_fee_sats, max_fee_sats * 1000, 
-            int(max_fee_sats * 1e6 / amount_sats) if amount_sats > 0 else 0,
-            0, 0.5, "manual", 0, 0
+            source_candidates=[from_channel],
+            to_channel=to_channel,
+            primary_source_peer_id=f_info.get("peer_id", ""),
+            to_peer_id=t_info.get("peer_id", ""),
+            amount_sats=amount_sats,
+            amount_msat=amount_sats * 1000,
+            outbound_fee_ppm=fee_ppm,
+            inbound_fee_ppm=est_in,
+            source_fee_ppm=src_ppm,
+            weighted_opp_cost_ppm=0,
+            spread_ppm=fee_ppm - est_in - src_ppm,
+            max_budget_sats=max_fee_sats,
+            max_budget_msat=max_fee_sats * 1000,
+            max_fee_ppm=max_fee_ppm,
+            expected_profit_sats=0,
+            liquidity_ratio=0.5,
+            dest_flow_state="manual",
+            dest_turnover_rate=0.0,
+            source_turnover_rate=0.0
         )
         return self.execute_rebalance(cand)
 

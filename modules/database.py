@@ -581,7 +581,8 @@ class Database:
             limit: Maximum records to return
             
         Returns:
-            List of rebalance records with fee and amount info
+            List of rebalance records with fee and amount info.
+            Note: fee_paid_msat is in millisatoshis (actual_fee_sats * 1000)
         """
         conn = self._get_connection()
         
@@ -597,11 +598,12 @@ class Database:
         placeholders = ','.join('?' * len(channel_ids))
         
         # Get rebalances to these channels
+        # Note: actual_fee_sats is stored in sats, convert to msat for fee_paid_msat
         rows = conn.execute(f"""
             SELECT 
                 to_channel,
                 amount_sats,
-                actual_fee_sats as fee_paid_msat,
+                COALESCE(actual_fee_sats, 0) * 1000 as fee_paid_msat,
                 amount_sats * 1000 as amount_msat,
                 status,
                 timestamp
