@@ -38,19 +38,22 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Precision Accounting**: Implemented Summation Logic for Bookkeeper to correctly handle Batch Transactions.
 
 ## Phase 5: Network Resilience & Optimization (Planned v1.1)
-*Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed by learning from past failures.*
+*Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed.*
 
 - [ ] **Connection Stability Tracking**: Implement `peer_connected` hooks to track historical uptime.
-- [ ] **Flap Protection**: Skip rebalancing targets with high 24h disconnect rates.
-- [ ] **Source Reliability Scoring**: Penalize source channels in the rebalancer selection logic if they have a history of routing failures.
-- [ ] **Database Rollups**: Summarize old forwarding data into daily stats before pruning to maintain long-term history without bloat.
+- [ ] **Flap Protection & Stability Scoring**: 
+    - **Rebalancer**: Skip targets with high disconnect rates.
+    - **Fee Controller**: Discount volume from flapping peers.
+- [ ] **Reputation Fee Penalty**: **CRITICAL.** Invert the logic for low-reputation peers. Instead of just ignoring their volume (which triggers fee drops), explicitly apply a fee multiplier (e.g., 2x-5x) to "price out" spammy/broken peers.
+- [ ] **Source Reliability Scoring**: Penalize source channels in the rebalancer if they have a history of routing failures.
+- [ ] **Database Rollups**: Summarize old forwarding data.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 *Objective: Automate the expansion of profitable capacity and defend against Layer 1 volatility.*
 
-- [ ] **Automated Liquidity Ads**: Automatically set `option_will_fund` rates based on the node's Cost of Capital to monetize excess "Sink" liquidity.
-- [ ] **Smart Splicing**: Detect high-ROI channels that are capacity-constrained and trigger `splice` to increase size.
-- [ ] **Mempool-Aware Floors**: Dynamically adjust the minimum routing fee floor based on current L1 feerates to cover force-close risk exposure.
+- [ ] **Mempool-Aware Fee Floors**: Dynamically adjust `min_fee_ppm` based on current L1 feerates to ensure routing fees cover the increased risk/insurance cost of force-closures during congestion.
+- [ ] **Smart Splicing**: Detect high-ROI channels that are capacity-constrained and trigger `splice`.
+- [ ] **Automated Liquidity Ads**: Monetize excess "Sink" liquidity.
 
 ---
 *Roadmap updated: December 16, 2025*
