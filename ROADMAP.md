@@ -38,21 +38,24 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Precision Accounting**: Implemented Summation Logic for Bookkeeper to correctly handle Batch Transactions.
 
 ## Phase 5: Network Resilience & Optimization (Planned v1.1)
-*Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed.*
+*Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed by learning from past failures.*
 
 - [ ] **Connection Stability Tracking**: Implement `peer_connected` hooks to track historical uptime.
-- [ ] **Flap Protection & Stability Scoring**: 
+- [ ] **Flap Protection**: 
     - **Rebalancer**: Skip targets with high disconnect rates.
     - **Fee Controller**: Discount volume from flapping peers.
-- [ ] **Reputation Fee Penalty**: **CRITICAL.** Invert the logic for low-reputation peers. Instead of just ignoring their volume (which triggers fee drops), explicitly apply a fee multiplier (e.g., 2x-5x) to "price out" spammy/broken peers.
-- [ ] **Source Reliability Scoring**: Penalize source channels in the rebalancer if they have a history of routing failures.
-- [ ] **Database Rollups**: Summarize old forwarding data.
+- [ ] **The "Profitability Shield" (Smart Reputation)**:
+    - **Volume Unmasking:** If a channel is `PROFITABLE`, ignore the Reputation Score and count 100% of the volume for Fee Control (fixes the "Invisible Whale" problem where we undercharge messy-but-rich peers).
+    - **Smart Penalty:** Only apply fee penalties (pricing out) to peers that are both **Spammy AND Underwater**. Grant "Immunity" to profitable spammers.
+- [ ] **Source Protection (Anti-Cannibalization)**: Explicitly prevent the Rebalancer from draining channels marked as **High-Velocity Sources**, even if they have excess liquidity.
+- [ ] **Source Reliability Scoring**: Penalize source channels in the rebalancer selection logic if they have a history of routing failures.
+- [ ] **Database Rollups**: Summarize old forwarding data into daily stats before pruning to maintain long-term history without bloat.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 *Objective: Automate the expansion of profitable capacity and defend against Layer 1 volatility.*
 
 - [ ] **Mempool-Aware Fee Floors**: Dynamically adjust `min_fee_ppm` based on current L1 feerates to ensure routing fees cover the increased risk/insurance cost of force-closures during congestion.
-- [ ] **Smart Splicing**: Detect high-ROI channels that are capacity-constrained and trigger `splice`.
+- [ ] **Smart Splicing**: Detect high-ROI channels that are capacity-constrained and trigger `splice` to increase size.
 - [ ] **Automated Liquidity Ads**: Monetize excess "Sink" liquidity.
 
 ---
