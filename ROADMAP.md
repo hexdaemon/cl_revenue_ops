@@ -37,5 +37,10 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - JobManager class manages sling background jobs lifecycle.
     - Configurable max_concurrent_jobs, job timeout, and chunk sizes.
 
----
-*Roadmap updated: December 08, 2025*
+## Phase 5: Network Resilience & Optimization (Planned v1.1)
+*Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed by learning from past failures.*
+
+- [ ] **Connection Stability Tracking:** Implement `peer_connected` hooks to track historical uptime.
+- [ ] **Flap Protection:** Skip rebalancing targets with high 24h disconnect rates.
+- [ ] **Source Reliability Scoring:** Penalize source channels in the rebalancer selection logic if they have a history of routing failures.
+- [ ] **Database Rollups:** Summarize old forwarding data into daily stats before pruning to maintain long-term history without bloat.
