@@ -270,6 +270,43 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
                f"dry_run={config.dry_run}")
     
+    # =========================================================================
+    # STARTUP DEPENDENCY CHECKS (Phase 4: Stability & Scaling)
+    # Verify external plugins are available before initializing dependent modules
+    # =========================================================================
+    try:
+        plugins_result = plugin.rpc.listplugins()
+        active_plugins = [p.get("name", "").lower() for p in plugins_result.get("plugins", [])]
+        
+        # Check for sling plugin
+        sling_found = any("sling" in name for name in active_plugins)
+        if not sling_found:
+            plugin.log(
+                "Dependency 'sling' not found. Rebalancing module disabled. "
+                "Install cln-sling to enable rebalancing.",
+                level='warn'
+            )
+            config.sling_available = False
+        else:
+            plugin.log("Dependency check: sling plugin detected")
+            config.sling_available = True
+        
+        # Check for bookkeeper plugin
+        bookkeeper_found = any("bookkeeper" in name for name in active_plugins)
+        if not bookkeeper_found:
+            plugin.log(
+                "Dependency 'bookkeeper' not found. Using 'listforwards' fallback for flow analysis. "
+                "Enable bookkeeper for accurate cost tracking.",
+                level='info'
+            )
+        else:
+            plugin.log("Dependency check: bookkeeper plugin detected")
+            
+    except Exception as e:
+        plugin.log(f"Error checking plugin dependencies: {e}", level='warn')
+        # Assume plugins are available if check fails
+        config.sling_available = True
+    
     # Initialize database
     database = Database(config.db_path, plugin)
     database.initialize()
@@ -364,6 +401,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     def rebalance_check_loop():
         """Background loop for rebalance checks."""
+        # Skip rebalancing entirely if sling is not available
+        if not config.sling_available:
+            plugin.log("Rebalance loop disabled: sling plugin not found")
+            return
+        
         # Initial delay to let other analyses run first
         time.sleep(120)
         while True:
@@ -612,6 +654,9 @@ def revenue_rebalance(plugin: Plugin,
     """
     if rebalancer is None:
         return {"error": "Plugin not fully initialized"}
+    
+    if config and not config.sling_available:
+        return {"error": "Rebalancing disabled: sling plugin not found. Install cln-sling to enable."}
     
     try:
         result = rebalancer.manual_rebalance(from_channel, to_channel, amount_sats, max_fee_sats)

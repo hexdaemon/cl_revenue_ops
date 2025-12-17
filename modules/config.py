@@ -95,6 +95,9 @@ class Config:
     
     # Safety flags
     dry_run: bool = False          # If True, log but don't execute
+    
+    # Runtime dependency flags (set during init based on listplugins)
+    sling_available: bool = True   # Set to False if sling plugin not detected
 
 
 # Default chain cost assumptions for fee floor calculation

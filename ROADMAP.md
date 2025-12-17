@@ -45,7 +45,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] Clarify bookkeeper vs listforwards usage
 - [x] **Documentation Alignment**: Purge references to legacy `circular` wording; documentation and error logs must reflect the `sling` backend.
 - [x] **Database Maintenance**: Implement `VACUUM` strategy to recover disk space after pruning.
-- [ ] **Startup Dependency Checks**: Verify `sling` and `bookkeeper` are loaded on startup to prevent runtime RPC errors.
+- [x] **Startup Dependency Checks**: Verify `sling` and `bookkeeper` are loaded on startup to prevent runtime RPC errors.
 
 ## Phase 5: Network Resilience & Optimization (Planned v1.1)
 *Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed by learning from past failures.*
