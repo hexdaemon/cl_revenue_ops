@@ -1259,6 +1259,16 @@ class Database:
             conn.execute("DELETE FROM flow_history WHERE timestamp < ?", (cutoff,))
             conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))
 
+        # VACUUM to reclaim disk space after pruning
+        # SQLite DELETE only marks pages as free; VACUUM actually shrinks the file.
+        # This is safe to run from a background thread (blocking is acceptable).
+        if flow_count > 0 or forwards_count > 0:
+            try:
+                conn.execute("VACUUM")
+                self.plugin.log("Database VACUUM completed to reclaim disk space")
+            except Exception as e:
+                self.plugin.log(f"VACUUM failed (non-fatal): {e}", level='warn')
+
         if forwards_count > 0:
             self.plugin.log(
                 f"Preserved {pruned_revenue // 1000} sats revenue from {pruned_count} forwards before pruning"

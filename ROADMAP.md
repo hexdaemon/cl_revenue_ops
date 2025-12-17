@@ -44,7 +44,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Precision Accounting**: Implemented Summation Logic for Bookkeeper to correctly handle Batch Transactions.
 - [x] Clarify bookkeeper vs listforwards usage
 - [x] **Documentation Alignment**: Purge references to legacy `circular` wording; documentation and error logs must reflect the `sling` backend.
-- [ ] **Database Maintenance**: Implement `VACUUM` strategy to recover disk space after pruning.
+- [x] **Database Maintenance**: Implement `VACUUM` strategy to recover disk space after pruning.
 - [ ] **Startup Dependency Checks**: Verify `sling` and `bookkeeper` are loaded on startup to prevent runtime RPC errors.
 
 ## Phase 5: Network Resilience & Optimization (Planned v1.1)
