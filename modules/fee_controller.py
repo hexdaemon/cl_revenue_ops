@@ -258,6 +258,17 @@ class HillClimbingFeeController:
         Returns:
             FeeAdjustment if fee was changed, None otherwise
         """
+        # =====================================================================
+        # CONGESTION GUARD: Skip fee updates when HTLC slots are stressed
+        # Fee changes are meaningless when channel can't accept more HTLCs
+        # =====================================================================
+        if state and state.get("state") == "congested":
+            self.plugin.log(
+                f"CONGESTION GUARD: Skipping fee update for {channel_id[:12]}... (HTLC slots stressed)",
+                level='info'
+            )
+            return None
+        
         # Get current fee
         current_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
         if current_fee_ppm == 0:

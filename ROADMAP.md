@@ -27,7 +27,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Reputation Tracking**: Track HTLC failure rates per peer in database.
 - [x] **Reputation-Weighted Fees**: Discount volume from spammy peers in the Hill Climbing algorithm.
 - [x] **Reputation Logic Refinements**: Implemented Laplace Smoothing and Time Decay.
-- [ ] Apply congested-state protections
+- [x] **Congestion Guards**: Skip fee updates and rebalancing into congested channels.
 - [ ] Align reputation default weighting docs
 
 ## Phase 4: Stability & Scaling
@@ -43,7 +43,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Implemented Multi-Source selection for robust pathfinding.
 - [x] **Precision Accounting**: Implemented Summation Logic for Bookkeeper to correctly handle Batch Transactions.
 - [ ] Clarify bookkeeper vs listforwards usage
-- [ ] **Documentation Alignment**: Purge references to legacy `circular` wording; documentation and error logs must reflect the `sling` backend.
+- [x] **Documentation Alignment**: Purge references to legacy `circular` wording; documentation and error logs must reflect the `sling` backend.
 - [ ] **Database Maintenance**: Implement `VACUUM` strategy to recover disk space after pruning.
 - [ ] **Startup Dependency Checks**: Verify `sling` and `bookkeeper` are loaded on startup to prevent runtime RPC errors.
 

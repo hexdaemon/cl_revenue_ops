@@ -750,6 +750,18 @@ class EVRebalancer:
                 if self._is_pending_with_backoff(dest_id): 
                     continue
                 
+                # CONGESTION PROTECTION: Skip congested channels as rebalance destinations
+                # Rebalancing into a slot-congested channel can worsen HTLC contention
+                dest_state = self.database.get_channel_state(dest_id)
+                if not dest_state and ':' in dest_id:
+                    dest_state = self.database.get_channel_state(dest_id.replace(':', 'x'))
+                if dest_state and dest_state.get("state") == "congested":
+                    self.plugin.log(
+                        f"CONGESTION GUARD: Skipping {dest_id[:12]}... as rebalance target (HTLC slots stressed)",
+                        level='info'
+                    )
+                    continue
+                
                 last_rebalance = self.database.get_last_rebalance_time(dest_id)
                 if last_rebalance:
                     cooldown = self.config.rebalance_cooldown_hours * 3600

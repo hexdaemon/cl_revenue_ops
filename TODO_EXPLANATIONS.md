@@ -40,49 +40,6 @@ Deliverable:
 - Provide a short list of mismatches you fixed and where.
 ```
 
-## Apply congested-state protections (Phase 3)
-
-**Problem**
-- Channels can be marked congested (HTLC slot utilization threshold), but downstream decisions (fee changes, rebalancer selection) may not consistently treat congestion as a protection condition.
-
-**Why it matters**
-- Rebalancing or fee adjustments on congested channels can worsen HTLC contention and reduce forwarding success.
-
-**Likely touch-points**
-- `modules/flow_analysis.py`: congestion detection/representation.
-- `modules/rebalancer.py`: candidate selection and execution guards.
-- `modules/fee_controller.py`: fee update logic.
-
-**Done when**
-- Congested channels are handled according to an explicit policy, and the behavior is visible via logs/metrics.
-
-**AI Prompt**
-```text
-Repo: cl_revenue_ops.
-
-Task: Apply consistent protections when a channel is marked congested (HTLC slots).
-
-Context:
-- `modules/config.py` defines `htlc_congestion_threshold`.
-- Flow/analysis marks channels as CONGESTED.
-
-Requirements:
-1) Choose a minimal protection policy and implement it consistently. Examples:
-   - Rebalancer: do not pick congested channels as destinations; optionally also avoid as sources.
-   - Fee controller: reduce fee churn on congested channels (skip updates or cap change rate).
-2) Implement with the smallest number of conditionals at the decision points.
-3) Add clear logs and/or Prometheus metrics so operators can tell congestion is gating behavior.
-4) Update README to describe the policy.
-
-Acceptance:
-- Congested channels are visibly treated differently in logs/metrics.
-- No change in behavior for non-congested channels.
-- `python -m py_compile` succeeds for touched files.
-
-Deliverable:
-- List the exact guards added (file/function) and the chosen policy.
-```
-
 ## Align reputation default weighting docs (Phase 3)
 
 **Problem**

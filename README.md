@@ -62,7 +62,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - **Peer Reputation Tracking**: Tracks HTLC success/failure rates per peer
 - **Reputation-Weighted Fees**: Discounts volume from high-failure peers in fee optimization
 - **HTLC Slot Monitoring**: Marks channels with >80% slot usage as CONGESTED
-- Prevents investing in congested channels where liquidity cannot be used
+- **Congestion Guards**: Skips fee updates and rebalancing into congested channels
 
 ## Architecture
 
