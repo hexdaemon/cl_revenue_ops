@@ -61,6 +61,9 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 ### Module 6: Traffic Intelligence
 - **Peer Reputation Tracking**: Tracks HTLC success/failure rates per peer
 - **Reputation-Weighted Fees**: Discounts volume from high-failure peers in fee optimization
+  - **Laplace Smoothing Formula**: `Score = (success + 1) / (success + failure + 2)`
+  - **Neutral Fallback**: New/unknown peers start at score 0.5
+  - **Time Decay**: Counts multiplied by `reputation_decay` (default 0.98) each flow-interval (~hourly). Daily decay ≈ 0.61; weekly ≈ 0.03
 - **HTLC Slot Monitoring**: Marks channels with >80% slot usage as CONGESTED
 - **Congestion Guards**: Skips fee updates and rebalancing into congested channels
 
@@ -111,6 +114,25 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
        └──────────────┘
 ```
 
+## Data Sources
+
+The plugin uses different Core Lightning RPCs depending on the task:
+
+| Data Type | Primary Source | Fallback | Notes |
+|-----------|----------------|----------|-------|
+| **Flow/Volume** | `listforwards` | — | Uses `short_channel_id` format; most reliable for channel mapping |
+| **Revenue** | `listforwards` | — | Aggregates `fee_msat` from settled forwards |
+| **Open Costs** | `bkpr-listaccountevents` | `estimated_open_cost_sats` config | Bookkeeper provides exact on-chain fees; uses summation logic for batch transactions |
+| **Rebalance Costs** | Local DB + `bkpr-listaccountevents` | Local DB only | DB tracks costs from plugin rebalances; bookkeeper may have additional history |
+| **Open Timestamp** | `bkpr-listaccountevents` | SCID block-height estimation | Bookkeeper `channel_open` event has exact timestamp |
+
+**Key differences:**
+- **bookkeeper** uses `funding_txid` (reversed bytes) as account identifier, not `short_channel_id`
+- **listforwards** uses `short_channel_id` which matches channel identifiers throughout the plugin
+- Bookkeeper data requires the `bookkeeper` plugin to be enabled; if unavailable, the plugin uses fallbacks
+
+**Recommendation:** Enable the `bookkeeper` plugin for accurate cost tracking (especially for batch channel opens).
+
 ## Installation
 
 ### Prerequisites
@@ -158,14 +180,22 @@ All options can be set via `lightning-cli` at startup or in your config file:
 | `revenue-ops-rebalance-min-profit` | `10` | Min profit to trigger rebalance (sats) |
 | `revenue-ops-flow-window-days` | `7` | Days to analyze for flow |
 | `revenue-ops-clboss-enabled` | `true` | Enable clboss integration |
+| `revenue-ops-rebalancer` | `sling` | Rebalancer plugin to use |
 | `revenue-ops-daily-budget-sats` | `5000` | Max rebalancing fees per 24 hours (sats) |
 | `revenue-ops-min-wallet-reserve` | `1000000` | Min total funds to keep in reserve (sats) |
-| `revenue-ops-metrics-port` | `9800` | Prometheus metrics HTTP port |
-| `revenue-ops-enable-reputation` | `true` | Enable peer reputation tracking |
-| `revenue-ops-htlc-congestion-threshold` | `0.8` | HTLC slot usage threshold (0.0-1.0) |
 | `revenue-ops-dry-run` | `false` | Log actions without executing |
+| `revenue-ops-htlc-congestion-threshold` | `0.8` | HTLC slot usage threshold (0.0-1.0) |
+| `revenue-ops-enable-reputation` | `true` | Enable peer reputation tracking |
+| `revenue-ops-reputation-decay` | `0.98` | Reputation decay factor per flow-interval |
+| `revenue-ops-enable-prometheus` | `false` | Enable Prometheus metrics HTTP server |
+| `revenue-ops-prometheus-port` | `9800` | Prometheus metrics HTTP port |
+| `revenue-ops-enable-kelly` | `false` | Scale rebalance budget using Kelly Criterion |
+| `revenue-ops-kelly-fraction` | `0.5` | Kelly fraction multiplier (0.5 = Half Kelly) |
+| `revenue-ops-pid-kp` | `0.5` | PID Proportional gain (legacy) |
+| `revenue-ops-pid-ki` | `0.1` | PID Integral gain (legacy) |
+| `revenue-ops-pid-kd` | `0.05` | PID Derivative gain (legacy) |
 
-*Note: The Hill Climbing fee controller manages its own internal state (step size, direction, sleep mode) automatically.*
+*Note: The Hill Climbing fee controller manages its own internal state (step size, direction, sleep mode) automatically. PID options are legacy and may be removed in a future version.*
 
 Example config:
 
@@ -229,6 +259,8 @@ lightning-cli revenue-profitability
 lightning-cli revenue-profitability 123x456x0
 ```
 
+**Data sources:** Revenue from `listforwards`; costs from `bkpr-listaccountevents` (with local DB fallback).
+
 Returns:
 - **profitable**: Positive ROI, earning more than costs
 - **break_even**: ROI near zero
@@ -241,6 +273,8 @@ Get lifetime financial history including closed channels.
 ```bash
 lightning-cli revenue-history
 ```
+
+**Data sources:** Aggregates from local DB (`forwards`, `channel_costs`, `rebalance_costs`, `lifetime_aggregates` tables). The DB is populated from `listforwards` and `bkpr-listaccountevents` during normal operation.
 
 Returns aggregate financial performance since the plugin was installed, including data from channels that have since been closed. This provides a true "Lifetime P&L" view:
 
