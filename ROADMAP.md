@@ -50,7 +50,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 ## Phase 5: Network Resilience & Optimization (Planned v1.1)
 *Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed by learning from past failures.*
 
-- [ ] **Connection Stability Tracking**: Implement `peer_connected` hooks to track historical uptime.
+- [x] **Connection Stability Tracking**: Implement `peer_connected` hooks to track historical uptime.
 - [ ] **Flap Protection**: 
     - **Rebalancer**: Skip targets with high disconnect rates.
     - **Fee Controller**: Discount volume from flapping peers.

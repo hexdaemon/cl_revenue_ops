@@ -1375,6 +1375,11 @@ class Database:
             ORDER BY timestamp ASC
         """, (peer_id, window_start)).fetchall()
         
+        # COLD START: If no history at all (neither prior nor in window), assume 100% uptime
+        # This prevents penalizing new peers or when tracking is just enabled
+        if prior_event is None and not rows:
+            return 100.0
+            
         total_connected_time = 0
         
         for row in rows:

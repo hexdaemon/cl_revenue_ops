@@ -353,6 +353,21 @@ class HillClimbingFeeController:
         else:
             volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
         
+        # FLAP PROTECTION: Penalize flapping peers' volume for revenue signal
+        # Peers with high disconnect rates have dampened revenue signals so we
+        # don't optimize fees based on unreliable traffic patterns.
+        # Formula: effective_volume = volume * (uptime_pct / 100)
+        uptime_pct = self.database.get_peer_uptime_percent(peer_id, 86400)  # 24h window
+        uptime_factor = uptime_pct / 100.0  # Convert 0-100 to 0-1
+        if uptime_factor < 1.0:
+            original_volume = volume_since_sats
+            volume_since_sats = int(volume_since_sats * uptime_factor)
+            self.plugin.log(
+                f"FLAP PROTECTION: Dampening volume for {channel_id[:12]}... "
+                f"({original_volume} -> {volume_since_sats} sats, uptime={uptime_pct:.1f}%)",
+                level='debug'
+            )
+        
         # Calculate time elapsed since last update
         if hc_state.last_update > 0:
             hours_elapsed = (now - hc_state.last_update) / 3600.0

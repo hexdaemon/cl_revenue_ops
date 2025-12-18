@@ -818,6 +818,19 @@ class EVRebalancer:
         if dest_flow_state == "sink": 
             return None
         
+        # FLAP PROTECTION: Skip unstable destination peers
+        # Peers with low uptime (high disconnect rate) are unreliable rebalance targets
+        dest_peer_id = dest_info.get("peer_id", "")
+        if dest_peer_id:
+            uptime_pct = self.database.get_peer_uptime_percent(dest_peer_id, 86400)  # 24h window
+            if uptime_pct < 90.0:
+                self.plugin.log(
+                    f"Skipping rebalance candidate {dest_peer_id}: unstable connection "
+                    f"({uptime_pct:.1f}% uptime in 24h).",
+                    level='info'
+                )
+                return None
+        
         # Check profitability logic
         if self._profitability_analyzer:
             try:
@@ -1074,6 +1087,18 @@ class EVRebalancer:
             pid = info.get("peer_id", "")
             if pid and pid in peers and not peers[pid].get("connected"): 
                 continue
+            
+            # FLAP PROTECTION: Skip unstable source peers
+            # Peers with low uptime (high disconnect rate) are unreliable rebalance sources
+            if pid:
+                uptime_pct = self.database.get_peer_uptime_percent(pid, 86400)  # 24h window
+                if uptime_pct < 90.0:
+                    self.plugin.log(
+                        f"Skipping source candidate {pid}: unstable connection "
+                        f"({uptime_pct:.1f}% uptime in 24h).",
+                        level='info'
+                    )
+                    continue
             
             # Calculate opportunity cost for this source
             source_fee_ppm = info.get("fee_ppm", 1000)
