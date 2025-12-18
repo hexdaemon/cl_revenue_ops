@@ -1376,11 +1376,25 @@ class Database:
         """, (peer_id, window_start)).fetchall()
         
         # COLD START: If no history at all (neither prior nor in window), assume 100% uptime
-        # This prevents penalizing new peers or when tracking is just enabled
         if prior_event is None and not rows:
             return 100.0
             
+        # Determine effective observation window
+        # If we have history before the window, we use the full window.
+        # If history starts inside the window, we only count time since that first event.
+        if prior_event:
+            effective_start = window_start
+        else:
+            effective_start = rows[0]['timestamp']
+            
+        actual_duration = now - effective_start
+        
+        # Avoid noise from very short windows (e.g. startup)
+        if actual_duration < 60:
+            return 100.0
+            
         total_connected_time = 0
+        last_interval_start = effective_start
         
         for row in rows:
             event_type = row['event_type']
@@ -1398,10 +1412,10 @@ class Database:
         if is_connected:
             total_connected_time += now - last_interval_start
         
-        if duration_seconds <= 0:
+        if actual_duration <= 0:
             return 0.0
         
-        uptime_pct = (total_connected_time / duration_seconds) * 100.0
+        uptime_pct = (total_connected_time / actual_duration) * 100.0
         return min(100.0, max(0.0, uptime_pct))
     
     def close(self):

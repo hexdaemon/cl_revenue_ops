@@ -51,7 +51,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 *Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed by learning from past failures.*
 
 - [x] **Connection Stability Tracking**: Implement `peer_connected` hooks to track historical uptime.
-- [ ] **Flap Protection**: 
+- [x] **Flap Protection**: 
     - **Rebalancer**: Skip targets with high disconnect rates.
     - **Fee Controller**: Discount volume from flapping peers.
 - [ ] **The "Profitability Shield" (Smart Reputation)**:
