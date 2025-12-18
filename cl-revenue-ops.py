@@ -996,12 +996,29 @@ def on_peer_connect(plugin: Plugin, **kwargs):
     if database is None:
         return
     
-    peer_id = kwargs.get("id")
+    # Log full structure for debugging
+    plugin.log(f"Connect notification: {kwargs}", level='debug')
+    
+    # Try multiple extraction methods for compatibility
+    peer_id = None
+    
+    # Method 1: Nested under 'connect' key
+    if 'connect' in kwargs and isinstance(kwargs['connect'], dict):
+        peer_id = kwargs['connect'].get('id')
+    
+    # Method 2: Direct 'id' key
+    if not peer_id and 'id' in kwargs:
+        peer_id = kwargs['id']
+    
+    # Method 3: Check for nested peer_id
+    if not peer_id and 'connect' in kwargs and isinstance(kwargs['connect'], dict):
+        peer_id = kwargs['connect'].get('peer_id')
+    
     if peer_id:
         database.record_connection_event(peer_id, "connected")
         plugin.log(f"Peer connected: {peer_id[:12]}...", level='info')
     else:
-        plugin.log(f"Received connect event without id: {kwargs.keys()}", level='info')
+        plugin.log(f"Connect event - could not extract peer_id from: {kwargs}", level='warn')
 
 
 @plugin.subscribe("disconnect")
@@ -1014,12 +1031,29 @@ def on_peer_disconnect(plugin: Plugin, **kwargs):
     if database is None:
         return
     
-    peer_id = kwargs.get("id")
+    # Log full structure for debugging
+    plugin.log(f"Disconnect notification: {kwargs}", level='debug')
+    
+    # Try multiple extraction methods for compatibility
+    peer_id = None
+    
+    # Method 1: Nested under 'disconnect' key
+    if 'disconnect' in kwargs and isinstance(kwargs['disconnect'], dict):
+        peer_id = kwargs['disconnect'].get('id')
+    
+    # Method 2: Direct 'id' key
+    if not peer_id and 'id' in kwargs:
+        peer_id = kwargs['id']
+    
+    # Method 3: Check for nested peer_id
+    if not peer_id and 'disconnect' in kwargs and isinstance(kwargs['disconnect'], dict):
+        peer_id = kwargs['disconnect'].get('peer_id')
+    
     if peer_id:
         database.record_connection_event(peer_id, "disconnected")
         plugin.log(f"Peer disconnected: {peer_id[:12]}...", level='info')
     else:
-        plugin.log(f"Received disconnect event without id: {kwargs.keys()}", level='info')
+        plugin.log(f"Disconnect event - could not extract peer_id from: {kwargs}", level='warn')
 
 
 # =============================================================================
