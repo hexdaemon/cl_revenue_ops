@@ -106,8 +106,8 @@ class FlowAnalyzer:
     
     Flow Analysis Logic:
     1. Query bookkeeper or listforwards for historical routing data
-    2. Calculate net flow for each channel over the analysis window
-    3. Compute FlowRatio = (SatsOut - SatsIn) / Capacity
+    2. Calculate net flow for each channel using Exponential Moving Average (EMA)
+    3. Compute FlowRatio = (EMA_Out - EMA_In) / Capacity
     4. Classify based on thresholds:
        - FlowRatio > 0.5: SOURCE (draining)
        - FlowRatio < -0.5: SINK (filling)
@@ -177,13 +177,8 @@ class FlowAnalyzer:
         self.plugin.log(f"Analyzing flow for {len(channels)} channels")
         
         # Get flow data from listforwards (most reliable source with correct channel IDs)
-        # Note: bookkeeper uses funding_txid as account, not short_channel_id
-        # listforwards uses short_channel_id which matches our channel identifiers
-        flow_data = self._get_flow_from_listforwards()
-        
-        # Debug: log how much flow data we got
-        channels_with_flow = sum(1 for v in flow_data.values() if v.get("in", 0) > 0 or v.get("out", 0) > 0)
-        self.plugin.log(f"Flow data: {len(flow_data)} channels tracked, {channels_with_flow} with non-zero flow")
+        # UPDATED: Now returns daily buckets for EMA calculation
+        flow_data_daily = self._get_daily_flow_from_listforwards()
         
         # Analyze each channel
         for channel in channels:
@@ -209,10 +204,11 @@ class FlowAnalyzer:
             # Get current balance for fallback inference (already fetched above for capacity calc)
             our_balance = spendable_msat // 1000
             
-            # Get flow data for this channel
-            channel_flow = flow_data.get(channel_id, {"in": 0, "out": 0})
-            sats_in = channel_flow.get("in", 0)
-            sats_out = channel_flow.get("out", 0)
+            # Get daily buckets for this channel
+            channel_daily = flow_data_daily.get(channel_id, [])
+            
+            # Calculate EMA flow and total volume
+            ema_in, ema_out, total_in, total_out = self._calculate_ema_flow(channel_daily)
             
             # Extract HTLC information for congestion detection
             htlc_min = channel.get("htlc_min_msat", 0)
@@ -224,8 +220,10 @@ class FlowAnalyzer:
             metrics = self._calculate_metrics(
                 channel_id=channel_id,
                 peer_id=peer_id,
-                sats_in=sats_in,
-                sats_out=sats_out,
+                sats_in=total_in,
+                sats_out=total_out,
+                ema_in=ema_in,    # Pass EMA for classification
+                ema_out=ema_out,  # Pass EMA for classification
                 capacity=capacity,
                 our_balance=our_balance,
                 htlc_min=htlc_min,
@@ -242,8 +240,8 @@ class FlowAnalyzer:
                 peer_id=peer_id,
                 state=metrics.state.value,
                 flow_ratio=metrics.flow_ratio,
-                sats_in=sats_in,
-                sats_out=sats_out,
+                sats_in=total_in,
+                sats_out=total_out,
                 capacity=capacity
             )
         
@@ -266,7 +264,7 @@ class FlowAnalyzer:
         
         peer_id = channel.get("peer_id", "")
         
-        # Calculate capacity - may be null in some CLN versions
+        # Calculate capacity
         capacity_msat = channel.get("capacity_msat")
         spendable_msat = channel.get("spendable_msat", 0) or 0
         receivable_msat = channel.get("receivable_msat", 0) or 0
@@ -279,15 +277,15 @@ class FlowAnalyzer:
         if capacity == 0:
             capacity = channel.get("capacity", 0)
         
-        # Get current balance for fallback
         our_balance = spendable_msat // 1000
         
-        # Get flow data from listforwards (uses short_channel_id format)
-        flow_data = self._get_flow_from_listforwards(channel_id)
+        # Get daily flow data
+        flow_data_daily = self._get_daily_flow_from_listforwards(channel_id)
+        channel_daily = flow_data_daily.get(channel_id, [])
         
-        channel_flow = flow_data.get(channel_id, {"in": 0, "out": 0})
+        ema_in, ema_out, total_in, total_out = self._calculate_ema_flow(channel_daily)
         
-        # Extract HTLC information for congestion detection
+        # Extract HTLC information
         htlc_min = channel.get("htlc_min_msat", 0)
         htlc_max = channel.get("htlc_max_msat", 0)
         active_htlcs = channel.get("active_htlcs", 0)
@@ -296,8 +294,10 @@ class FlowAnalyzer:
         return self._calculate_metrics(
             channel_id=channel_id,
             peer_id=peer_id,
-            sats_in=channel_flow.get("in", 0),
-            sats_out=channel_flow.get("out", 0),
+            sats_in=total_in,
+            sats_out=total_out,
+            ema_in=ema_in,
+            ema_out=ema_out,
             capacity=capacity,
             our_balance=our_balance,
             htlc_min=htlc_min,
@@ -308,73 +308,43 @@ class FlowAnalyzer:
     
     def _calculate_metrics(self, channel_id: str, peer_id: str,
                           sats_in: int, sats_out: int, capacity: int,
+                          ema_in: float = 0.0, ema_out: float = 0.0,
                           our_balance: int = 0,
                           htlc_min: int = 0, htlc_max: int = 0,
                           active_htlcs: int = 0, max_htlcs: int = 483) -> FlowMetrics:
         """
-        Calculate flow metrics and classify a channel.
+        Calculate flow metrics and classify a channel using EMA.
         
-        The FlowRatio formula:
-        FlowRatio = (SatsOut - SatsIn) / Capacity
+        The FlowRatio formula (EMA-based):
+        FlowRatio = (EMA_Out - EMA_In) / Capacity
+        
+        This makes the classification responsive to recent trend reversals.
         
         Interpretation:
-        - Positive ratio: More sats going out than coming in (SOURCE)
-        - Negative ratio: More sats coming in than going out (SINK)
+        - Positive ratio: Net outflow trend (SOURCE)
+        - Negative ratio: Net inflow trend (SINK)
         - Near zero: Balanced flow
-        
-        BALANCE FALLBACK:
-        When there's no flow data (sats_in == 0 and sats_out == 0), we infer
-        the flow state from the current channel balance:
-        - Low outbound (< 30%): Channel has been draining → likely SOURCE
-        - High outbound (> 70%): Channel has been filling → likely SINK
-        - Middle range: BALANCED
-        
-        HTLC CONGESTION CHECK:
-        If active_htlcs / max_htlcs exceeds the configured htlc_congestion_threshold
-        (default 80% slot utilization), the channel is marked as CONGESTED. This
-        overrides the flow-based classification because a congested channel cannot
-        route new payments regardless of its liquidity state.
-        
-        This allows the PID to make reasonable fee decisions even for new
-        channels or when bookkeeper data is unavailable.
-        
-        Args:
-            channel_id: Channel identifier
-            peer_id: Peer node ID
-            sats_in: Total sats routed in
-            sats_out: Total sats routed out
-            capacity: Channel capacity
-            our_balance: Our current balance (outbound liquidity) for fallback
-            htlc_min: Minimum HTLC amount (msat)
-            htlc_max: Maximum HTLC amount (msat)
-            active_htlcs: Number of currently active HTLCs
-            max_htlcs: Maximum allowed HTLCs on the channel
-            
-        Returns:
-            FlowMetrics with classification
         """
         has_flow_data = sats_in > 0 or sats_out > 0
         
-        # Calculate flow ratio from actual flow data
+        # Calculate flow ratio from EMA data
         if capacity > 0:
-            flow_ratio = (sats_out - sats_in) / capacity
+            flow_ratio = (ema_out - ema_in) / capacity
         else:
             flow_ratio = 0.0
         
         # Check HTLC slot congestion FIRST
-        # If > threshold of HTLC slots are used, channel is congested and cannot route
         htlc_utilization = active_htlcs / max_htlcs if max_htlcs > 0 else 0.0
         is_congested = htlc_utilization > self.config.htlc_congestion_threshold
         
         if is_congested:
-            # Channel is slot-congested - override flow state
             state = ChannelState.CONGESTED
             self.plugin.log(
                 f"Channel {channel_id} is CONGESTED: {active_htlcs}/{max_htlcs} "
                 f"HTLC slots used ({htlc_utilization:.1%})"
             )
         elif has_flow_data:
-            # Use actual flow data for classification
+            # Use EMA flow data for classification
             if flow_ratio > self.config.source_threshold:
                 state = ChannelState.SOURCE
             elif flow_ratio < self.config.sink_threshold:
@@ -383,25 +353,19 @@ class FlowAnalyzer:
                 state = ChannelState.BALANCED
         else:
             # FALLBACK: Infer from current balance
-            # If we have no flow data, the balance tells us what happened historically
             outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
             
             if outbound_ratio < 0.30:
-                # Low outbound = channel has been draining = SOURCE behavior
                 state = ChannelState.SOURCE
-                # Set a synthetic flow_ratio to reflect this
-                flow_ratio = 0.6  # Above source_threshold
+                flow_ratio = 0.6
             elif outbound_ratio > 0.70:
-                # High outbound = channel has been filling = SINK behavior
                 state = ChannelState.SINK
-                # Set a synthetic flow_ratio to reflect this
-                flow_ratio = -0.6  # Below sink_threshold
+                flow_ratio = -0.6
             else:
-                # Balanced liquidity = BALANCED
                 state = ChannelState.BALANCED
                 flow_ratio = 0.0
         
-        # Calculate daily volume
+        # Calculate daily volume (simple average for display/stats)
         total_volume = sats_in + sats_out
         daily_volume = total_volume // max(self.config.flow_window_days, 1)
         
@@ -422,6 +386,111 @@ class FlowAnalyzer:
             is_congested=is_congested
         )
     
+    def _get_daily_flow_from_listforwards(self, channel_id: Optional[str] = None) -> Dict[str, List[Dict[str, int]]]:
+        """
+        Get daily flow buckets from listforwards.
+        
+        Instead of summing everything, this buckets data by day (0 = today, 1 = yesterday, etc.)
+        to support EMA calculation.
+        
+        Returns:
+            Dict mapping channel_id to a list of daily buckets:
+            {'scid': [{'age': 0, 'in': 100, 'out': 50}, {'age': 1, ...}]}
+        """
+        flow_data = {} # type: Dict[str, List[Dict[str, int]]]
+        
+        window_days = self.config.flow_window_days
+        now = int(time.time())
+        window_seconds = window_days * 86400
+        start_time = now - window_seconds
+        
+        try:
+            # Query listforwards
+            params = {"status": "settled"}
+            result = self.plugin.rpc.listforwards(**params)
+            
+            for forward in result.get("forwards", []):
+                received_time = forward.get("received_time", 0)
+                if received_time < start_time:
+                    continue
+                
+                # Calculate age in days (0 = today/last 24h)
+                age_days = (now - received_time) // 86400
+                if age_days >= window_days:
+                    continue
+                
+                in_channel = forward.get("in_channel", "")
+                out_channel = forward.get("out_channel", "")
+                in_msat = forward.get("in_msat", 0)
+                out_msat = forward.get("out_msat", 0)
+                
+                if channel_id and in_channel != channel_id and out_channel != channel_id:
+                    continue
+                
+                # Initialize bucket lists if needed
+                if in_channel and in_channel not in flow_data:
+                    flow_data[in_channel] = [{'in': 0, 'out': 0} for _ in range(window_days)]
+                if out_channel and out_channel not in flow_data:
+                    flow_data[out_channel] = [{'in': 0, 'out': 0} for _ in range(window_days)]
+                
+                # Add to appropriate day bucket
+                if in_channel:
+                    flow_data[in_channel][age_days]['in'] += in_msat // 1000
+                
+                if out_channel:
+                    flow_data[out_channel][age_days]['out'] += out_msat // 1000
+                    
+        except RpcError as e:
+            self.plugin.log(f"Error querying listforwards: {e}", level='error')
+        
+        return flow_data
+    
+    def _calculate_ema_flow(self, daily_buckets: List[Dict[str, int]]) -> Tuple[float, float, int, int]:
+        """
+        Calculate Exponential Moving Average (EMA) for flow.
+        
+        Weights recent days significantly higher to reduce lag.
+        Formula: 
+           Weight = decay_factor ^ age
+           EMA = Sum(Value * Weight) / Sum(Weight)
+        
+        Using decay_factor = 0.8:
+           Day 0 (Today): 1.0
+           Day 1: 0.8
+           Day 2: 0.64
+           ...
+           
+        Returns:
+            (ema_in, ema_out, total_in, total_out)
+        """
+        if not daily_buckets:
+            return 0.0, 0.0, 0, 0
+            
+        ema_in = 0.0
+        ema_out = 0.0
+        total_weight = 0.0
+        total_in = 0
+        total_out = 0
+        
+        decay_factor = 0.8
+        
+        for age, bucket in enumerate(daily_buckets):
+            weight = decay_factor ** age
+            
+            ema_in += bucket['in'] * weight
+            ema_out += bucket['out'] * weight
+            
+            total_in += bucket['in']
+            total_out += bucket['out']
+            
+            total_weight += weight
+            
+        if total_weight > 0:
+            ema_in /= total_weight
+            ema_out /= total_weight
+            
+        return ema_in, ema_out, total_in, total_out
+
     def _get_channels(self) -> List[Dict[str, Any]]:
         """
         Get list of all channels from lightningd with HTLC information.
@@ -467,158 +536,6 @@ class FlowAnalyzer:
             if scid == channel_id:
                 return channel
         return None
-    
-    def _get_flow_from_bookkeeper(self, channel_id: Optional[str] = None) -> Dict[str, Dict[str, int]]:
-        """
-        Get flow data from the bookkeeper plugin.
-        
-        Bookkeeper provides accounting-grade data for channel flows.
-        We query for income events over the analysis window.
-        
-        Args:
-            channel_id: Optional specific channel to query
-            
-        Returns:
-            Dict mapping channel_id to {"in": sats_in, "out": sats_out}
-        """
-        flow_data = {}
-        
-        # Calculate time window
-        window_seconds = self.config.flow_window_days * 86400
-        start_time = int(time.time()) - window_seconds
-        
-        try:
-            # Get income from bookkeeper
-            # bkpr-listincome shows routing fees earned
-            income = self.plugin.rpc.call("bkpr-listincome", {
-                "consolidate_fees": False,
-                "start_time": start_time
-            })
-            
-            # Process income events to extract flow
-            for event in income.get("income_events", []):
-                event_channel = event.get("account", "")
-                
-                # Skip if looking for specific channel and this isn't it
-                if channel_id and event_channel != channel_id:
-                    continue
-                
-                # Initialize if needed
-                if event_channel not in flow_data:
-                    flow_data[event_channel] = {"in": 0, "out": 0}
-                
-                # Parse the event type and amount
-                tag = event.get("tag", "")
-                credit_msat = event.get("credit_msat", 0)
-                debit_msat = event.get("debit_msat", 0)
-                
-                # Routing income indicates flow through the channel
-                if tag == "routed":
-                    # Credit = received fee = sats passed through
-                    if credit_msat > 0:
-                        flow_data[event_channel]["out"] += credit_msat // 1000
-                
-            # Also get actual forwards for volume data
-            # bkpr-listforwards gives us the actual routing volume
-            try:
-                forwards = self.plugin.rpc.call("bkpr-listforwards")
-                
-                for fwd in forwards.get("forwards", []):
-                    in_channel = fwd.get("in_channel", "")
-                    out_channel = fwd.get("out_channel", "")
-                    in_msat = fwd.get("in_msat", 0)
-                    out_msat = fwd.get("out_msat", 0)
-                    
-                    # Filter by time if available
-                    resolved_time = fwd.get("resolved_time", 0)
-                    if resolved_time and resolved_time < start_time:
-                        continue
-                    
-                    # Track inflow (received from peer)
-                    if in_channel:
-                        if in_channel not in flow_data:
-                            flow_data[in_channel] = {"in": 0, "out": 0}
-                        flow_data[in_channel]["in"] += in_msat // 1000
-                    
-                    # Track outflow (sent to peer)
-                    if out_channel:
-                        if out_channel not in flow_data:
-                            flow_data[out_channel] = {"in": 0, "out": 0}
-                        flow_data[out_channel]["out"] += out_msat // 1000
-                        
-            except RpcError:
-                # bkpr-listforwards might not be available
-                pass
-                
-        except RpcError as e:
-            self.plugin.log(f"Error querying bookkeeper: {e}", level='warn')
-            # Fall back to listforwards
-            return self._get_flow_from_listforwards(channel_id)
-        
-        return flow_data
-    
-    def _get_flow_from_listforwards(self, channel_id: Optional[str] = None) -> Dict[str, Dict[str, int]]:
-        """
-        Get flow data from listforwards.
-        
-        listforwards provides forward history with short_channel_id format
-        which matches our channel identifiers from listpeerchannels.
-        
-        Note: On very busy nodes with 100k+ forwards, this query can be slow.
-        The time window filter helps limit the data processed.
-        
-        Args:
-            channel_id: Optional specific channel to query
-            
-        Returns:
-            Dict mapping channel_id to {"in": sats_in, "out": sats_out}
-        """
-        flow_data = {}
-        
-        # Calculate time window
-        window_seconds = self.config.flow_window_days * 86400
-        start_time = int(time.time()) - window_seconds
-        
-        try:
-            # Query listforwards
-            params = {"status": "settled"}
-            if channel_id:
-                # Try both in_channel and out_channel queries
-                pass  # listforwards doesn't filter well, we'll filter in code
-            
-            result = self.plugin.rpc.listforwards(**params)
-            
-            for forward in result.get("forwards", []):
-                # Check time window
-                received_time = forward.get("received_time", 0)
-                if received_time < start_time:
-                    continue
-                
-                in_channel = forward.get("in_channel", "")
-                out_channel = forward.get("out_channel", "")
-                in_msat = forward.get("in_msat", 0)
-                out_msat = forward.get("out_msat", 0)
-                
-                # Skip if looking for specific channel and neither matches
-                if channel_id and in_channel != channel_id and out_channel != channel_id:
-                    continue
-                
-                # Track inflow to in_channel
-                if in_channel:
-                    if in_channel not in flow_data:
-                        flow_data[in_channel] = {"in": 0, "out": 0}
-                    flow_data[in_channel]["in"] += in_msat // 1000
-                
-                # Track outflow from out_channel
-                if out_channel:
-                    if out_channel not in flow_data:
-                        flow_data[out_channel] = {"in": 0, "out": 0}
-                    flow_data[out_channel]["out"] += out_msat // 1000
-                    
-        except RpcError as e:
-            self.plugin.log(f"Error querying listforwards: {e}", level='error')
-        
-        return flow_data
     
     def get_channel_state(self, channel_id: str) -> ChannelState:
         """
