@@ -61,7 +61,7 @@ Implement "HTLC Hold" Risk Premium to penalize peers that lock up capital.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 
-### 3. Capacity Augmentation (Smart Splicing)
+### 3. Capacity Augmentation (Smart Splicing) ✅ COMPLETED
 **Objective:** Identify "Growth" levers by redeploying capital from dead channels to sold-out winners.
 
 **Context Files:**

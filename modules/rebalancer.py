@@ -250,10 +250,6 @@ class JobManager:
         chunk_size = min(candidate.amount_sats, self.chunk_size_sats)
         
         try:
-            # Build candidates JSON array with ALL source candidates
-            # Sling will try them in order, providing pathfinding failover
-            candidates_json = json.dumps(source_scids_sling)
-            
             primary_source = source_scids_sling[0] if source_scids_sling else "none"
             self.plugin.log(
                 f"Starting sling-job: {to_scid} <- [{len(source_scids_sling)} candidates], "
@@ -268,7 +264,7 @@ class JobManager:
                 "direction": "pull",
                 "amount": chunk_size,
                 "maxppm": candidate.max_fee_ppm,
-                "candidates": candidates_json,
+                "candidates": source_scids_sling,
                 "target": 0.5  # Stop when 50% balance reached (we'll stop earlier ourselves)
             })
             
@@ -749,7 +745,8 @@ class EVRebalancer:
             depleted_channels = []
             source_channels = []
             
-            for channel_id, info in channels.items():
+            for raw_channel_id, info in channels.items():
+                channel_id = raw_channel_id.replace(':', 'x')
                 capacity = info.get("capacity", 0)
                 spendable = info.get("spendable_sats", 0)
                 if capacity == 0: 
@@ -758,8 +755,7 @@ class EVRebalancer:
                 outbound_ratio = spendable / capacity
                 
                 # Skip channels with active jobs
-                normalized = channel_id.replace(':', 'x')
-                if normalized in active_channels:
+                if channel_id in active_channels:
                     continue
                 
                 # STAGNANT INVENTORY DETECTION
@@ -793,8 +789,6 @@ class EVRebalancer:
                 # CONGESTION PROTECTION: Skip congested channels as rebalance destinations
                 # Rebalancing into a slot-congested channel can worsen HTLC contention
                 dest_state = self.database.get_channel_state(dest_id)
-                if not dest_state and ':' in dest_id:
-                    dest_state = self.database.get_channel_state(dest_id.replace(':', 'x'))
                 if dest_state and dest_state.get("state") == "congested":
                     self.plugin.log(
                         f"CONGESTION GUARD: Skipping {dest_id[:12]}... as rebalance target (HTLC slots stressed)",

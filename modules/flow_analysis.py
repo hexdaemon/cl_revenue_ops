@@ -64,6 +64,7 @@ class FlowMetrics:
         active_htlcs: Number of currently active HTLCs
         max_htlcs: Maximum allowed HTLCs on the channel
         is_congested: True if HTLC slots are >80% utilized
+        our_balance: Current outbound balance in sats
     """
     channel_id: str
     peer_id: str
@@ -79,6 +80,7 @@ class FlowMetrics:
     active_htlcs: int = 0
     max_htlcs: int = 483  # Default per BOLT spec
     is_congested: bool = False
+    our_balance: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -96,7 +98,8 @@ class FlowMetrics:
             "htlc_max": self.htlc_max,
             "active_htlcs": self.active_htlcs,
             "max_htlcs": self.max_htlcs,
-            "is_congested": self.is_congested
+            "is_congested": self.is_congested,
+            "our_balance": self.our_balance
         }
 
 
@@ -383,7 +386,8 @@ class FlowAnalyzer:
             htlc_max=htlc_max,
             active_htlcs=active_htlcs,
             max_htlcs=max_htlcs,
-            is_congested=is_congested
+            is_congested=is_congested,
+            our_balance=our_balance
         )
     
     def _get_daily_flow_from_listforwards(self, channel_id: Optional[str] = None) -> Dict[str, List[Dict[str, int]]]:
@@ -486,9 +490,11 @@ class FlowAnalyzer:
             
             total_weight += weight
             
-        if total_weight > 0:
-            ema_in /= total_weight
-            ema_out /= total_weight
+        if total_weight <= 0:
+            return 0.0, 0.0, 0, 0
+            
+        ema_in /= total_weight
+        ema_out /= total_weight
             
         return ema_in, ema_out, total_in, total_out
 

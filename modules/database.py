@@ -113,7 +113,10 @@ class Database:
                 trend_direction INTEGER NOT NULL DEFAULT 1,  -- 1 = increase, -1 = decrease
                 step_ppm INTEGER NOT NULL DEFAULT 50,  -- Current step size (for dampening)
                 consecutive_same_direction INTEGER NOT NULL DEFAULT 0,
-                last_update INTEGER NOT NULL DEFAULT 0
+                last_update INTEGER NOT NULL DEFAULT 0,
+                is_sleeping INTEGER NOT NULL DEFAULT 0,
+                sleep_until INTEGER NOT NULL DEFAULT 0,
+                stable_cycles INTEGER NOT NULL DEFAULT 0
             )
         """)
         
@@ -157,6 +160,7 @@ class Database:
                 in_msat INTEGER NOT NULL,
                 out_msat INTEGER NOT NULL,
                 fee_msat INTEGER NOT NULL,
+                resolution_time REAL DEFAULT 0,
                 timestamp INTEGER NOT NULL
             )
         """)
@@ -283,6 +287,13 @@ class Database:
         try:
             conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN stable_cycles INTEGER DEFAULT 0")
             self.plugin.log("Added stable_cycles column to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+            
+        # Schema migration: Add resolution_time to forwards for risk premium
+        try:
+            conn.execute("ALTER TABLE forwards ADD COLUMN resolution_time REAL DEFAULT 0")
+            self.plugin.log("Added resolution_time column to forwards")
         except sqlite3.OperationalError:
             pass  # Column already exists
         
@@ -662,16 +673,17 @@ class Database:
     # =========================================================================
     
     def record_forward(self, in_channel: str, out_channel: str, 
-                       in_msat: int, out_msat: int, fee_msat: int):
+                       in_msat: int, out_msat: int, fee_msat: int,
+                       resolution_time: float = 0):
         """Record a completed forward for real-time tracking."""
         conn = self._get_connection()
         now = int(time.time())
         
         conn.execute("""
             INSERT INTO forwards 
-            (in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (in_channel, out_channel, in_msat, out_msat, fee_msat, now))
+            (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, now))
     
     def get_channel_forwards(self, channel_id: str, since_timestamp: int) -> Dict[str, int]:
         """Get aggregate forward stats for a channel since a timestamp."""

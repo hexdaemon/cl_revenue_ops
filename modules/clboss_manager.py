@@ -46,9 +46,9 @@ class ClbossTags:
     CLOSE = "close"
     
     # For fee + rebalance control (most common use case)
-    # Pass as comma-separated string to clboss-unmanage
-    FEE_AND_BALANCE = "lnfee,balance"
-    ALL = "lnfee,balance,open,close"
+    # Pass as list or comma-separated string to manager methods
+    FEE_AND_BALANCE = ["lnfee", "balance"]
+    ALL = ["lnfee", "balance", "open", "close"]
 
 
 class ClbossManager:
@@ -180,10 +180,13 @@ class ClbossManager:
                 return result
             
             # Call clboss-unmanage with positional args: nodeid tags
+            # Normalize tag: if list, join with commas for clboss-unmanage
+            tags_str = ",".join(tag) if isinstance(tag, list) else tag
+            
             try:
                 unmanage_result = self.plugin.rpc.call(
                     "clboss-unmanage",
-                    [peer_id, tag]  # positional: nodeid, tags
+                    [peer_id, tags_str]  # positional: nodeid, tags
                 )
                 
                 result["success"] = True
@@ -242,13 +245,19 @@ class ClbossManager:
             result["message"] = f"[DRY RUN] Would remanage {peer_id} for {tag or 'all tags'}"
             self.plugin.log(result["message"])
             return result
-        
         try:
-            # Call clboss-manage to re-enable management
-            # clboss-manage nodeid tags (positional args)
-            tags_to_manage = [tag] if tag else ClbossTags.ALL
+            # Determine which tags to manage
+            if tag is None:
+                tags_to_process = ClbossTags.ALL
+            elif isinstance(tag, list):
+                tags_to_process = tag
+            else:
+                # Could be a single tag or a comma-separated string
+                # If it's a comma-separated string, clboss-manage can handle it
+                # or we could split it. CLN RPC usually handles comma-sep strings.
+                tags_to_process = [tag]
             
-            for t in tags_to_manage:
+            for t in tags_to_process:
                 try:
                     self.plugin.rpc.call(
                         "clboss-manage",

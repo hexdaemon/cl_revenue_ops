@@ -49,6 +49,7 @@ from modules.clboss_manager import ClbossManager
 from modules.config import Config
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
+from modules.capacity_planner import CapacityPlanner
 from modules.metrics import PrometheusExporter, MetricNames, METRIC_HELP
 
 # Initialize the plugin
@@ -62,6 +63,7 @@ clboss_manager: Optional[ClbossManager] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
+capacity_planner: Optional[CapacityPlanner] = None
 metrics_exporter: Optional[PrometheusExporter] = None
 
 # SCID to Peer ID cache for reputation tracking
@@ -234,7 +236,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     4. Set up timers for periodic execution
     5. Start Prometheus metrics exporter (if enabled)
     """
-    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, metrics_exporter
+    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, metrics_exporter
     
     plugin.log("Initializing cl-revenue-ops plugin...")
     
@@ -364,6 +366,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize analysis modules with profitability analyzer and metrics exporter
     flow_analyzer = FlowAnalyzer(plugin, config, database)
+    capacity_planner = CapacityPlanner(plugin, config, profitability_analyzer, flow_analyzer)
     fee_controller = PIDFeeController(plugin, config, database, clboss_manager, profitability_analyzer, metrics_exporter)
     rebalancer = EVRebalancer(plugin, config, database, clboss_manager, metrics_exporter)
     rebalancer.set_profitability_analyzer(profitability_analyzer)
@@ -685,10 +688,25 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
     
     if channel_id:
         result = flow_analyzer.analyze_channel(channel_id)
-        return {"channel": channel_id, "analysis": result.__dict__ if result else None}
+        return {"channel": channel_id, "analysis": result.to_dict() if result else None}
     else:
         run_flow_analysis()
         return {"status": "Flow analysis triggered"}
+
+
+
+@plugin.method("revenue-capacity-report")
+def revenue_capacity_report(plugin: Plugin, **kwargs):
+    """
+    Generate a strategic capital redeployment report.
+    
+    Identifies "Winner" channels for capital injection (Splice-In)
+    and "Loser" channels for capital extraction (Splice-Out/Close).
+    """
+    if capacity_planner is None:
+        raise RpcError("revenue-capacity-report", {}, "Capacity planner not initialized")
+        
+    return capacity_planner.generate_report()
 
 
 @plugin.method("revenue-set-fee")
@@ -924,6 +942,31 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
     except RpcError as e:
         plugin.log(f"Error resolving SCID {scid} to peer: {e}", level='warn')
         return None
+        
+
+def _parse_msat(msat_val: Any) -> int:
+    """
+    Safely convert msat values to integers.
+    Handles '1000msat' strings, raw integers, Millisatoshi objects, and plain numeric strings.
+    """
+    if msat_val is None:
+        return 0
+    if hasattr(msat_val, 'millisatoshis'):
+        return int(msat_val.millisatoshis)
+    if isinstance(msat_val, int):
+        return msat_val
+    if isinstance(msat_val, str):
+        # Strip suffix if present
+        if msat_val.endswith('msat'):
+            clean_val = msat_val[:-4]
+        else:
+            clean_val = msat_val
+            
+        try:
+            return int(clean_val)
+        except ValueError:
+            return 0
+    return 0
 
 
 @plugin.subscribe("forward_event")
@@ -942,6 +985,10 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     
     status = forward_event.get("status")
     in_channel = forward_event.get("in_channel")
+    
+    # Normalize SCID: replace colons with 'x' for consistency
+    if in_channel:
+        in_channel = in_channel.replace(':', 'x')
     
     # Track peer reputation for all forward outcomes
     if in_channel:
@@ -979,11 +1026,20 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     # Record successful forwards for flow metrics
     if status == "settled":
         out_channel = forward_event.get("out_channel")
-        in_msat = forward_event.get("in_msat", 0)
-        out_msat = forward_event.get("out_msat", 0)
-        fee_msat = forward_event.get("fee_msat", 0)
+        if out_channel:
+            out_channel = out_channel.replace(':', 'x')
+            
+        in_msat = _parse_msat(forward_event.get("in_msatoshi", 0))
+        out_msat = _parse_msat(forward_event.get("out_msatoshi", 0))
+        fee_msat = _parse_msat(forward_event.get("fee_msatoshi", 0))
         
-        database.record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat)
+        # Calculate resolution duration (Risk Premium tracking)
+        # durations in CLN are usually in seconds (float)
+        received_time = forward_event.get("received_time", 0)
+        resolved_time = forward_event.get("resolved_time", 0)
+        resolution_duration = resolved_time - received_time if resolved_time > 0 else 0
+        
+        database.record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_duration)
 
 
 @plugin.subscribe("connect")

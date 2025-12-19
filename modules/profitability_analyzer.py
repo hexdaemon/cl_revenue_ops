@@ -219,6 +219,30 @@ class ChannelProfitabilityAnalyzer:
         self._profitability_cache: Dict[str, ChannelProfitability] = {}
         self._cache_timestamp: int = 0
         self._cache_ttl: int = 300  # 5 minutes
+        
+    def _parse_msat(self, msat_val: Any) -> int:
+        """
+        Safely convert msat values to integers.
+        Handles '1000msat' strings, raw integers, Millisatoshi objects, and plain numeric strings.
+        """
+        if msat_val is None:
+            return 0
+        if hasattr(msat_val, 'millisatoshis'):
+            return int(msat_val.millisatoshis)
+        if isinstance(msat_val, int):
+            return msat_val
+        if isinstance(msat_val, str):
+            # Strip suffix if present
+            if msat_val.endswith('msat'):
+                clean_val = msat_val[:-4]
+            else:
+                clean_val = msat_val
+                
+            try:
+                return int(clean_val)
+            except ValueError:
+                return 0
+        return 0
     
     def analyze_all_channels(self) -> Dict[str, ChannelProfitability]:
         """
@@ -731,20 +755,14 @@ class ChannelProfitabilityAnalyzer:
                     continue
                 
                 # Calculate capacity
-                capacity = channel.get("total_msat", 0)
-                if isinstance(capacity, str):
-                    capacity = int(capacity.replace("msat", ""))
-                capacity = capacity // 1000  # Convert to sats
+                capacity_msat = self._parse_msat(channel.get("total_msat", 0))
+                capacity = capacity_msat // 1000  # Convert to sats
                 
                 # If capacity is 0, try spendable + receivable
                 if capacity == 0:
-                    spendable = channel.get("spendable_msat", 0)
-                    receivable = channel.get("receivable_msat", 0)
-                    if isinstance(spendable, str):
-                        spendable = int(spendable.replace("msat", ""))
-                    if isinstance(receivable, str):
-                        receivable = int(receivable.replace("msat", ""))
-                    capacity = (spendable + receivable) // 1000
+                    spendable_msat = self._parse_msat(channel.get("spendable_msat", 0))
+                    receivable_msat = self._parse_msat(channel.get("receivable_msat", 0))
+                    capacity = (spendable_msat + receivable_msat) // 1000
                 
                 funding_txid = channel.get("funding_txid", "")
                 
@@ -1347,15 +1365,11 @@ class ChannelProfitabilityAnalyzer:
                     }
                 
                 # Aggregate fee
-                fee_msat = forward.get("fee_msat", 0)
-                if isinstance(fee_msat, str):
-                    fee_msat = int(fee_msat.replace("msat", ""))
+                fee_msat = self._parse_msat(forward.get("fee_msat", 0))
                 revenue_map[out_channel]["fees_earned"] += fee_msat // 1000
                 
                 # Aggregate volume
-                out_msat = forward.get("out_msat", 0)
-                if isinstance(out_msat, str):
-                    out_msat = int(out_msat.replace("msat", ""))
+                out_msat = self._parse_msat(forward.get("out_msat", 0))
                 revenue_map[out_channel]["volume_routed"] += out_msat // 1000
                 
                 revenue_map[out_channel]["forward_count"] += 1
@@ -1399,14 +1413,10 @@ class ChannelProfitabilityAnalyzer:
             )
             
             for forward in result.get("forwards", []):
-                fee_msat = forward.get("fee_msat", 0)
-                if isinstance(fee_msat, str):
-                    fee_msat = int(fee_msat.replace("msat", ""))
+                fee_msat = self._parse_msat(forward.get("fee_msat", 0))
                 fees_earned += fee_msat // 1000
                 
-                out_msat = forward.get("out_msat", 0)
-                if isinstance(out_msat, str):
-                    out_msat = int(out_msat.replace("msat", ""))
+                out_msat = self._parse_msat(forward.get("out_msat", 0))
                 volume_routed += out_msat // 1000
                 
                 forward_count += 1
