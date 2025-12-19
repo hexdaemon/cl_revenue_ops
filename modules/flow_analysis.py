@@ -415,7 +415,8 @@ class FlowAnalyzer:
                     continue
                 
                 # Calculate age in days (0 = today/last 24h)
-                age_days = (now - received_time) // 86400
+                # Cast to int to prevent float index error if received_time is float
+                age_days = int((now - received_time) // 86400)
                 if age_days >= window_days:
                     continue
                 
