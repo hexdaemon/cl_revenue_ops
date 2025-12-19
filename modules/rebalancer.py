@@ -533,7 +533,7 @@ class JobManager:
             if primary_source in self.source_failure_counts:
                 # Significant reduction (rewarding success)
                 self.source_failure_counts[primary_source] = 0.0
-        
+
         # Update metrics
         if self.metrics:
             self.metrics.inc_counter(
@@ -1149,8 +1149,20 @@ class EVRebalancer:
             source_capacity = info.get("capacity", 1)
             source_turnover_rate = self._calculate_turnover_rate(cid, source_capacity)
             
-            # Weight opportunity cost by how actively the source is used
-            turnover_weight = min(1.0, source_turnover_rate * 7)
+            # BUFFER-AWARE OPPORTUNITY COST (Phase 5 fix)
+            # If turnover is low (<10% of cap/day), assume the rest is "Slack Inventory" (idle buffer).
+            # Slack inventory has lower opportunity cost because it's not being used actively.
+            # 
+            # Logic: If source_turnover_rate is low, reduce the turnover_weight.
+            # This makes idle liquidity cheaper to use for rebalancing.
+            if source_turnover_rate < 0.10:
+                # Channel is mostly idle. Effective weight should be very low.
+                # turnover_weight = 0.1 * 7 = 0.7 (standard) -> reduce to 0.1
+                turnover_weight = max(0.01, source_turnover_rate) # Linear down to 1%
+            else:
+                # Channel is active. Standard penalty applies.
+                turnover_weight = min(1.0, source_turnover_rate * 7)
+
             weighted_opp_cost = int(source_fee_ppm * turnover_weight)
             
             # Calculate spread: what we earn minus what it costs
