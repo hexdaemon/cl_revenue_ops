@@ -1,4 +1,4 @@
-# cl-revenue-ops (experimental, in-progress)
+# cl-revenue-ops beta
 
 A Revenue Operations Plugin for Core Lightning that provides intelligent fee management, profit-aware rebalancing, and enterprise-grade observability.
 
@@ -20,23 +20,20 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - Includes **wiggle dampening** to reduce step size on direction reversals
 - **Volatility reset**: Detects large revenue shifts (>50%) and resets step size for aggressive re-exploration
 - **Deadband Hysteresis**: Enters "sleep mode" during stable markets to reduce gossip noise
+- **HTLC Hold Risk Premium**: Markup for peers with high "Stall Risk" (avg_resolution_time > 10s)
+- **Dynamic Chain Cost Defense**: Automatically raises floor based on mempool congestion
 - Applies profitability multipliers based on channel health
-- Never drops below economic floor (based on channel costs)
+- Never drops below economic floor (based on **Replacement Cost**)
 
 ### Module 3: EV-Based Rebalancing with Opportunity Cost
 - Only executes rebalances with positive expected value
 - **Weighted opportunity cost**: Accounts for lost revenue from draining source channel
 - **Dynamic liquidity targeting**: Different targets based on flow state
-  - SOURCE channels: Target 85% outbound (keep them full to earn)
-  - BALANCED channels: Target 50% outbound (standard equilibrium)
-  - SINK channels: Target 15% outbound (they fill themselves for free)
 - **Persistent failure tracking**: Failure counts survive plugin restarts (prevents retry storms)
 - **Last Hop Cost estimation**: Uses `listchannels` to get peer's actual fee policy toward us
 - **Adaptive failure backoff**: Exponential cooldown for channels that keep failing
 - **HTLC Slot Awareness**: Prevents rebalancing into congested channels (>80% slot usage)
-- **Global Capital Controls**: Prevents over-spending with two safety checks:
-  - **Daily Budget**: Limits total rebalancing fees to a configurable amount per 24 hours
-   - **Wallet Reserve**: Aborts rebalancing if (confirmed on-chain + channel spendable) falls below the minimum threshold
+- **Global Capital Controls**: Daily Budget and Wallet Reserve checks
 - Uses sling for async background job execution
 
 ### Module 4: Channel Profitability Analyzer
@@ -52,7 +49,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - Metrics exported:
   - `cl_revenue_channel_fee_ppm` - Current fee rate per channel
   - `cl_revenue_channel_revenue_rate_sats_hr` - Revenue rate in sats/hour
-  - `cl_revenue_channel_is_sleeping` - Deadband hysteresis sleep state (1=sleeping, 0=awake)
+  - `cl_revenue_channel_is_sleeping` - Deadband hysteresis sleep state
   - `cl_revenue_channel_marginal_roi_percent` - Marginal ROI percentage
   - `cl_revenue_rebalance_cost_total_sats` - Total rebalancing costs
   - `cl_revenue_peer_reputation_score` - Peer success rate (0.0-1.0)
@@ -61,11 +58,13 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 ### Module 6: Traffic Intelligence
 - **Peer Reputation Tracking**: Tracks HTLC success/failure rates per peer
 - **Reputation-Weighted Fees**: Discounts volume from high-failure peers in fee optimization
-  - **Laplace Smoothing Formula**: `Score = (success + 1) / (success + failure + 2)`
-  - **Neutral Fallback**: New/unknown peers start at score 0.5
-  - **Time Decay**: Counts multiplied by `reputation_decay` (default 0.98) each flow-interval (~hourly). Daily decay ≈ 0.61; weekly ≈ 0.03
 - **HTLC Slot Monitoring**: Marks channels with >80% slot usage as CONGESTED
 - **Congestion Guards**: Skips fee updates and rebalancing into congested channels
+
+### Module 7: Capacity Augmentation & Splicing (Smart Growth)
+- **Growth Reports**: Identifies "Targets for Splice-In" (High ROI winners)
+- **Capital Liquidation**: Identifies "Sources for Splice-Out" (Zombie/Stagnant losers)
+- **Actionable Recommendations**: Suggests closing losers and splicing into winners to maximize capital efficiency
 
 ## Architecture
 
@@ -106,394 +105,65 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
        │   setchan    │              │    sling     │
        │   -nelfee    │              │  (async)     │
        └──────────────┘              └──────────────┘
-              │
-              ▼
-       ┌──────────────┐
-       │   clboss     │
-       │   unmanage   │
-       └──────────────┘
 ```
 
 ## Data Sources
 
-The plugin uses different Core Lightning RPCs depending on the task:
-
-| Data Type | Primary Source | Fallback | Notes |
-|-----------|----------------|----------|-------|
-| **Flow/Volume** | `listforwards` | — | Uses `short_channel_id` format; most reliable for channel mapping |
-| **Revenue** | `listforwards` | — | Aggregates `fee_msat` from settled forwards |
-| **Open Costs** | `bkpr-listaccountevents` | `estimated_open_cost_sats` config | Bookkeeper provides exact on-chain fees; uses summation logic for batch transactions |
-| **Rebalance Costs** | Local DB + `bkpr-listaccountevents` | Local DB only | DB tracks costs from plugin rebalances; bookkeeper may have additional history |
-| **Open Timestamp** | `bkpr-listaccountevents` | SCID block-height estimation | Bookkeeper `channel_open` event has exact timestamp |
-
-**Key differences:**
-- **bookkeeper** uses `funding_txid` (reversed bytes) as account identifier, not `short_channel_id`
-- **listforwards** uses `short_channel_id` which matches channel identifiers throughout the plugin
-- Bookkeeper data requires the `bookkeeper` plugin to be enabled; if unavailable, the plugin uses fallbacks
-
-**Recommendation:** Enable the `bookkeeper` plugin for accurate cost tracking (especially for batch channel opens).
+| Data Type | Primary Source | Fallback |
+|-----------|----------------|----------|
+| **Flow/Volume** | `listforwards` | — |
+| **Revenue** | `listforwards` | — |
+| **Open Costs** | `bkpr-listaccountevents` | `estimated_open_cost_sats` config |
+| **Rebalance Costs** | Local DB + `bkpr-listaccountevents` | Local DB only |
+| **Open Timestamp** | `bkpr-listaccountevents` | SCID block-height estimation |
 
 ## Installation
 
 ### Prerequisites
-
 1. Core Lightning node running
 2. Python 3.8+
-3. bookkeeper plugin enabled (recommended) or just listforwards
-4. **cln-sling plugin** installed (required for rebalancing)
-5. clboss (optional, for full integration)
+3. **cln-sling plugin** installed (required for rebalancing)
+4. bookkeeper plugin enabled (recommended)
 
 ### Install Steps
-
 ```bash
-# Clone or copy the plugin
 cd ~/.lightning/plugins
 git clone <repo-url> cl-revenue-ops
 cd cl-revenue-ops
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Make the plugin executable
 chmod +x cl-revenue-ops.py
-
-# Start the plugin dynamically
-lightning-cli plugin start ~/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py
-
-# Or add to config for automatic loading
-echo "plugin=~/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py" >> ~/.lightning/config
-```
-
-## Configuration Options
-
-All options can be set via `lightning-cli` at startup or in your config file:
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `revenue-ops-db-path` | `~/.lightning/revenue_ops.db` | SQLite database path |
-| `revenue-ops-flow-interval` | `3600` | Flow analysis interval (seconds) |
-| `revenue-ops-fee-interval` | `1800` | Fee adjustment interval (seconds) |
-| `revenue-ops-rebalance-interval` | `900` | Rebalance check interval (seconds) |
-| `revenue-ops-target-flow` | `100000` | Target daily flow per channel (sats) |
-| `revenue-ops-min-fee-ppm` | `10` | Minimum fee floor (PPM) |
-| `revenue-ops-max-fee-ppm` | `5000` | Maximum fee ceiling (PPM) |
-| `revenue-ops-rebalance-min-profit` | `10` | Min profit to trigger rebalance (sats) |
-| `revenue-ops-flow-window-days` | `7` | Days to analyze for flow |
-| `revenue-ops-clboss-enabled` | `true` | Enable clboss integration |
-| `revenue-ops-rebalancer` | `sling` | Rebalancer plugin to use |
-| `revenue-ops-daily-budget-sats` | `5000` | Max rebalancing fees per 24 hours (sats) |
-| `revenue-ops-min-wallet-reserve` | `1000000` | Min total funds to keep in reserve (sats) |
-| `revenue-ops-dry-run` | `false` | Log actions without executing |
-| `revenue-ops-htlc-congestion-threshold` | `0.8` | HTLC slot usage threshold (0.0-1.0) |
-| `revenue-ops-enable-reputation` | `true` | Enable peer reputation tracking |
-| `revenue-ops-reputation-decay` | `0.98` | Reputation decay factor per flow-interval |
-| `revenue-ops-enable-prometheus` | `false` | Enable Prometheus metrics HTTP server |
-| `revenue-ops-prometheus-port` | `9800` | Prometheus metrics HTTP port |
-| `revenue-ops-enable-kelly` | `false` | Scale rebalance budget using Kelly Criterion |
-| `revenue-ops-kelly-fraction` | `0.5` | Kelly fraction multiplier (0.5 = Half Kelly) |
-| `revenue-ops-pid-kp` | `0.5` | PID Proportional gain (legacy) |
-| `revenue-ops-pid-ki` | `0.1` | PID Integral gain (legacy) |
-| `revenue-ops-pid-kd` | `0.05` | PID Derivative gain (legacy) |
-
-*Note: The Hill Climbing fee controller manages its own internal state (step size, direction, sleep mode) automatically. PID options are legacy and may be removed in a future version.*
-
-Example config:
-
-```ini
-# ~/.lightning/config
-revenue-ops-target-flow=200000
-revenue-ops-min-fee-ppm=50
-revenue-ops-metrics-port=9800
-revenue-ops-dry-run=true  # Test mode
+lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 ```
 
 ## RPC Commands
 
-### `revenue-status`
-Get current plugin status and recent activity.
-
-```bash
-lightning-cli revenue-status
-```
-
-### `revenue-analyze [channel_id]`
-Run flow analysis on demand.
-
-```bash
-# Analyze all channels
-lightning-cli revenue-analyze
-
-# Analyze specific channel
-lightning-cli revenue-analyze 123x456x0
-```
-
-### `revenue-set-fee channel_id fee_ppm`
-Manually set a channel fee (with clboss unmanage).
-
-```bash
-lightning-cli revenue-set-fee 123x456x0 500
-```
-
-### `revenue-rebalance from_channel to_channel amount_sats [max_fee_sats]`
-Manually trigger a rebalance with profit constraints.
-
-```bash
-lightning-cli revenue-rebalance 123x456x0 789x012x1 500000
-```
-
-### `revenue-clboss-status`
-Check clboss integration status.
-
-```bash
-lightning-cli revenue-clboss-status
-```
-
-### `revenue-profitability [channel_id]`
-Get channel profitability analysis.
-
-```bash
-# Get summary of all channels grouped by profitability class
-lightning-cli revenue-profitability
-
-# Analyze specific channel
-lightning-cli revenue-profitability 123x456x0
-```
-
-**Data sources:** Revenue from `listforwards`; costs from `bkpr-listaccountevents` (with local DB fallback).
-
-Returns:
-- **profitable**: Positive ROI, earning more than costs
-- **break_even**: ROI near zero
-- **underwater**: Negative ROI, losing money
-- **zombie**: No routing activity at all
-
-### `revenue-history`
-Get lifetime financial history including closed channels.
-
-```bash
-lightning-cli revenue-history
-```
-
-**Data sources:** Aggregates from local DB (`forwards`, `channel_costs`, `rebalance_costs`, `lifetime_aggregates` tables). The DB is populated from `listforwards` and `bkpr-listaccountevents` during normal operation.
-
-Returns aggregate financial performance since the plugin was installed, including data from channels that have since been closed. This provides a true "Lifetime P&L" view:
-
-- **lifetime_revenue_sats**: Total routing fees earned (all time)
-- **lifetime_opening_costs_sats**: Total channel opening fees paid
-- **lifetime_rebalance_costs_sats**: Total rebalancing fees paid
-- **lifetime_total_costs_sats**: Opening + Rebalance costs
-- **lifetime_net_profit_sats**: Revenue minus total costs
-- **lifetime_roi_percent**: Return on investment percentage
-- **lifetime_forward_count**: Total number of forwards processed
-
-### `revenue-remanage peer_id [tag]`
-Re-enable clboss management for a peer.
-
-```bash
-lightning-cli revenue-remanage 03abc...def lnfee
-```
-
-## Manager-Override Pattern
-
-This plugin uses a "Manager-Override" pattern to coexist with clboss:
-
-1. **Detection**: Before changing any channel state, check if clboss is managing the peer
-2. **Override**: Call `clboss-unmanage` for the specific tag (e.g., `lnfee`)
-3. **Action**: Make our changes (set fee, trigger rebalance)
-4. **Track**: Record what we've unmanaged for later reversion if needed
-
-This allows:
-- clboss to handle channel creation and peer selection (what it's good at)
-- revenue-ops to handle fee optimization and profitable rebalancing (our specialty)
+- `revenue-status`: Get current plugin status and recent activity.
+- `revenue-analyze [channel_id]`: Run flow analysis on demand.
+- `revenue-set-fee channel_id fee_ppm`: Manually set a channel fee (with clboss unmanage).
+- `revenue-rebalance from to amount [max_fee]`: Manual triggered rebalance with profit constraints.
+- `revenue-profitability [channel_id]`: Get channel profitability analysis (PROFITABLE, ZOMBIE, etc).
+- `revenue-history`: Get lifetime financial history including closed channels.
+- `revenue-capacity-report`: Generate growth recommendations for splicing and capital redeployment.
 
 ## How It Works
 
-### Flow Analysis
-
-Every hour (configurable), the plugin:
-
-1. Queries bookkeeper or listforwards for the past 7 days
-2. Calculates net flow: `FlowRatio = (SatsOut - SatsIn) / Capacity`
-3. Classifies channels:
-   - `FlowRatio > 0.5`: **SOURCE** (draining out) - These are money printers!
-   - `FlowRatio < -0.5`: **SINK** (filling up) - These fill for free
-   - Otherwise: **BALANCED**
-
 ### Hill Climbing Fee Control
-
 Every 30 minutes (configurable), the plugin:
-
-1. **Perturb**: Make a small fee change in a direction
-2. **Observe**: Measure the resulting revenue rate (sats/hour) since last change
-3. **Compare**: Is revenue rate better or worse than before?
-4. **Decide**:
-   - If Revenue Rate Increased: Keep going in the same direction
-   - If Revenue Rate Decreased: Reverse direction (we went too far)
-5. **Dampening**: On direction reversal, reduce step size (wiggle dampening)
-6. **Deadband Hysteresis** (gossip noise reduction):
-   - If revenue rate change < 1% for 3 consecutive cycles: Enter sleep mode
-   - Sleep for 4x the fee interval (reduces `channel_update` broadcasts)
-   - Wake up immediately if revenue spikes >20%
-7. Enforce floor (economic minimum) and ceiling constraints
-8. Apply profitability multipliers based on channel health
+1. **Perturb**: Make a small fee change in a direction.
+2. **Observe**: Measure the resulting revenue rate (sats/hour) since last change.
+3. **Dampening**: Reduce step size on direction reversals to settle on optimal rates.
+4. **Stall Defense**: Detects peers capturing capital for too long and adjusts floor upwards.
+5. **Mempool Defense**: Adjusts floor in real-time to cover rising L1 replacement costs.
 
 ### EV Rebalancing
-
 Every 15 minutes (configurable), the plugin:
+1. Identifies channels low on outbound liquidity.
+2. **Dynamic Liquidity Targeting**: Targets 85% for Source, 50% for Balanced, 15% for Sink.
+3. **Opportunity Cost Calculation**: Subtracts potential routing revenue of Source from the spread.
+4. **Stagnant Recovery**: Identifies balanced but low-volume channels to use as Sources.
 
-1. Identifies channels low on outbound liquidity
-2. **CRITICAL: Checks flow state first**
-   - If target is a **SINK**: SKIP (it fills itself for free!)
-   - If target is a **SOURCE**: HIGH PRIORITY (keep it full!)
-3. **Dynamic Liquidity Targeting**:
-   - SOURCE channels: Target 85% outbound
-   - BALANCED channels: Target 50% outbound
-   - SINK channels: Target 15% outbound (only if critically low)
-4. **Estimates inbound fee with Last Hop Cost**:
-   - Queries `listchannels(source=peer_id)` to get peer's fee policy toward us
-   - Adds network buffer for intermediate hops
-5. **Calculates weighted opportunity cost**:
-   - Source fee weighted by source channel's turnover rate
-   - Spread = OutboundFee - InboundFee - WeightedOpportunityCost
-6. Only executes if spread is positive and profit > minimum
-7. **Adaptive failure backoff**: Exponential cooldown for failing channels
-8. Starts a `sling` job with a strict `maxppm` constraint
-
-### Sling Integration (Strategist & Driver Pattern)
-
-This plugin acts as the **Strategist** while `sling` is the **Driver**:
-
-```python
-# We calculate the EV constraint
-max_ppm = int((max_fee_msat / amount_msat) * 1_000_000)
-
-# We tell sling what to do via RPC
-plugin.rpc.call("sling-job", {
-   "scid": incoming_scid,   # Channel to fill
-   "direction": "pull",
-   "amount": amount_msat,
-   "maxppm": max_ppm,
-   "candidates": [outgoing_scid],
-})
-```
-
-This separation of concerns means:
-- **revenue-ops** handles the economics (when to rebalance, how much to pay)
-- **sling** handles the mechanics (pathfinding, HTLC management)
-
-### Anti-Thrashing Protection
-
-After a successful rebalance, the plugin keeps the peer unmanaged from clboss's rebalancing logic. This prevents clboss from immediately "fixing" the channel balance and wasting the fees we just paid.
-
-### Channel Profitability Analysis
-
-The profitability analyzer tracks the economic performance of each channel:
-
-**Cost Tracking:**
-- Opening costs from **bookkeeper plugin** (`bkpr-listaccountevents` onchain_fee events)
-- Channel open timestamps from bookkeeper `channel_open` events (or estimated from SCID block height)
-- Rebalancing costs from bookkeeper invoice events with `fees_msat`
-- Falls back to database cache, then config estimate if bookkeeper unavailable
-
-**Revenue Tracking:**
-- Routing fees earned from forwards through the channel
-
-**Marginal ROI Analysis:**
-- Calculates marginal ROI: return on the *last* unit of investment
-- Helps decide whether additional investment (rebalancing) is worthwhile
-- Channels with declining marginal ROI may not benefit from more capital
-
-**Classification Logic:**
-- **PROFITABLE**: ROI > 0% and net profit > 0
-- **BREAK_EVEN**: ROI between -5% and 5%
-- **UNDERWATER**: Negative ROI (costs exceed revenue)
-- **ZOMBIE**: No routing activity detected
-
-**Integration with Other Modules:**
-
-1. **Fee Controller**: Applies profitability multipliers
-   - Profitable channels: 1.0x (standard fees)
-   - Break-even channels: 1.1x (slightly higher to improve margins)
-   - Underwater channels: 1.2x (higher fees to recover costs)
-   - Zombie channels: 1.15x (higher to make any activity worthwhile)
-
-2. **Rebalancer**: Filters candidates by profitability
-   - Skips ZOMBIE channels (no point investing in dead channels)
-   - Skips deeply UNDERWATER channels (ROI < -50%)
-   - Proceeds with caution on mildly underwater channels
-
-## Monitoring
-
-### Prometheus Metrics
-
-The plugin exposes Prometheus metrics on port 9800 (configurable). Add to your Prometheus config:
-
-```yaml
-scrape_configs:
-  - job_name: 'cl-revenue-ops'
-    static_configs:
-      - targets: ['localhost:9800']
-```
-
-Access metrics directly:
-
-```bash
-curl http://localhost:9800/metrics
-```
-
-### Key Metrics for Grafana Dashboards
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `cl_revenue_channel_fee_ppm` | Gauge | Current fee rate per channel |
-| `cl_revenue_channel_revenue_rate_sats_hr` | Gauge | Revenue rate in sats/hour |
-| `cl_revenue_channel_is_sleeping` | Gauge | 1 if in sleep mode (deadband hysteresis) |
-| `cl_revenue_channel_marginal_roi_percent` | Gauge | Marginal ROI percentage |
-| `cl_revenue_rebalance_cost_total_sats` | Counter | Total rebalancing costs |
-| `cl_revenue_peer_reputation_score` | Gauge | Peer success rate (0.0-1.0) |
-
-### Database Queries
-
-Check the SQLite database for historical data:
-
-```bash
-# Recent fee changes
-sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM fee_changes ORDER BY timestamp DESC LIMIT 10;"
-
-# Recent rebalances
-sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM rebalance_history ORDER BY timestamp DESC LIMIT 10;"
-
-# Channel profitability
-sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM channel_costs;"
-
-# Peer reputation scores
-sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM peer_reputation ORDER BY (success_count + failure_count) DESC LIMIT 20;"
-
-# Channels in sleep mode
-sqlite3 ~/.lightning/revenue_ops.db "SELECT channel_id, is_sleeping, sleep_until FROM fee_strategy_state WHERE is_sleeping = 1;"
-```
-
-## Troubleshooting
-
-### Plugin won't start
-- Check Python version: `python3 --version` (need 3.8+)
-- Install dependencies: `pip install pyln-client`
-- Check logs: `lightning-cli getlog debug | grep revenue`
-
-### Fees not changing
-- Ensure `dry-run` is `false`
-- Check if clboss is reverting (enable `clboss-enabled`)
-- Verify flow analysis has run: `lightning-cli revenue-status`
-
-### Rebalances not happening
-- Check if spread is positive: `lightning-cli revenue-status`
-- Verify rebalancer plugin is installed
-- Check minimum profit threshold
+### Fire Sale Mode
+Zombie or deeply Underwater channels are automatically set to 0-1 PPM fees. This encourages the network to drain the channel for us, avoiding on-chain closing costs.
 
 ## License
-
-MIT License
-
-## Contributing
-
-Contributions welcome! Please open issues or PRs on the repository.
+MIT
