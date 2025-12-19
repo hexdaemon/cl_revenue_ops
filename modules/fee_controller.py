@@ -280,6 +280,43 @@ class HillClimbingFeeController:
         now = int(time.time())
         
         # =====================================================================
+        # FIRE SALE MODE: Dump inventory for dead channels
+        # If channel is ZOMBIE or UNDERWATER (and old), drop fees to near zero
+        # to encourage the network to drain it for us (OpEx) vs expensive close (CapEx).
+        # =====================================================================
+        if self.profitability:
+            from .profitability_analyzer import ProfitabilityClass
+            prof_data = self.profitability.get_profitability(channel_id)
+            
+            if prof_data and prof_data.days_open > 90:
+                is_dead = False
+                if prof_data.classification == ProfitabilityClass.ZOMBIE:
+                    is_dead = True
+                elif prof_data.classification == ProfitabilityClass.UNDERWATER:
+                    # Only fire sale deeply underwater channels
+                    if prof_data.roi_percent < -50.0:
+                        is_dead = True
+                
+                if is_dead:
+                    # TARGET PRICE: 1 PPM (Effectively free)
+                    if current_fee_ppm > 1:
+                        reason = f"FIRE SALE: Dumping inventory for {channel_id[:12]}... (ROI={prof_data.roi_percent:.1f}%)"
+                        result = self.set_channel_fee(channel_id, 1, reason=reason)
+                        if result.get("success"):
+                            # Update state to reflect we took action
+                            hc_state.last_update = now
+                            self._save_hill_climb_state(channel_id, hc_state)
+                            return FeeAdjustment(
+                                channel_id=channel_id,
+                                peer_id=peer_id,
+                                old_fee_ppm=current_fee_ppm,
+                                new_fee_ppm=1,
+                                reason=reason,
+                                hill_climb_values={}
+                            )
+                    return None # Already at floor
+        
+        # =====================================================================
         # DEADBAND HYSTERESIS: Sleep Status Check (Phase 4: Stability & Scaling)
         # Reduces gossip noise by suppressing fee updates when the market is stable
         # =====================================================================
@@ -585,12 +622,13 @@ class HillClimbingFeeController:
         
         # Check if fee changed meaningfully
         fee_change = abs(new_fee_ppm - current_fee_ppm)
-
-        #allow any integer change if the fee is low
+        
+        # FIX: "Low Fee Trap" Logic (Phase 7 Fix)
+        # Allow small integer changes (1ppm) for low-fee channels to enable fine-tuning
         if current_fee_ppm < 100:
-            min_change = 1  # Allow fine-tuning at the bottom
+            min_change = 1
         else:
-            min_change = max(5, current_fee_ppm * 0.03)
+            min_change = max(5, current_fee_ppm * 0.03)  # 3% or 5 ppm minimum
         
         # Always update state for tracking (with rate-based values)
         hc_state.last_revenue_rate = current_revenue_rate
@@ -767,6 +805,7 @@ class HillClimbingFeeController:
         
         ALGORITHM:
         1. Base Floor: Amortized open/close costs over lifetime volume.
+           (Phase 7: REPLACEMENT COST PRICING logic)
         2. Risk Premium: Additional fee needed to cover on-chain enforcement diff
            during high congestion for typical HTLC sizes.
            
@@ -786,7 +825,9 @@ class HillClimbingFeeController:
         floor_ppm = ChainCostDefaults.calculate_floor_ppm(capacity_sats)
         
         if dynamic_costs:
-            # 1. Calculate Base Floor (Cost Recovery)
+            # 1. Calculate Base Floor (Cost Recovery) using REPLACEMENT COST
+            # We ignore historical costs (what we paid) and look at what it costs
+            # to replace the channel today.
             open_cost = dynamic_costs.get("open_cost_sats", ChainCostDefaults.CHANNEL_OPEN_COST_SATS)
             close_cost = dynamic_costs.get("close_cost_sats", ChainCostDefaults.CHANNEL_CLOSE_COST_SATS)
             
@@ -795,6 +836,15 @@ class HillClimbingFeeController:
             
             if estimated_lifetime_volume > 0:
                 base_floor = (total_chain_cost / estimated_lifetime_volume) * 1_000_000
+                
+                # Check if replacement cost is driving the floor up significantly
+                if base_floor > floor_ppm:
+                    self.plugin.log(
+                        f"REPLACEMENT COST PRICING: Raising floor to {int(base_floor)} PPM "
+                        f"based on current chain fees.", 
+                        level='debug'
+                    )
+                
                 floor_ppm = max(floor_ppm, int(base_floor))
                 
             # 2. Calculate Risk Premium (Congestion Defense)

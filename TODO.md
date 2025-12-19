@@ -106,7 +106,7 @@ Automate the management of Core Lightning Liquidity Ads (leases).
 ## Phase 7: Alpha Maximization (Yield Optimization)
 *These are newly identified inefficiencies ("Alpha Leaks") that require logic updates to maximize ROI.*
 
-### 5. Replacement Cost Pricing (Accounting Fix)
+### 5. Replacement Cost Pricing (Accounting Fix) ✅ COMPLETED
 **Objective:** Price liquidity based on the current cost to replace it, not the historical cost paid to open the channel.
 
 **Context Files:**
@@ -124,7 +124,7 @@ Update the fee floor calculation to use Replacement Cost instead of Historical C
     - *Rationale:* In a rising fee market, we must charge enough to replace the channel at *today's* prices, not 2023 prices.
 ```
 
-### 6. "Fire Sale" Mode (Capital Preservation)
+### 6. "Fire Sale" Mode (Capital Preservation) ✅ COMPLETED
 **Objective:** Drain dead channels via routing (cheap) rather than closing them on-chain (expensive).
 
 **Context Files:**
