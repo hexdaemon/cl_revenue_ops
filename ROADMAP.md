@@ -65,10 +65,8 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 *Objective: This phase shifts the plugin from "Maintenance" to "Growth & Pruning," automating the capital allocation decisions that usually require manual operator intervention.*
 
 - [x] **Dynamic Chain Cost Defense (Mempool Awareness)**: Automatically adjust the fee floor based on current L1 congestion to cover the "Risk Premium" of on-chain enforcement.
-- [ ] **The "HTLC Hold" Risk Premium (Capital Efficiency)**: Price-in the capital lockup time by charging a premium to high-latency peers.
-    - **Logic**: Track `avg_resolution_time` per peer. If ` > 10s`, apply +20% fee markup.
-- [ ] **Capacity Augmentation (Smart Splicing)**: Detect high-performing channels that are capacity-constrained and recommend (or execute) a splice-in.
-- [ ] **Automated Liquidity Ads (Leasing)**: Monetize excess inbound capacity on "Sink" channels by selling it via Liquidity Ads.
+- [ ] **The "HTLC Hold" Risk Premium (Capital Efficiency)**: Price-in capital lockup. Track `avg_resolution_time` and standard deviation ("Stall Risk"). If `avg > 10s` or `std > 5s`, apply +20% fee markup.
+- [ ] **Capacity Augmentation (Smart Splicing)**: This is the "Growth" lever. Use Phase 7 data (Fire Sale/Stagnant) to recommend: "Close A (Loser), Splice into B (Source Winner)."
 
 ## Phase 7: Alpha Maximization (Yield Optimization)
 *Objective: Optimize for capital efficiency and yield by fixing accounting gaps and automating inventory liquidation.*
@@ -78,4 +76,5 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **"Stagnant Inventory" Awakening**: Treat balanced but low-volume channels as Sources to redeploy idle capital to high-demand areas.
 
 ---
+*Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
 *Roadmap updated: December 19, 2025*

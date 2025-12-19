@@ -29,7 +29,7 @@ Reason: The current logic prevents the Hill Climber from fine-tuning fees at the
 ## Phase 5: Network Resilience & Optimization (In Progress)
 
 ### 2. The "HTLC Hold" Risk Premium (Capital Efficiency)
-**Objective:** Price-in the capital lockup time by charging a premium to high-latency peers.
+**Objective:** Price-in the capital lockup time by charging a premium to high-latency or high-variance ("Stalling") peers.
 
 **Context Files:**
 - `cl-revenue-ops.py` (Subscriber update)
@@ -38,21 +38,23 @@ Reason: The current logic prevents the Hill Climber from fine-tuning fees at the
 
 **AI Prompt:**
 ```text
-Implement "HTLC Hold" Risk Premium to penalize peers that lock up capital for long periods.
+Implement "HTLC Hold" Risk Premium to penalize peers that lock up capital.
 
 1.  **Database Upgrade (`modules/database.py`)**:
     - Modify the `forwards` table to add a `resolution_time` column (REAL).
-    - Update `record_forward()` to accept and store this value.
-    - Add `get_average_resolution_time(peer_id, duration_seconds)` to calculate the mean latency for a peer over a window.
+    - Update `record_forward()` to store this value.
+    - Add `get_peer_latency_stats(peer_id, window_seconds)`: Return BOTH `mean` and `std_dev` of resolution times.
+    - *Rationale:* Consistent slowness is bad, but high variance ("Stalling") is worse.
 
 2.  **Notification Logic (`cl-revenue-ops.py`)**:
-    - In `on_forward_event()`, calculate the forward duration using `resolved_time` and `received_time` from the event.
+    - In `on_forward_event()`, calculate `resolution_time = resolved_time - received_time`.
     - Pass this duration to `database.record_forward()`.
 
 3.  **Fee Logic (`modules/fee_controller.py`)**:
-    - In `_calculate_floor()`, fetch the peer's average resolution time for the last 24h.
-    - If `avg_resolution_time > 10` seconds, apply a +20% markup to the `floor_ppm`.
-    - Log: "HTLC HOLD DEFENSE: Peer {peer_id} has high latency ({avg_time}s). Applying 20% markup."
+    - In `_calculate_floor()`, fetch latency stats (mean + std_dev) for the last 24h.
+    - **Stall Risk Check:** If `mean > 10s` OR `std_dev > 5s`:
+        - Apply a +20% markup to the `floor_ppm`.
+        - Log: "HTLC HOLD DEFENSE: Peer {peer_id} has high Stall Risk (avg={mean}s, std={std_dev}s). Applying 20% markup."
 ```
 
 ---
@@ -60,45 +62,29 @@ Implement "HTLC Hold" Risk Premium to penalize peers that lock up capital for lo
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 
 ### 3. Capacity Augmentation (Smart Splicing)
-**Objective:** Detect high-performing channels that are capacity-constrained and recommend a splice-in.
+**Objective:** Identify "Growth" levers by redeploying capital from dead channels to sold-out winners.
 
 **Context Files:**
 - `modules/capacity_planner.py` (New Module)
 - `modules/flow_analysis.py`
+- `modules/profitability_analyzer.py`
 
 **AI Prompt:**
 ```text
-Create `modules/capacity_planner.py` to identify "Winner" channels needing capital.
+Create `modules/capacity_planner.py` to identify capital redeployment opportunities.
 
-1.  **Identify Winners**:
-    - Query `profitability_analyzer` for channels with `marginal_roi > 20%`.
-    - Query `flow_analysis` for channels with `flow_ratio > 0.8` (Source) OR `flow_ratio < -0.8` (Sink).
+1.  **Identify Winners (Targets for Splice-In)**:
+    - `marginal_roi > 20%`.
+    - `flow_ratio > 0.8` (Source) AND `turnover > 0.5` (Sold out).
 
-2.  **Calculate Velocity**:
-    - `turnover = daily_volume / capacity`.
-    - If `turnover > 0.5` (50% of cap moves daily), the channel is too small.
+2.  **Identify Losers (Sources for Splice-Out/Close)**:
+    - Channels in `FIRE SALE` mode (Zombie/Deeply Underwater).
+    - Balanced channels with `turnover < 0.0015` (Stagnant).
 
 3.  **Action**:
-    - Generate a report: `revenue-capacity-report`.
-    - Output: "RECOMMENDATION: Splice {scid}. Current Cap: {cap}. Suggested: {cap * 2}. Reason: High Turnover ({turnover})."
-```
-
-### 4. Automated Liquidity Ads (Leasing)
-**Objective:** Monetize excess inbound capacity on "Sink" channels via Liquidity Ads.
-
-**Context Files:**
-- `modules/flow_analysis.py`
-- `cl-revenue-ops.py`
-
-**AI Prompt:**
-```text
-Automate the management of Core Lightning Liquidity Ads (leases).
-
-1.  **Strategy**:
-    - If `total_sink_capacity > 50,000,000` (50M sats sitting idle in Sinks):
-        - Enable liquidity ads: `funder-update policy=match, lease_fee_base=..., lease_fee_basis=...`
-    - If `total_sink_capacity` drops:
-        - Disable/Throttle ads to preserve liquidity for routing.
+    - Generate `revenue-capacity-report`.
+    - Recommendation Logic: "STRATEGIC REDEPLOYMENT: Close channel {loser_scid} (Fire Sale/Stagnant) and Splice the funds into {winner_scid} (High ROI Source)."
+    - This creates a self-optimizing loop where capital flows toward yield.
 ```
 
 ---
@@ -106,7 +92,7 @@ Automate the management of Core Lightning Liquidity Ads (leases).
 ## Phase 7: Alpha Maximization (Yield Optimization)
 *These are newly identified inefficiencies ("Alpha Leaks") that require logic updates to maximize ROI.*
 
-### 5. Replacement Cost Pricing (Accounting Fix) ✅ COMPLETED
+### 4. Replacement Cost Pricing (Accounting Fix) ✅ COMPLETED
 **Objective:** Price liquidity based on the current cost to replace it, not the historical cost paid to open the channel.
 
 **Context Files:**
@@ -124,7 +110,7 @@ Update the fee floor calculation to use Replacement Cost instead of Historical C
     - *Rationale:* In a rising fee market, we must charge enough to replace the channel at *today's* prices, not 2023 prices.
 ```
 
-### 6. "Fire Sale" Mode (Capital Preservation) ✅ COMPLETED
+### 5. "Fire Sale" Mode (Capital Preservation) ✅ COMPLETED
 **Objective:** Drain dead channels via routing (cheap) rather than closing them on-chain (expensive).
 
 **Context Files:**
@@ -143,7 +129,7 @@ Implement "Fire Sale" mode for Zombie channels.
     - This encourages the network to drain the channel for us, saving the closing fee.
 ```
 
-### 7. "Stagnant Inventory" Awakening (Rebalancer) ✅ COMPLETED
+### 6. "Stagnant Inventory" Awakening (Rebalancer) ✅ COMPLETED
 **Objective:** Treat balanced but low-volume channels as "Sources" to redeploy that idle capital.
 
 **Context Files:**
