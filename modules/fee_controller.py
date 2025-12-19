@@ -135,7 +135,7 @@ class HillClimbingFeeController:
     MIN_STEP_PPM = 10       # Minimum step size (floor for dampening)
     MAX_STEP_PPM = 200      # Maximum step size
     MAX_CONSECUTIVE = 5     # Max consecutive moves in same direction before reducing step
-    DAMPENING_FACTOR = 0.8  # Step size decay factor on direction reversal (wiggle dampening)
+    DAMPENING_FACTOR = 0.5  # Step size decay factor on direction reversal (halve the step)
     MIN_OBSERVATION_HOURS = 1.0  # Minimum hours between fee changes for valid signal
     VOLATILITY_THRESHOLD = 0.50  # 50% change in revenue rate triggers volatility reset
     
@@ -536,6 +536,14 @@ class HillClimbingFeeController:
             new_direction = last_direction
             decision_reason = f"rate_up_{rate_change:.2f}sats_hr_continue"
             hc_state.consecutive_same_direction += 1
+            
+            # ADAPTIVE STEP SIZING: Acceleration
+            # If revenue increased significantly (>20%), double step size to capture the trend
+            if rate_change_ratio > 0.20:
+                old_step = step_ppm
+                step_ppm = min(int(step_ppm * 2), self.MAX_STEP_PPM)
+                if step_ppm != old_step:
+                    decision_reason += f"_accelerate_step_{old_step}->{step_ppm}"
         elif rate_change < 0:
             # Revenue rate decreased! Reverse direction
             new_direction = -last_direction
