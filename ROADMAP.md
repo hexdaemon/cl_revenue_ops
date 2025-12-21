@@ -86,7 +86,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **"Fire Sale" Mode**: Automatically dump inventory for Zombie or Underwater channels at 0-1 PPM fees to avoid manual closure costs.
 - [x] **"Stagnant Inventory" Awakening**: Treat balanced but low-volume channels as Sources to redeploy idle capital to high-demand areas.
 
-## Phase 8: "The 1% Node" Strategy Path
+## Phase 7: "The 1% Node" Strategy Path
 *Objective: Institutional-grade Liquidity Management focusing on Scarcity, Irreplaceability, Volatility, and Market Presence.*
 
 - [ ] **Mempool Acceleration (Vegas Reflex)**: 
