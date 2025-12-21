@@ -156,8 +156,9 @@ Every 30 minutes (configurable), the plugin execute the **Alpha Sequence**:
    - **CONGESTION**: If HTLC slots are >80% utilized, fee is pushed to max (`ceiling_ppm`) regardless of revenue.
    - **FIRE SALE**: If channel is Zombie/Underwater, fee is dropped to 1 PPM to drain inventory.
 3. **Hill Climbing**: If not in a critical state, perform the "Perturb & Observe" cycle to find the revenue-maximizing point.
-4. **Gossip Hysteresis (5% Gate)**: Compare target fee to last broadcast.
-   - If change < 5% and not a state transition: Skip RPC, pause observation timer.
+4. **Redundant Update Guard**: If target fee == current fee, skip gossip but reset observation timer (accepting the current fee).
+5. **Gossip Hysteresis (5% Gate)**: Compare target fee to last broadcast.
+   - If change < 5% and not a state transition: Skip RPC, pause observation timer to gain better signal.
    - If change > 5% or state transition: Execute `setchannel` RPC, reset observation timer.
 
 This prioritized flow ensures the node remains responsive to emergencies while being an efficient, non-spammy gossip peer.

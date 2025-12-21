@@ -265,7 +265,8 @@ class HillClimbingFeeController:
         is_congested = (state and state.get("state") == "congested")
         
         # Get current fee
-        current_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
+        raw_chain_fee = channel_info.get("fee_proportional_millionths", 0)
+        current_fee_ppm = raw_chain_fee
         if current_fee_ppm == 0:
             current_fee_ppm = self.config.min_fee_ppm  # Initialize if not set
         
@@ -552,6 +553,7 @@ class HillClimbingFeeController:
             new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
             new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
 
+
         # Check if fee changed meaningfully (Alpha Guard)
         fee_change = abs(new_fee_ppm - current_fee_ppm)
         if current_fee_ppm < 100:
@@ -600,6 +602,18 @@ class HillClimbingFeeController:
                  f"step={step_ppm}ppm, state={flow_state}, "
                  f"liquidity={bucket} ({outbound_ratio:.0%}), "
                  f"{marginal_roi_info}")
+        
+        # IDEMPOTENCY GUARD: Skip RPC if target is physically set (Phase 5.5)
+        if new_fee_ppm == raw_chain_fee:
+            hc_state.last_revenue_rate = current_revenue_rate
+            hc_state.last_fee_ppm = raw_chain_fee
+            hc_state.last_broadcast_fee_ppm = new_fee_ppm
+            hc_state.last_state = decision_reason
+            hc_state.trend_direction = new_direction
+            hc_state.step_ppm = step_ppm
+            hc_state.last_update = now  # Reset observation timer
+            self._save_hill_climb_state(channel_id, hc_state)
+            return None
         
         # Apply the fee change (Significant change -> Broadcast)
         result = self.set_channel_fee(channel_id, new_fee_ppm, reason=reason)
