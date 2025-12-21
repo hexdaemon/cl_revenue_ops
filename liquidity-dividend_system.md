@@ -110,4 +110,4 @@ To protect the pool from sudden fee spikes when channels close:
 2.  **No Guarantee of Profit:** Just like a self-managed node, routing activity may not always exceed rebalancing costs.
 3.  **Operator Discretion:** The Node Operator maintains control over channel selection and peer peering to ensure overall node health.
 
-**Status: This specification is complete and verified against team review feedback. READY FOR DEVELOPMENT.**
+**Status: This specification is ready for team review feedback.**
