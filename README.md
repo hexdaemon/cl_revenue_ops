@@ -19,6 +19,8 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - Actively seeks the optimal fee point where `Revenue = Volume × Fee` is maximized
 - Includes **wiggle dampening** to reduce step size on direction reversals
 - **Volatility reset**: Detects large revenue shifts (>50%) and resets step size for aggressive re-exploration
+- **Gossip Hysteresis**: Suppresses small fee updates (<5% change) to reduce network noise; automatically "pauses" the observation window until a significant move is triggered.
+- **Alpha Sequence**: A prioritized decision flow (Floor -> Critical States -> Hill Climbing -> Hysteresis) that ensures emergency states (CONGESTION, FIRE_SALE) always take precedence and are broadcasted immediately.
 - **Deadband Hysteresis**: Enters "sleep mode" during stable markets to reduce gossip noise
 - **HTLC Hold Risk Premium**: Markup for peers with high "Stall Risk" (avg_resolution_time > 10s)
 - **Dynamic Chain Cost Defense**: Automatically raises floor based on mempool congestion
@@ -147,13 +149,18 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 
 ## How It Works
 
-### Hill Climbing Fee Control
-Every 30 minutes (configurable), the plugin:
-1. **Perturb**: Make a small fee change in a direction.
-2. **Observe**: Measure the resulting revenue rate (sats/hour) since last change.
-3. **Dampening**: Reduce step size on direction reversals to settle on optimal rates.
-4. **Stall Defense**: Detects peers capturing capital for too long and adjusts floor upwards.
-5. **Mempool Defense**: Adjusts floor in real-time to cover rising L1 replacement costs.
+### Hill Climbing & Alpha Sequence Fee Control
+Every 30 minutes (configurable), the plugin execute the **Alpha Sequence**:
+1. **Floor Calculation**: Establish the absolute economic minimum fee (including dynamic L1 chain costs).
+2. **Critical State Check**:
+   - **CONGESTION**: If HTLC slots are >80% utilized, fee is pushed to max (`ceiling_ppm`) regardless of revenue.
+   - **FIRE SALE**: If channel is Zombie/Underwater, fee is dropped to 1 PPM to drain inventory.
+3. **Hill Climbing**: If not in a critical state, perform the "Perturb & Observe" cycle to find the revenue-maximizing point.
+4. **Gossip Hysteresis (5% Gate)**: Compare target fee to last broadcast.
+   - If change < 5% and not a state transition: Skip RPC, pause observation timer.
+   - If change > 5% or state transition: Execute `setchannel` RPC, reset observation timer.
+
+This prioritized flow ensures the node remains responsive to emergencies while being an efficient, non-spammy gossip peer.
 
 ### EV Rebalancing
 Every 15 minutes (configurable), the plugin:

@@ -61,6 +61,16 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Source Reliability Scoring**: Penalize source channels in the rebalancer selection logic if they have a history of routing failures.
 - [x] **Database Rollups**: Summarize old forwarding data into daily stats before pruning to maintain long-term history without bloat.
 
+## Phase 5.5: Stability & Efficiency Patches
+*Objective: Refine algorithm performance to be enterprise-grade and reduce network overhead.*
+
+- [x] **Delta-Based Gossip Updates (Gossip Hysteresis)**:
+    - Implement 5% gate to suppress redundant updates.
+    - **Observation Pause**: Freeze Hill Climbing timer when gossip is skipped to accumulate more data.
+    - **Critical State Overrides**: Forced immediate broadcast for Congestion and Fire Sale transitions.
+- [x] **The "Alpha Sequence" Fee Logic**: Refactored decision flow to prioritize emergency states over discovery.
+- [x] **Low Fee Trap Fix**: Enabled fine-tuning (1 PPM steps) for inexpensive, high-volume channels.
+
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 *Objective: This phase shifts the plugin from "Maintenance" to "Growth & Pruning," automating the capital allocation decisions that usually require manual operator intervention.*
 
@@ -77,4 +87,4 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
-*Roadmap updated: December 19, 2025*
+*Roadmap updated: December 21, 2025*
