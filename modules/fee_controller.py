@@ -66,6 +66,7 @@ class HillClimbState:
         is_sleeping: Deadband hysteresis - True if channel is in sleep mode
         sleep_until: Unix timestamp when to wake up from sleep mode
         stable_cycles: Number of consecutive stable cycles (for entering sleep)
+        last_broadcast_fee_ppm: The last fee PPM broadcasted to the network
     """
     last_revenue_rate: float = 0.0  # Revenue rate in sats/hour
     last_fee_ppm: int = 0
@@ -76,6 +77,8 @@ class HillClimbState:
     is_sleeping: bool = False  # Deadband hysteresis sleep state
     sleep_until: int = 0  # Unix timestamp when to wake up
     stable_cycles: int = 0  # Consecutive stable cycles counter
+    last_broadcast_fee_ppm: int = 0  # Last fee PPM broadcasted to the network
+    last_state: str = 'balanced'  # State during last broadcast
 
 
 @dataclass
@@ -258,16 +261,8 @@ class HillClimbingFeeController:
         Returns:
             FeeAdjustment if fee was changed, None otherwise
         """
-        # =====================================================================
-        # CONGESTION GUARD: Skip fee updates when HTLC slots are stressed
-        # Fee changes are meaningless when channel can't accept more HTLCs
-        # =====================================================================
-        if state and state.get("state") == "congested":
-            self.plugin.log(
-                f"CONGESTION GUARD: Skipping fee update for {channel_id[:12]}... (HTLC slots stressed)",
-                level='info'
-            )
-            return None
+        # Detect critical state (Phase 5.5)
+        is_congested = (state and state.get("state") == "congested")
         
         # Get current fee
         current_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
@@ -279,42 +274,17 @@ class HillClimbingFeeController:
         
         now = int(time.time())
         
-        # =====================================================================
-        # FIRE SALE MODE: Dump inventory for dead channels
-        # If channel is ZOMBIE or UNDERWATER (and old), drop fees to near zero
-        # to encourage the network to drain it for us (OpEx) vs expensive close (CapEx).
-        # =====================================================================
+        # Decision for target fee (The Alpha Sequence)
+        is_fire_sale = False
         if self.profitability:
             from .profitability_analyzer import ProfitabilityClass
             prof_data = self.profitability.get_profitability(channel_id)
-            
             if prof_data and prof_data.days_open > 90:
-                is_dead = False
                 if prof_data.classification == ProfitabilityClass.ZOMBIE:
-                    is_dead = True
+                    is_fire_sale = True
                 elif prof_data.classification == ProfitabilityClass.UNDERWATER:
-                    # Only fire sale deeply underwater channels
                     if prof_data.roi_percent < -50.0:
-                        is_dead = True
-                
-                if is_dead:
-                    # TARGET PRICE: 1 PPM (Effectively free)
-                    if current_fee_ppm > 1:
-                        reason = f"FIRE SALE: Dumping inventory for {channel_id[:12]}... (ROI={prof_data.roi_percent:.1f}%)"
-                        result = self.set_channel_fee(channel_id, 1, reason=reason)
-                        if result.get("success"):
-                            # Update state to reflect we took action
-                            hc_state.last_update = now
-                            self._save_hill_climb_state(channel_id, hc_state)
-                            return FeeAdjustment(
-                                channel_id=channel_id,
-                                peer_id=peer_id,
-                                old_fee_ppm=current_fee_ppm,
-                                new_fee_ppm=1,
-                                reason=reason,
-                                hill_climb_values={}
-                            )
-                    return None # Already at floor
+                        is_fire_sale = True
         
         # =====================================================================
         # DEADBAND HYSTERESIS: Sleep Status Check (Phase 4: Stability & Scaling)
@@ -475,7 +445,7 @@ class HillClimbingFeeController:
             if prof_data:
                 marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
         
-        # Calculate floor and ceiling
+        # Calculate Floor and Ceiling
         floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id)
         floor_ppm = max(floor_ppm, self.config.min_fee_ppm)
         # Apply flow state to floor (sinks can go lower)
@@ -484,164 +454,145 @@ class HillClimbingFeeController:
         
         ceiling_ppm = self.config.max_fee_ppm
         
-        # HILL CLIMBING DECISION (Rate-Based)
-        # Compare current revenue RATE to last observed revenue RATE
-        rate_change = current_revenue_rate - hc_state.last_revenue_rate
-        last_direction = hc_state.trend_direction
-        previous_rate = hc_state.last_revenue_rate  # Save for logging before update
+        # Target Decision Block (The Alpha Sequence)
+        new_fee_ppm = 0
+        target_found = False
         
-        # Get current step size from state (may have been dampened)
-        step_ppm = hc_state.step_ppm
-        if step_ppm <= 0:
-            step_ppm = self.STEP_PPM  # Reset to default if invalid
-        
-        # VOLATILITY RESET: Detect large revenue shifts and reset step size
-        # If revenue rate changed by more than VOLATILITY_THRESHOLD (50%), the demand
-        # curve has likely shifted significantly. A small dampened step (e.g., 10ppm)
-        # won't adapt fast enough - we need to explore aggressively again.
-        volatility_reset = False
-        rate_change_ratio = 0.0  # Track for hysteresis check
-        if hc_state.last_update > 0 and hc_state.last_revenue_rate > 0:
-            # Calculate percentage change in revenue rate (division-by-zero safe)
-            delta = abs(current_revenue_rate - hc_state.last_revenue_rate)
-            rate_change_ratio = delta / max(1.0, hc_state.last_revenue_rate)
+        # Priority 1: Congestion (Emergency High Fee)
+        if is_congested:
+            new_fee_ppm = ceiling_ppm
+            decision_reason = "CONGESTION"
+            new_direction = hc_state.trend_direction
+            step_ppm = hc_state.step_ppm
+            volatility_reset = False
+            rate_change = 0.0
+            previous_rate = hc_state.last_revenue_rate
+            target_found = True
             
-            if rate_change_ratio > self.VOLATILITY_THRESHOLD:
-                # Large shift detected - reset step to default for aggressive exploration
-                old_step = step_ppm
+        # Priority 2: Fire Sale (Dumping Inventory)
+        elif is_fire_sale:
+            new_fee_ppm = 1
+            decision_reason = "FIRE_SALE"
+            new_direction = hc_state.trend_direction
+            step_ppm = hc_state.step_ppm
+            volatility_reset = False
+            rate_change = 0.0
+            previous_rate = hc_state.last_revenue_rate
+            target_found = True
+            
+        # Priority 3: Hill Climbing (Discovery)
+        if not target_found:
+            # HILL CLIMBING DECISION (Rate-Based)
+            rate_change = current_revenue_rate - hc_state.last_revenue_rate
+            last_direction = hc_state.trend_direction
+            previous_rate = hc_state.last_revenue_rate
+            
+            step_ppm = hc_state.step_ppm
+            if step_ppm <= 0:
                 step_ppm = self.STEP_PPM
-                volatility_reset = True
-                # Also reset stable cycles counter - market is volatile
-                hc_state.stable_cycles = 0
-                self.plugin.log(
-                    f"VOLATILITY RESET {channel_id[:12]}...: revenue rate changed by "
-                    f"{rate_change_ratio:.0%} (from {hc_state.last_revenue_rate:.2f} to "
-                    f"{current_revenue_rate:.2f} sats/hr). Resetting step from "
-                    f"{old_step}ppm to {step_ppm}ppm for aggressive exploration.",
-                    level='info'
-                )
-        
-        # =====================================================================
-        # DEADBAND HYSTERESIS: Enter Sleep Mode Check (Phase 4: Stability & Scaling)
-        # If the market is stable (low rate change), increment stable_cycles.
-        # After STABLE_CYCLES_REQUIRED consecutive stable cycles, enter sleep mode.
-        # =====================================================================
-        if hc_state.last_update > 0 and rate_change_ratio < self.STABILITY_THRESHOLD:
-            # Market is stable - increment stable cycles counter
-            hc_state.stable_cycles += 1
             
-            if hc_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED:
-                # Enough stable cycles - enter sleep mode
-                sleep_duration_seconds = self.config.fee_interval * self.SLEEP_CYCLES
-                hc_state.is_sleeping = True
-                hc_state.sleep_until = now + sleep_duration_seconds
+            # VOLATILITY RESET & DEADBAND HYSTERESIS
+            volatility_reset = False
+            rate_change_ratio = 0.0
+            if hc_state.last_update > 0 and hc_state.last_revenue_rate > 0:
+                delta_rate = abs(current_revenue_rate - hc_state.last_revenue_rate)
+                rate_change_ratio = delta_rate / max(1.0, hc_state.last_revenue_rate)
                 
-                # Update state for tracking before sleeping
-                hc_state.last_revenue_rate = current_revenue_rate
-                hc_state.last_fee_ppm = current_fee_ppm
-                hc_state.last_update = now
-                self._save_hill_climb_state(channel_id, hc_state)
-                
-                self.plugin.log(
-                    f"HYSTERESIS: Market Calm - Channel {channel_id[:12]}... entering sleep mode "
-                    f"({hc_state.stable_cycles} stable cycles, rate_change={rate_change_ratio:.1%}). "
-                    f"Sleeping for {sleep_duration_seconds // 60} minutes.",
-                    level='info'
-                )
-                # Export sleep state metric (Observability)
-                if self.metrics:
-                    self.metrics.set_gauge(
-                        MetricNames.CHANNEL_IS_SLEEPING,
-                        1,
-                        {"channel_id": channel_id, "peer_id": peer_id},
-                        METRIC_HELP.get(MetricNames.CHANNEL_IS_SLEEPING, "")
-                    )
-                return None  # Do not update fee this cycle
-        else:
-            # Market is not stable - reset stable cycles counter
-            if rate_change_ratio >= self.STABILITY_THRESHOLD:
-                hc_state.stable_cycles = 0
-        
-        # Determine new direction based on revenue rate change
-        if hc_state.last_update == 0:
-            # First run - start by trying to increase (default direction)
-            new_direction = 1
-            decision_reason = "initial"
-            step_ppm = self.STEP_PPM  # Use default step for first run
-        elif rate_change > 0:
-            # Revenue rate increased! Keep going in same direction
-            new_direction = last_direction
-            decision_reason = f"rate_up_{rate_change:.2f}sats_hr_continue"
-            hc_state.consecutive_same_direction += 1
-            
-            # ADAPTIVE STEP SIZING: Acceleration
-            # If revenue increased significantly (>20%), double step size to capture the trend
-            if rate_change_ratio > 0.20:
-                old_step = step_ppm
-                step_ppm = min(int(step_ppm * 2), self.MAX_STEP_PPM)
-                if step_ppm != old_step:
-                    decision_reason += f"_accelerate_step_{old_step}->{step_ppm}"
-        elif rate_change < 0:
-            # Revenue rate decreased! Reverse direction
-            new_direction = -last_direction
-            decision_reason = f"rate_down_{abs(rate_change):.2f}sats_hr_reverse"
-            hc_state.consecutive_same_direction = 0
-            
-            # WIGGLE DAMPENING: Decay step size on reversal
-            # We overshot the peak, so reduce step to converge on optimal fee
-            step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
-            decision_reason += f"_dampen_step_to_{step_ppm}"
-        else:
-            # Revenue rate unchanged - try opposite direction (we may be at optimum)
-            new_direction = -last_direction
-            decision_reason = "rate_flat_try_opposite"
-            hc_state.consecutive_same_direction = 0
-            
-            # Also apply dampening when flat - we're close to optimum
-            step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
-        
-        # Apply percentage-based minimum to step (ensures meaningful changes at high fees)
-        step_percent = max(current_fee_ppm * self.STEP_PERCENT, self.MIN_STEP_PPM)
-        step_ppm = max(step_ppm, int(step_percent))
-        step_ppm = min(step_ppm, self.MAX_STEP_PPM)
-        
-        # Reduce step if we've been moving in same direction too long
-        # (we might be oscillating around the optimum)
-        if hc_state.consecutive_same_direction > self.MAX_CONSECUTIVE:
-            step_ppm = step_ppm // 2
-            step_ppm = max(step_ppm, self.MIN_STEP_PPM)
-        
-        # Calculate base new fee
-        base_new_fee = current_fee_ppm + (new_direction * step_ppm)
-        
-        # Apply multipliers (secondary weighting)
-        new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
-        
-        # Enforce floor and ceiling
-        new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
-        
-        # Check if fee changed meaningfully
+                if rate_change_ratio > self.VOLATILITY_THRESHOLD:
+                    step_ppm = self.STEP_PPM
+                    volatility_reset = True
+                    hc_state.stable_cycles = 0
+
+            # DEADBAND HYSTERESIS: Enter Sleep Mode Check
+            if hc_state.last_update > 0 and rate_change_ratio < self.STABILITY_THRESHOLD:
+                hc_state.stable_cycles += 1
+                if hc_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED:
+                    sleep_duration_seconds = self.config.fee_interval * self.SLEEP_CYCLES
+                    hc_state.is_sleeping = True
+                    hc_state.sleep_until = now + sleep_duration_seconds
+                    hc_state.last_revenue_rate = current_revenue_rate
+                    hc_state.last_fee_ppm = current_fee_ppm
+                    hc_state.last_update = now
+                    self._save_hill_climb_state(channel_id, hc_state)
+                    self.plugin.log(f"HYSTERESIS: Market Calm - Channel {channel_id[:12]}... entering sleep mode.", level='info')
+                    return None
+            else:
+                if rate_change_ratio >= self.STABILITY_THRESHOLD:
+                    hc_state.stable_cycles = 0
+
+            # Direction Decision
+            if hc_state.last_update == 0:
+                new_direction = 1
+                decision_reason = "initial"
+            elif rate_change > 0:
+                new_direction = last_direction
+                decision_reason = "rate_up"
+                hc_state.consecutive_same_direction += 1
+                if rate_change_ratio > 0.20:
+                    step_ppm = min(int(step_ppm * 2), self.MAX_STEP_PPM)
+            elif rate_change < 0:
+                new_direction = -last_direction
+                decision_reason = "rate_down"
+                hc_state.consecutive_same_direction = 0
+                step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
+            else:
+                new_direction = -last_direction
+                decision_reason = "rate_flat"
+                hc_state.consecutive_same_direction = 0
+                step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
+
+            # Apply step constraints
+            step_percent = max(current_fee_ppm * self.STEP_PERCENT, self.MIN_STEP_PPM)
+            step_ppm = max(step_ppm, int(step_percent))
+            step_ppm = min(step_ppm, self.MAX_STEP_PPM)
+            if hc_state.consecutive_same_direction > self.MAX_CONSECUTIVE:
+                step_ppm = max(self.MIN_STEP_PPM, step_ppm // 2)
+
+            base_new_fee = current_fee_ppm + (new_direction * step_ppm)
+            new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
+            new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
+
+        # Check if fee changed meaningfully (Alpha Guard)
         fee_change = abs(new_fee_ppm - current_fee_ppm)
-        
-        # FIX: "Low Fee Trap" Logic (Phase 7 Fix)
-        # Allow small integer changes (1ppm) for low-fee channels to enable fine-tuning
         if current_fee_ppm < 100:
             min_change = 1
         else:
-            min_change = max(5, current_fee_ppm * 0.03)  # 3% or 5 ppm minimum
-        
-        # Always update state for tracking (with rate-based values)
-        hc_state.last_revenue_rate = current_revenue_rate
-        hc_state.last_fee_ppm = current_fee_ppm
-        hc_state.trend_direction = new_direction
-        hc_state.step_ppm = step_ppm  # Persist dampened step size
-        hc_state.last_update = now
-        self._save_hill_climb_state(channel_id, hc_state)
-        
-        if fee_change < min_change:
-            # Not enough change to warrant update
+            min_change = max(5, current_fee_ppm * 0.03)
+            
+        if fee_change < min_change and not (is_congested or is_fire_sale):
             return None
         
+        # =====================================================================
+        # GOSSIP HYSTERESIS: The 5% Gate (Phase 5.5)
+        # Reduce network noise by only broadcasting significant changes.
+        # =====================================================================
+        delta_broadcast = abs(new_fee_ppm - hc_state.last_broadcast_fee_ppm)
+        threshold = hc_state.last_broadcast_fee_ppm * 0.05
+        
+        # Override: Always broadcast if entering/exiting critical states
+        # or if we have never broadcasted before
+        significant_change = (delta_broadcast > threshold) or \
+                             (hc_state.last_broadcast_fee_ppm <= 1) or \
+                             (new_fee_ppm <= 1) or \
+                             (target_found and hc_state.last_state != decision_reason) or \
+                             (not target_found and hc_state.last_state in ("CONGESTION", "FIRE_SALE"))
+
+        if not significant_change:
+            # HYSTERESIS: Skip RPC, update internal target, but PAUSE observation window
+            hc_state.last_fee_ppm = new_fee_ppm
+            hc_state.last_revenue_rate = current_revenue_rate
+            hc_state.trend_direction = new_direction
+            hc_state.step_ppm = step_ppm
+            # IMPORTANT: Do NOT update hc_state.last_update here (Observation Pause)
+            self._save_hill_climb_state(channel_id, hc_state)
+            
+            self.plugin.log(
+                f"HYSTERESIS: Target fee {new_fee_ppm} is <5% delta from broadcast {hc_state.last_broadcast_fee_ppm}. "
+                f"Skipping gossip; pausing observation.",
+                level='info'
+            )
+            return None
+
         # Build reason string (with rate info)
         volatility_note = " [VOLATILITY_RESET]" if volatility_reset else ""
         reason = (f"HillClimb: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
@@ -650,10 +601,19 @@ class HillClimbingFeeController:
                  f"liquidity={bucket} ({outbound_ratio:.0%}), "
                  f"{marginal_roi_info}")
         
-        # Apply the fee change
+        # Apply the fee change (Significant change -> Broadcast)
         result = self.set_channel_fee(channel_id, new_fee_ppm, reason=reason)
         
         if result.get("success"):
+            # Update state with new broadcast fee and refresh timer
+            hc_state.last_revenue_rate = current_revenue_rate
+            hc_state.last_fee_ppm = current_fee_ppm
+            hc_state.last_broadcast_fee_ppm = new_fee_ppm
+            hc_state.last_state = decision_reason
+            hc_state.trend_direction = new_direction
+            hc_state.step_ppm = step_ppm
+            hc_state.last_update = now
+            self._save_hill_climb_state(channel_id, hc_state)
             # Export metrics (Phase 2: Observability)
             if self.metrics:
                 labels = {"channel_id": channel_id, "peer_id": peer_id}
@@ -983,7 +943,9 @@ class HillClimbingFeeController:
             consecutive_same_direction=db_state.get("consecutive_same_direction", 0),
             is_sleeping=bool(db_state.get("is_sleeping", 0)),
             sleep_until=db_state.get("sleep_until", 0),
-            stable_cycles=db_state.get("stable_cycles", 0)
+            stable_cycles=db_state.get("stable_cycles", 0),
+            last_broadcast_fee_ppm=db_state.get("last_broadcast_fee_ppm", 0),
+            last_state=db_state.get("last_state", "balanced")
         )
         
         self._hill_climb_states[channel_id] = hc_state
@@ -999,6 +961,8 @@ class HillClimbingFeeController:
             trend_direction=state.trend_direction,
             step_ppm=state.step_ppm,
             consecutive_same_direction=state.consecutive_same_direction,
+            last_broadcast_fee_ppm=state.last_broadcast_fee_ppm,
+            last_state=state.last_state,
             is_sleeping=1 if state.is_sleeping else 0,
             sleep_until=state.sleep_until,
             stable_cycles=state.stable_cycles

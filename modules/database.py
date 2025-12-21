@@ -115,6 +115,7 @@ class Database:
                 step_ppm INTEGER NOT NULL DEFAULT 50,  -- Current step size (for dampening)
                 consecutive_same_direction INTEGER NOT NULL DEFAULT 0,
                 last_update INTEGER NOT NULL DEFAULT 0,
+                last_broadcast_fee_ppm INTEGER NOT NULL DEFAULT 0,
                 is_sleeping INTEGER NOT NULL DEFAULT 0,
                 sleep_until INTEGER NOT NULL DEFAULT 0,
                 stable_cycles INTEGER NOT NULL DEFAULT 0
@@ -298,6 +299,14 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
         
+    # Schema migration: Add last_broadcast_fee_ppm and last_state for gossip hysteresis
+    try:
+        conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_broadcast_fee_ppm INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_state TEXT DEFAULT 'balanced'")
+        self.plugin.log("Added last_broadcast_fee_ppm and last_state columns to fee_strategy_state")
+    except sqlite3.OperationalError:
+        pass  # Columns already exist
+        
         self.plugin.log("Database initialized successfully")
     
     # =========================================================================
@@ -426,6 +435,8 @@ class Database:
                 result['sleep_until'] = 0
             if 'stable_cycles' not in result:
                 result['stable_cycles'] = 0
+            if 'last_broadcast_fee_ppm' not in result:
+                result['last_broadcast_fee_ppm'] = result.get('last_fee_ppm', 0)
             return result
         
         # Return default state if not found
@@ -433,19 +444,23 @@ class Database:
             'channel_id': channel_id,
             'last_revenue_rate': 0.0,  # Revenue rate in sats/hour
             'last_fee_ppm': 0,
+            'last_broadcast_fee_ppm': 0,
             'trend_direction': 1,  # Default: try increasing fee
             'step_ppm': 50,  # Default step size for dampening
             'consecutive_same_direction': 0,
             'last_update': 0,
-            'is_sleeping': 0,  # Deadband hysteresis: 0 = awake, 1 = sleeping
-            'sleep_until': 0,  # Unix timestamp when to wake up
-            'stable_cycles': 0  # Number of consecutive stable cycles
+            'last_state': 'unknown',
+            'is_sleeping': 0,
+            'sleep_until': 0,
+            'stable_cycles': 0
         }
     
     def update_fee_strategy_state(self, channel_id: str, last_revenue_rate: float,
                                    last_fee_ppm: int, trend_direction: int,
                                    step_ppm: int = 50,
                                    consecutive_same_direction: int = 0,
+                                   last_broadcast_fee_ppm: int = 0,
+                                   last_state: str = 'unknown',
                                    is_sleeping: int = 0,
                                    sleep_until: int = 0,
                                    stable_cycles: int = 0):
@@ -462,6 +477,8 @@ class Database:
             trend_direction: Direction we were moving (1 = up, -1 = down)
             step_ppm: Current step size (for wiggle dampening)
             consecutive_same_direction: How many times we've moved same way
+            last_broadcast_fee_ppm: The last fee PPM broadcasted to the network
+            last_state: The state classification during the last broadcast
             is_sleeping: Deadband hysteresis sleep state (0 = awake, 1 = sleeping)
             sleep_until: Unix timestamp when to wake up from sleep mode
             stable_cycles: Number of consecutive stable cycles (for hysteresis)
@@ -473,11 +490,11 @@ class Database:
             INSERT OR REPLACE INTO fee_strategy_state 
             (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
              step_ppm, consecutive_same_direction, last_update,
-             is_sleeping, sleep_until, stable_cycles)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
               step_ppm, consecutive_same_direction, now,
-              is_sleeping, sleep_until, stable_cycles))
+              last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles))
     
     def get_all_fee_strategy_states(self) -> List[Dict[str, Any]]:
         """Get fee strategy state for all channels."""

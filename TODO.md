@@ -146,4 +146,47 @@ Update rebalancer logic to target stagnant balanced channels.
         - Treat this channel as a valid **SOURCE**.
         - Apply a specific score bonus (e.g., `+10`) to prioritize moving this idle capital to a high-demand Sink.
     - *Rationale:* A balanced channel with no volume is dead inventory. We should move it.
+
+---
+
+## Phase 5.5: Stability & Efficiency Patches (Good Peer Evolution)
+
+### 7. Delta-Based Gossip Updates (Gossip Hysteresis) ✅ COMPLETED
+**Objective:** Reduce network noise and remain an enterprise-grade stable peer by only broadcasting fee updates when they are economically significant (>5% change).
+
+**Context Files:**
+- `modules/fee_controller.py`
+- `modules/database.py`
+
+**Logic Flow**:
+1. **Target vs. Broadcast**: We now track two fees. The `target_fee` is where the Hill Climber currently sits. The `broadcast_fee` is what we last told the network via RPC.
+2. **The 5% Gate**: If `abs(target_fee - broadcast_fee) / broadcast_fee < 0.05`, we skip the `setchannel` RPC call.
+3. **The Observation Pause**: If we skip the RPC, we **do not** update the `last_update` timestamp in the database. This effectively "freezes" the Hill Climber's timer. It won't try to calculate a new revenue rate or move again until the Delta accumulates enough to trigger a real broadcast.
+
+**AI Prompt:**
+```text
+Implement Delta-Based Gossip Updates with Hill Climber synchronization.
+
+1.  **Database Update (`modules/database.py`)**:
+    - Add `last_broadcast_fee_ppm` (INTEGER) to the `fee_strategy_state` table.
+    - Ensure `get_fee_strategy_state` and `update_fee_strategy_state` handle this new field.
+
+2.  **Controller Logic (`modules/fee_controller.py`)**:
+    - Modify `_adjust_channel_fee` to calculate `delta = abs(new_fee_ppm - hc_state.last_broadcast_fee_ppm)`.
+    - Set a `significant_change = delta > (hc_state.last_broadcast_fee_ppm * 0.05)`.
+    - **Override**: Always set `significant_change = True` if the channel is entering/exiting "CONGESTED" or "FIRE SALE" states.
+
+3.  **The Broadcast Gate**:
+    - If `significant_change` is FALSE:
+        - DO NOT call `set_channel_fee` (skip RPC).
+        - Update `hc_state.last_fee_ppm = new_fee_ppm` (save internal target).
+        - IMPORTANT: Do NOT update `hc_state.last_update`. This pauses the observation window.
+        - Log: "HYSTERESIS: Target fee {new_fee} is <5% delta from broadcast {last_broadcast}. Skipping gossip; pausing observation."
+    - If `significant_change` is TRUE:
+        - Call `set_channel_fee` (execute RPC).
+        - Update `hc_state.last_broadcast_fee_ppm = new_fee_ppm`.
+        - Update `hc_state.last_update = now`. This starts the 30-minute clock for the next "Observe" phase.
+
+4.  **Result**: This allows the node to wiggle its fee internally to find a floor, but it only "announces" the move once it has shifted significantly, ensuring high-quality, non-spammy gossip.
+```
 ```
