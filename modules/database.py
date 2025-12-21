@@ -299,13 +299,13 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
         
-    # Schema migration: Add last_broadcast_fee_ppm and last_state for gossip hysteresis
-    try:
-        conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_broadcast_fee_ppm INTEGER DEFAULT 0")
-        conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_state TEXT DEFAULT 'balanced'")
-        self.plugin.log("Added last_broadcast_fee_ppm and last_state columns to fee_strategy_state")
-    except sqlite3.OperationalError:
-        pass  # Columns already exist
+        # Schema migration: Add last_broadcast_fee_ppm and last_state for gossip hysteresis
+        try:
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_broadcast_fee_ppm INTEGER DEFAULT 0")
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_state TEXT DEFAULT 'balanced'")
+            self.plugin.log("Added last_broadcast_fee_ppm and last_state columns to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass  # Columns already exist
         
         self.plugin.log("Database initialized successfully")
     
