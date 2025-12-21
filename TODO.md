@@ -121,3 +121,49 @@ Refactor `adjust_all_fees` in `modules/fee_controller.py` for "State-Aware Synci
 *   **Item 15 (Syncing):** Prevents "Policy Cherry-Picking."
 
 **Implementation Recommendation:** Start with **Item 12 (Vegas Reflex)**. It is the strongest defensive move to preserve the real value of your node's capital during Bitcoin's high-volatility periods.
+
+---
+
+## Phase 8.0: Liquidity Dividend System (LDS)
+
+### 16. The Solvency & TWAB Driver
+**Objective:** Track investor capital and ensure system solvency.
+
+**Context Files:**
+- `modules/database.py`
+- `cl-revenue-ops.py`
+
+**AI Prompt:**
+```text
+Update `modules/database.py` to support LDS tracking. 
+
+1. Create an `lds_snapshots` table to record wallet balances every hour. 
+2. Implement `get_72h_twab(wallet_id)`. 
+3. In `cl-revenue-ops.py`, create a `verify_solvency()` function that aborts the payout loop if total virtual liabilities exceed 85% of the physical local balance found in CLN `listfunds`.
+```
+
+### 17. The LNbits Extension (Spend Guard)
+**Objective:** Enforce lock-up periods for investor capital.
+
+**AI Prompt:**
+```text
+Build an LNbits extension called 'LDS Vault'. 
+
+1. Create a setting to mark a wallet as 'LOCKED'. 
+2. Implement a middleware hook in FastAPI to intercept `POST /api/v1/payments`. 
+3. If the source wallet is LOCKED and the `lock_expiry` hasn't passed, return a 403 error: 'Capital is currently deployed in routing channels and is time-locked'.
+```
+
+### 18. The Profit Distribution Loop
+**Objective:** Distribute net profits to investors.
+
+**AI Prompt:**
+```text
+Implement the `distribute_dividends` loop in `cl-revenue-ops.py`. 
+
+1. Calculate Net Profit since the last successful payout. 
+2. For each investor wallet, calculate their TWAB-based share. 
+3. Apply the MFR (Management Fee Rebate) based on their lock tier (Liquid, 30d, 90d). 
+4. Use the LNbits API to credit the user's wallet. 
+5. Update a `global_high_water_mark` in the DB to ensure losses are recovered before the next payout.
+```
