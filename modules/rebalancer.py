@@ -1294,18 +1294,30 @@ class EVRebalancer:
             for source_scid in candidate.source_candidates:
                 # We only have peer_id for primary source, but clboss can work with just SCID
                 self.clboss.ensure_unmanaged_for_channel(
-                    source_scid, candidate.primary_source_peer_id, 
+                    str(source_scid), str(candidate.primary_source_peer_id), 
                     ClbossTags.FEE_AND_BALANCE, self.database
                 )
             self.clboss.ensure_unmanaged_for_channel(
-                candidate.to_channel, candidate.to_peer_id, 
+                str(candidate.to_channel), str(candidate.to_peer_id), 
                 ClbossTags.FEE_AND_BALANCE, self.database
             )
             
-            # Record rebalance attempt in database
+            # HOTFIX: Explicitly cast to string/int to prevent SQLite binding errors
+            # The 'from_channel' is a property that returns a string, but we cast to be sure.
+            db_from_channel = str(candidate.from_channel)
+            db_to_channel = str(candidate.to_channel)
+            db_amount = int(candidate.amount_sats)
+            db_max_fee = int(candidate.max_budget_sats)
+            db_profit = int(candidate.expected_profit_sats)
+            
+            # Record rebalance attempt in database using SAFE primitives
             rebalance_id = self.database.record_rebalance(
-                candidate.from_channel, candidate.to_channel, candidate.amount_sats,
-                candidate.max_budget_sats, candidate.expected_profit_sats, 'pending'
+                db_from_channel, 
+                db_to_channel, 
+                db_amount,
+                db_max_fee, 
+                db_profit, 
+                'pending'
             )
             
             if self.config.dry_run:
