@@ -869,21 +869,6 @@ class EVRebalancer:
         if self._profitability_analyzer:
             try:
                 prof = self._profitability_analyzer.analyze_channel(dest_channel)
-                # Check for STAGNANT_CANDIDATE first (since ZOMBIE needs 2 failed probes)
-                if prof and prof.classification.value == "stagnant_candidate":
-                    # Check if probe has already been attempted twice in the last 14 days
-                    diag_stats = self.database.get_diagnostic_rebalance_stats(dest_channel, days=14)
-                    if diag_stats["attempt_count"] < 2:
-                        # Skip rebalance, wait for the Defibrillator logic to run
-                        self.plugin.log(
-                            f"Skipping rebalance for {dest_channel[:12]}... (Stagnant, needs probe)",
-                            level='debug'
-                        )
-                        # Immediately trigger the Zero-Fee Probe for this channel
-                        self.diagnostic_rebalance(dest_channel)
-                        return None
-                    # If 2 attempts have failed, the channel is now functionally ZOMBIE (and will be classified as such next cycle)
-                
                 if prof and prof.classification.value == "zombie": 
                     return None
                 if prof and prof.classification.value == "underwater" and prof.marginal_roi <= 0:
@@ -1267,7 +1252,6 @@ class EVRebalancer:
                     continue
                     
                 scid = channel.get("short_channel_id", "")
-                    # Note: 'spendable_sats' is already the correct key from the internal logic audit
                 if not scid:
                     continue
                 
@@ -1294,26 +1278,21 @@ class EVRebalancer:
         
         return channels
 
-    def execute_rebalance(self, candidate: RebalanceCandidate, rebalance_type: str = 'normal') -> Dict[str, Any]:
+    def execute_rebalance(self, candidate: RebalanceCandidate, **kwargs) -> Dict[str, Any]:
         """
         Execute a rebalance for the given candidate.
         
-        This function has been hardened to prevent the SQLite binding error by 
-        explicitly defining the rebalance_type and casting all arguments.
-
-        Args:
-            candidate: The rebalance candidate with all parameters
-            rebalance_type: The type of rebalance ('normal', 'diagnostic', 'manual')
-        
-        Returns:
-            Result dict with status and execution details
+        Uses the async JobManager to spawn sling background jobs.
+        This plugin acts as the "Strategist" while sling workers handle execution.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         self._pending[candidate.to_channel] = int(time.time())
         
         try:
             # Ensure channels are unmanaged from clboss
+            # Unmanage ALL source candidates since Sling may use any of them
             for source_scid in candidate.source_candidates:
+                # We only have peer_id for primary source, but clboss can work with just SCID
                 self.clboss.ensure_unmanaged_for_channel(
                     str(source_scid), str(candidate.primary_source_peer_id), 
                     ClbossTags.FEE_AND_BALANCE, self.database
@@ -1331,7 +1310,6 @@ class EVRebalancer:
             db_profit = int(candidate.expected_profit_sats)
             
             # Record rebalance attempt in database using SAFE primitives
-            # The database.py file must use Named Binding or explicitly accept kwargs.
             rebalance_id = self.database.record_rebalance(
                 db_from_channel, 
                 db_to_channel, 
@@ -1339,7 +1317,7 @@ class EVRebalancer:
                 db_max_fee, 
                 db_profit, 
                 'pending',
-                rebalance_type=rebalance_type  # Use the explicitly passed argument
+                rebalance_type=kwargs.get('rebalance_type', 'normal')
             )
             
             if self.config.dry_run:
@@ -1440,7 +1418,6 @@ class EVRebalancer:
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0
         )
-        # Pass the candidate to the execute_rebalance, explicitly defining the type
         return self.execute_rebalance(cand, rebalance_type='manual')
 
     def _check_capital_controls(self) -> bool:
@@ -1524,4 +1501,4 @@ class EVRebalancer:
     def stop_all_rebalance_jobs(self) -> Dict[str, Any]:
         """Stop all active rebalance jobs."""
         count = self.job_manager.stop_all_jobs(reason="manual_stop_all")
-        return {"success": True, "stopped": count}Fsame
+        return {"success": True, "stopped": count}
