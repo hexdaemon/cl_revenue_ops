@@ -68,6 +68,11 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - **Capital Liquidation**: Identifies "Sources for Splice-Out" (Zombie/Stagnant losers)
 - **Actionable Recommendations**: Suggests closing losers and splicing into winners to maximize capital efficiency
 
+### Thread-Safe Architecture (High-Uptime Stability)
+- **RPC Lock Serialization**: All background loops (Fee, Flow, Rebalance) share a thread-safe RPC proxy
+- **Thread-Local Database Connections**: Each thread gets isolated SQLite connections via `threading.local()`
+- **Daemon Threads**: Background tasks run as daemon threads that don't block shutdown
+
 ## Architecture
 
 ```
