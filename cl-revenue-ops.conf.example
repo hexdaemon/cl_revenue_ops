@@ -1,0 +1,122 @@
+# --- CL-REVENUE-OPS CONFIGURATION ---
+# Copy to ~/.lightning/config or include via `include cl-revenue-ops.conf`
+# All options shown with defaults (commented out)
+
+# ============================================================================
+# INTEGRATION
+# ============================================================================
+
+# Enable integration with CLBOSS (recommended if running CLBOSS)
+#revenue-ops-clboss-enabled=false
+
+# Safety switch - log actions but don't execute (set false for production)
+#revenue-ops-dry-run=true
+
+# ============================================================================
+# FLOW ANALYSIS
+# ============================================================================
+
+# Target daily flow per channel in sats (used for liquidity scoring)
+#revenue-ops-target-flow=250000
+
+# Flow analysis interval in seconds (1 hour default)
+#revenue-ops-flow-interval=3600
+
+# Historical window for flow averaging (days)
+#revenue-ops-flow-window-days=7
+
+# ============================================================================
+# FEE MANAGEMENT
+# ============================================================================
+
+# Fee adjustment interval in seconds (1 hour = calm market balance)
+# CALM MARKET: 3 cycles stability + 4 cycles sleep = 7 hours policy stability
+# VOLATILE MARKET: Catch revenue spikes within 60 minutes
+#revenue-ops-fee-interval=3600
+
+# Fee floor - Phase 7 Replacement Cost Pricing (protects against L1 fee spikes)
+#revenue-ops-min-fee-ppm=100
+
+# Fee ceiling - maximum fee rate
+#revenue-ops-max-fee-ppm=5000
+
+# PID controller tuning (advanced - defaults are stable)
+#revenue-ops-pid-kp=0.1
+#revenue-ops-pid-ki=0.01
+#revenue-ops-pid-kd=0.05
+
+# ============================================================================
+# REBALANCING
+# ============================================================================
+
+# Rebalance candidate evaluation interval in seconds (15 min default)
+#revenue-ops-rebalance-interval=900
+
+# Minimum expected profit in sats to trigger rebalance
+#revenue-ops-rebalance-min-profit=50
+
+# Rebalancer backend (only 'sling' supported)
+#revenue-ops-rebalancer=sling
+
+# ============================================================================
+# CAPITAL SAFETY (Global Capital Controls)
+# ============================================================================
+
+# Daily budget for rebalancing fees - acts as floor when proportional enabled
+#revenue-ops-daily-budget-sats=5000
+
+# On-chain + Off-chain reserve threshold (abort rebalancing if below)
+#revenue-ops-min-wallet-reserve=500000
+
+# --- Revenue-Proportional Budget (Phase 7) ---
+# Scale daily budget as percentage of trailing 24h routing revenue
+# Formula: effective_budget = max(daily-budget-sats, revenue_24h × pct)
+# This allows aggressive rebalancing during high-revenue periods while
+# maintaining a fixed floor during low-revenue periods.
+
+# Enable revenue-proportional budget scaling
+#revenue-ops-proportional-budget=false
+
+# Percentage of 24h revenue to use as budget (0.05 = 5%)
+#revenue-ops-proportional-budget-pct=0.05
+
+# ============================================================================
+# RISK MANAGEMENT (Kelly Criterion)
+# ============================================================================
+
+# Scale rebalance budget based on historical success rate
+#revenue-ops-enable-kelly=false
+
+# Kelly fraction multiplier (0.5 = Half Kelly, conservative; 1.0 = Full Kelly)
+# 0.6 = Slightly aggressive for growing nodes
+#revenue-ops-kelly-fraction=0.5
+
+# ============================================================================
+# TRAFFIC INTELLIGENCE (Reputation System)
+# ============================================================================
+
+# Discount volume from peers with high failure rates ("Spam Shield")
+#revenue-ops-enable-reputation=true
+
+# Decay factor per flow interval (0.98^24 ≈ 0.61 = ~40% weight loss daily)
+#revenue-ops-reputation-decay=0.98
+
+# HTLC Congestion Guard: Skip rebalancing into channels with stressed slots
+#revenue-ops-htlc-congestion-threshold=0.8
+
+# ============================================================================
+# OBSERVABILITY (Prometheus Metrics)
+# ============================================================================
+
+# Enable Prometheus metrics exporter
+#revenue-ops-enable-prometheus=false
+
+# Prometheus HTTP server port
+#revenue-ops-prometheus-port=9800
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+
+# Path to SQLite database
+#revenue-ops-db-path=~/.lightning/revenue-ops.db
