@@ -629,9 +629,9 @@ def run_flow_analysis():
 
 def run_fee_adjustment():
     """
-    Module 2: PID Fee Controller (Dynamic Pricing)
+    Module 2: Hill Climbing Fee Controller (Dynamic Pricing)
     
-    Adjust channel fees based on the Flow Analysis using a PID controller.
+    Adjust channel fees using Perturb & Observe optimization.
     Before setting fees, unmanage from clboss to prevent conflicts.
     """
     if fee_controller is None:

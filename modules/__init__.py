@@ -3,7 +3,7 @@ cl-revenue-ops modules package
 
 This package contains the core modules for the Revenue Operations plugin:
 - flow_analysis: Sink/Source detection and flow metrics
-- fee_controller: PID-based dynamic fee adjustment
+- fee_controller: Hill Climbing (Perturb & Observe) dynamic fee optimization
 - rebalancer: EV-based profit-aware rebalancing
 - clboss_manager: Interface for clboss unmanage commands
 - config: Configuration and constants

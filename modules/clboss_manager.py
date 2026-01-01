@@ -13,7 +13,7 @@ clboss is excellent at:
 - Basic fee adjustments
 
 But we want to override it for:
-- Fee setting (we use PID controller with economic principles)
+- Fee setting (we use Hill Climbing with revenue maximization)
 - Rebalancing decisions (we use EV-based profit analysis)
 
 The pattern:

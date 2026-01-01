@@ -3,7 +3,7 @@ Database module for cl-revenue-ops
 
 Handles SQLite persistence for:
 - Channel flow states and history
-- PID controller state (integral terms)
+- Hill Climbing fee controller state
 - Fee change history
 - Rebalance history
 
@@ -30,7 +30,7 @@ class Database:
     Provides persistence for:
     - Channel states (source/sink/balanced classification)
     - Flow metrics history
-    - PID controller state
+    - Hill Climbing fee controller state
     - Fee change audit log
     - Rebalance history
     
@@ -429,11 +429,13 @@ class Database:
         conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
     
     # =========================================================================
-    # PID State Methods (LEGACY - kept for backward compatibility)
+    # PID State Methods (DEPRECATED - table kept for migration compatibility)
+    # The fee controller now uses Hill Climbing, not PID. These methods and
+    # the pid_state table are retained only to prevent errors on upgrade.
     # =========================================================================
     
     def get_pid_state(self, channel_id: str) -> Dict[str, Any]:
-        """Get PID controller state for a channel (LEGACY)."""
+        """Get PID controller state for a channel (DEPRECATED - unused)."""
         conn = self._get_connection()
         row = conn.execute(
             "SELECT * FROM pid_state WHERE channel_id = ?",
@@ -454,7 +456,7 @@ class Database:
     
     def update_pid_state(self, channel_id: str, integral: float, last_error: float, 
                          last_fee_ppm: int):
-        """Update PID controller state for a channel (LEGACY)."""
+        """Update PID controller state for a channel (DEPRECATED - unused)."""
         conn = self._get_connection()
         now = int(time.time())
         

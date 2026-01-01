@@ -99,9 +99,9 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 │     ┌─────┴─────┐                                                      │
 │     ▼           ▼                                                      │
 │  ┌──────────────────────┐      ┌──────────────────────┐                │
-│  │   PID Fee Controller │      │    EV Rebalancer     │                │
-│  │ (flow + profitability│      │ (flow + profitability│                │
-│  │      multipliers)    │      │      checks)         │                │
+│  │  Hill Climbing Fee   │      │    EV Rebalancer     │                │
+│  │     Controller       │      │ (flow + profitability│                │
+│  │ (Perturb & Observe)  │      │      checks)         │                │
 │  └──────────┬───────────┘      └──────────┬───────────┘                │
 │             │                             │                            │
 │             ▼                             ▼                            │
