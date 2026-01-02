@@ -156,6 +156,42 @@ class VegasReflexState:
         return 1.0 + (self.intensity ** 0.5) * 2.0
 
 
+def calculate_scarcity_multiplier(outbound_ratio: float, scarcity_threshold: float) -> float:
+    """
+    Phase 7: Calculate scarcity pricing multiplier for low local balance.
+    
+    When outbound liquidity is scarce (below threshold), we charge premium
+    fees because the remaining liquidity is more valuable. This implements
+    economically rational pricing: price rises as supply decreases.
+    
+    ALGORITHM:
+    - If outbound_ratio >= threshold: multiplier = 1.0 (no premium)
+    - If outbound_ratio < threshold: linear scaling from 1.0x to 3.0x
+      - At threshold: 1.0x
+      - At 0% balance: 3.0x
+    
+    Formula: multiplier = 1.0 + 2.0 * (1 - ratio / threshold)
+    
+    Args:
+        outbound_ratio: Current outbound liquidity ratio (0.0 to 1.0)
+        scarcity_threshold: Threshold below which scarcity pricing activates (e.g., 0.30)
+        
+    Returns:
+        Fee multiplier (1.0 to 3.0)
+    """
+    if outbound_ratio >= scarcity_threshold:
+        return 1.0
+    
+    if scarcity_threshold <= 0:
+        return 1.0  # Safety: avoid division by zero
+    
+    # Linear interpolation: 1.0x at threshold, 3.0x at 0
+    scarcity_depth = 1.0 - (outbound_ratio / scarcity_threshold)
+    multiplier = 1.0 + (scarcity_depth * 2.0)
+    
+    return min(3.0, max(1.0, multiplier))
+
+
 @dataclass
 class FeeAdjustment:
     """
@@ -712,6 +748,20 @@ class HillClimbingFeeController:
 
             base_new_fee = current_fee_ppm + (new_direction * step_ppm)
             new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
+            
+            # Phase 7: Scarcity Pricing - premium for low local balance
+            cfg = self.config.snapshot()
+            if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
+                scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
+                original_fee = new_fee_ppm
+                new_fee_ppm = int(new_fee_ppm * scarcity_mult)
+                self.plugin.log(
+                    f"SCARCITY PRICING: {channel_id[:12]}... balance={outbound_ratio:.1%} "
+                    f"(below {cfg.scarcity_threshold:.0%}). Applied {scarcity_mult:.2f}x "
+                    f"({original_fee} -> {new_fee_ppm} PPM)",
+                    level='info'
+                )
+            
             new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
 
 
