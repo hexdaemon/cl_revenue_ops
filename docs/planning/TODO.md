@@ -108,6 +108,23 @@ This document details the implementation steps for the remaining items in the ro
 **Safety Guard:** **Exception Hierarchy.** Emergency states (Fire Sale/Congestion) take precedence.
 **Deferral Reason:** HIGH-02 "Anchor & Drain" arbitrage risk. Requires "Floor-Only" architecture.
 
+### 📊 v1.4.0 Readiness (Data Analysis)
+
+#### 17. Traffic & Elasticity Analysis (The "Optimization" Audit)
+**Context:** Before implementing **Flow Asymmetry** and **Peer Syncing** (v1.4), we need empirical proof that these strategies won't cannibalize revenue. We need ~30 days of v1.3 production data to distinguish structural market advantages from random noise.
+
+**Tasks:**
+1.  **Develop Analysis Script:** Create `scripts/analyze_v1_4_data.py` to query `revenue_ops.db` (readonly).
+2.  **Metric 1: Structural Sinks (for Flow Asymmetry):**
+    - Identify channels where `inbound_ratio < 0.1` consistently (low standard deviation) over 30 days.
+    - *Goal:* Distinguish "One-Way Streets" (safe to tax) from "Self-Loops" (sensitive to price).
+3.  **Metric 2: Substitution Elasticity (for Peer Syncing):**
+    - For peers with >1 channel: Correlate fee increases on Channel A with volume changes on Channel B.
+    - *Goal:* Verify if peers treat channels as a bundle (safe to sync) or unique routes (unsafe).
+4.  **Metric 3: Scarcity Pricing Impact:**
+    - Compare revenue/volume during periods where Scarcity Multiplier > 1.0 vs baseline.
+    - *Goal:* Ensure exponential fees are protecting capacity without destroying total revenue.
+
 ---
 
 ## Phase 8.0: Liquidity Dividend System (LDS)
