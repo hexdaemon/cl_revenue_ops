@@ -179,6 +179,14 @@ class ScarcityState:
         return 1.0 + ((self.utilization_ema - 0.35) / 0.65) ** 2 * 2.0
 ```
 
+#### Known Limitations
+
+| Limitation | Impact | Status |
+|------------|--------|--------|
+| **Virgin Remote Channels** | Remote-opened channels start at 0% local balance, triggering maximum 3x scarcity multiplier before first payment | TODO #12: Virgin Channel Amnesty |
+
+> **Mitigation (Planned):** Bypass scarcity pricing for channels where `opener == 'remote'` AND `sats_out == 0`.
+
 #### Rebalancer Integration (Trap & Trap Prevention)
 
 **CRITICAL:** Rebalancer MUST forecast post-rebalance utilization before executing:
