@@ -613,6 +613,58 @@ class JobManager:
                 count += 1
         return count
     
+    def cleanup_orphans(self) -> int:
+        """
+        Clean up orphan sling jobs on startup.
+        
+        If the plugin crashes or restarts, sling jobs continue running in the
+        background. This method queries sling for all active jobs and terminates
+        them to prevent "Phantom Spending" where old logic fights new logic.
+        
+        Called during plugin init() to ensure clean state.
+        
+        Returns:
+            Number of orphan jobs terminated
+        """
+        try:
+            # Get list of all sling jobs
+            result = self.plugin.rpc.call("sling-job", {})
+            jobs = result.get("jobs", [])
+            
+            if not jobs:
+                self.plugin.log("Startup Hygiene: No orphan sling jobs found", level='debug')
+                return 0
+            
+            orphan_count = 0
+            for job in jobs:
+                scid = job.get("scid", "")
+                if not scid:
+                    continue
+                
+                try:
+                    # Delete the orphan job
+                    self.plugin.rpc.call("sling-deletejob", {"scid": scid})
+                    orphan_count += 1
+                    self.plugin.log(f"Startup Hygiene: Terminated orphan job for {scid}", level='debug')
+                except RpcError as e:
+                    self.plugin.log(f"Failed to delete orphan job {scid}: {e}", level='warn')
+            
+            if orphan_count > 0:
+                self.plugin.log(
+                    f"Startup Hygiene: Terminated {orphan_count} orphan sling jobs",
+                    level='info'
+                )
+            
+            return orphan_count
+            
+        except RpcError as e:
+            # sling-job might not be available or no jobs exist
+            self.plugin.log(f"Startup Hygiene: Could not query sling jobs: {e}", level='debug')
+            return 0
+        except Exception as e:
+            self.plugin.log(f"Startup Hygiene: Unexpected error: {e}", level='warn')
+            return 0
+
     def get_job_status(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get status info for a specific job."""
         normalized = self._normalize_scid(channel_id)

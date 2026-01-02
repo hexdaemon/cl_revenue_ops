@@ -34,6 +34,7 @@ import json
 import random
 import sqlite3
 import threading
+import signal
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
@@ -54,6 +55,16 @@ from modules.metrics import PrometheusExporter, MetricNames, METRIC_HELP
 
 # Initialize the plugin
 plugin = Plugin()
+
+# =============================================================================
+# GRACEFUL SHUTDOWN SUPPORT (Plugin Lifecycle Management)
+# =============================================================================
+# This event is used to signal all background threads to exit cleanly.
+# When `lightning-cli plugin stop cl-revenue-ops` is called, CLN sends SIGTERM.
+# We catch this signal and set the event, causing all loops to exit immediately
+# instead of waiting for their sleep timers (which could be 30+ minutes).
+
+shutdown_event = threading.Event()
 
 # =============================================================================
 # THREAD-SAFE RPC WRAPPER (Phase 5.5: High-Uptime Stability)
@@ -495,9 +506,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     def flow_analysis_loop():
         """Background loop for flow analysis."""
-        # Initial delay to let lightningd fully start
-        time.sleep(10)
-        while True:
+        # Initial delay to let lightningd fully start (interruptible)
+        if shutdown_event.wait(10):
+            plugin.log("Flow analysis loop cancelled during startup delay")
+            return
+        
+        while not shutdown_event.is_set():
             try:
                 plugin.log("Running scheduled flow analysis...")
                 run_flow_analysis()
@@ -524,17 +538,25 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     
             except Exception as e:
                 plugin.log(f"Error in flow analysis: {e}", level='error')
+            
             # Calculate +/- 20% jitter
             jitter_seconds = int(config.flow_interval * 0.2)
             sleep_time = config.flow_interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Flow analysis sleeping for {sleep_time}s")
-            time.sleep(sleep_time)
+            
+            # Interruptible sleep: wait for timeout OR shutdown signal
+            if shutdown_event.wait(sleep_time):
+                plugin.log("Flow analysis loop stopping due to shutdown signal")
+                break
     
     def fee_adjustment_loop():
         """Background loop for fee adjustment."""
-        # Initial delay to let flow analysis run first
-        time.sleep(60)
-        while True:
+        # Initial delay to let flow analysis run first (interruptible)
+        if shutdown_event.wait(60):
+            plugin.log("Fee adjustment loop cancelled during startup delay")
+            return
+        
+        while not shutdown_event.is_set():
             try:
                 plugin.log("Running scheduled fee adjustment...")
                 run_fee_adjustment()
@@ -549,11 +571,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     )
             except Exception as e:
                 plugin.log(f"Error in fee adjustment: {e}", level='error')
+            
             # Calculate +/- 20% jitter
             jitter_seconds = int(config.fee_interval * 0.2)
             sleep_time = config.fee_interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
-            time.sleep(sleep_time)
+            
+            # Interruptible sleep: wait for timeout OR shutdown signal
+            if shutdown_event.wait(sleep_time):
+                plugin.log("Fee adjustment loop stopping due to shutdown signal")
+                break
     
     def rebalance_check_loop():
         """Background loop for rebalance checks."""
@@ -562,9 +589,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log("Rebalance loop disabled: sling plugin not found")
             return
         
-        # Initial delay to let other analyses run first
-        time.sleep(120)
-        while True:
+        # Initial delay to let other analyses run first (interruptible)
+        if shutdown_event.wait(120):
+            plugin.log("Rebalance check loop cancelled during startup delay")
+            return
+        
+        while not shutdown_event.is_set():
             try:
                 plugin.log("Running scheduled rebalance check...")
                 run_rebalance_check()
@@ -579,11 +609,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     )
             except Exception as e:
                 plugin.log(f"Error in rebalance check: {e}", level='error')
+            
             # Calculate +/- 20% jitter
             jitter_seconds = int(config.rebalance_interval * 0.2)
             sleep_time = config.rebalance_interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Rebalance check sleeping for {sleep_time}s")
-            time.sleep(sleep_time)
+            
+            # Interruptible sleep: wait for timeout OR shutdown signal
+            if shutdown_event.wait(sleep_time):
+                plugin.log("Rebalance check loop stopping due to shutdown signal")
+                break
     
     def snapshot_peers_delayed():
         """
@@ -594,7 +629,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         """
         delay_seconds = 60
         plugin.log(f"Startup snapshot: waiting {delay_seconds}s for network connections...")
-        time.sleep(delay_seconds)
+        
+        # Interruptible delay
+        if shutdown_event.wait(delay_seconds):
+            plugin.log("Startup snapshot cancelled due to shutdown signal")
+            return
         
         try:
             peers = safe_plugin.rpc.listpeers()
@@ -615,6 +654,47 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Error in delayed snapshot: {e}", level='warn')
             import traceback
             plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
+    
+    # =========================================================================
+    # SIGNAL HANDLER: Clean Shutdown on `lightning-cli plugin stop`
+    # =========================================================================
+    def handle_shutdown_signal(signum, frame):
+        """
+        Handle SIGTERM for graceful shutdown.
+        
+        CLN sends SIGTERM when `lightning-cli plugin stop cl-revenue-ops` is called.
+        This handler sets the shutdown_event, causing all background loops to exit
+        immediately instead of waiting for their sleep timers.
+        """
+        plugin.log("Received SIGTERM, initiating clean shutdown...", level='info')
+        shutdown_event.set()
+        
+        # Stop active rebalance jobs to prevent phantom spending
+        if rebalancer and rebalancer.job_manager:
+            try:
+                stopped = rebalancer.job_manager.stop_all_jobs(reason="plugin_shutdown")
+                if stopped > 0:
+                    plugin.log(f"Stopped {stopped} active rebalance jobs", level='info')
+            except Exception as e:
+                plugin.log(f"Error stopping rebalance jobs: {e}", level='warn')
+        
+        # Stop Prometheus server if running
+        if metrics_exporter:
+            try:
+                metrics_exporter.stop_server()
+            except Exception as e:
+                plugin.log(f"Error stopping metrics server: {e}", level='warn')
+    
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    
+    # =========================================================================
+    # STARTUP HYGIENE: Clean up orphan jobs from previous runs
+    # =========================================================================
+    if rebalancer and config.sling_available:
+        try:
+            rebalancer.job_manager.cleanup_orphans()
+        except Exception as e:
+            plugin.log(f"Warning: Could not clean up orphan jobs: {e}", level='warn')
     
     # Start background threads (daemon=True so they don't block shutdown)
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()

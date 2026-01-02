@@ -120,9 +120,9 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 ### v1.3.1: Liquidity Hardening & Efficiency (Planned)
 *Objective: Improve rebalancer efficiency and prevent resource waste.*
 
-- [ ] **"Orphan Job" Cleanup (Startup Hygiene)**:
+- [x] **"Orphan Job" Cleanup (Startup Hygiene)**:
     - Terminate stale `sling` jobs on plugin restart to prevent "Phantom Spending."
-    - Call `sling-deletejob` for all active jobs during `init()`.
+    - `cleanup_orphans()` called during `init()`, `stop_all_jobs()` on shutdown.
 
 - [ ] **Volume-Weighted Liquidity Targets (Smart Allocation)**:
     - Target 3 days of buffer OR 50% capacity, whichever is lower.
@@ -134,6 +134,11 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 
 ### v1.3.2: Architectural Hardening (Planned)
 *Objective: Optimize for high-scale nodes with millions of forwards.*
+
+- [x] **Plugin Lifecycle Management (Graceful Shutdown)**:
+    - SIGTERM signal handler for clean `lightning-cli plugin stop`.
+    - All background loops use interruptible `shutdown_event.wait()`.
+    - Enables instant plugin stop/restart without waiting for sleep timers.
 
 - [ ] **Composite Database Indexing**:
     - Add `idx_forwards_composite ON forwards(out_channel, timestamp)`.

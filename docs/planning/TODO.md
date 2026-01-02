@@ -30,14 +30,8 @@ This document details the implementation steps for the remaining items in the ro
 
 ### 🛡️ Liquidity Hardening & Efficiency (Immediate)
 
-#### 15. Implement "Orphan Job" Cleanup (Startup Hygiene)
-**Context:** `cln-sling` processes run independently of this plugin. If `cl-revenue-ops` restarts (crash, update, or manual restart), old sling jobs continue running in the background. This causes "Phantom Spending" where new logic fights with old logic.
-**Tasks:**
-1.  **Modify `modules/rebalancer.py`**: Add `cleanup_orphans()` method to `JobManager`.
-    - Call `sling-job` (list).
-    - Iterate and call `sling-deletejob` for every active job found.
-    - Log: *"Startup Hygiene: Terminated {count} orphan sling jobs."*
-2.  **Modify `cl-revenue-ops.py`**: In `init()`, immediately after initializing the `rebalancer` instance, call `rebalancer.job_manager.cleanup_orphans()`.
+#### 15. Implement "Orphan Job" Cleanup (Startup Hygiene) ✅ COMPLETED
+**Status:** Implemented `cleanup_orphans()` method in `JobManager` (`modules/rebalancer.py`). Called during `init()` in `cl-revenue-ops.py`. Also added `stop_all_jobs()` call in SIGTERM handler to prevent phantom spending during shutdown.
 
 #### 16. Implement Volume-Weighted Liquidity Targets (Smart Allocation)
 **Context:** Currently, the rebalancer targets fixed ratios (50% for Balanced, 85% for Source). On large channels (e.g., 10M sats) with low volume (e.g., 10k/day), this traps massive amounts of "Lazy Capital" (5M sats) that sits idle.
@@ -74,7 +68,15 @@ This document details the implementation steps for the remaining items in the ro
 
 ### 🔧 Architectural Hardening & Optimization (High-Scale Stability)
 
-#### 18. Optimize Database Indexes (Composite Indexing)
+#### 18. Plugin Lifecycle Management (Graceful Shutdown) ✅ COMPLETED
+**Status:** Implemented `shutdown_event` threading.Event and SIGTERM signal handler in `cl-revenue-ops.py`. All background loops now use `shutdown_event.wait(timeout)` instead of `time.sleep(timeout)`, enabling instant clean shutdown via `lightning-cli plugin stop`.
+
+**Verified Components:**
+- `modules/metrics.py`: `stop_server()` correctly calls `self._server.shutdown()` to unblock the HTTP server thread ✅
+- `modules/rebalancer.py`: `stop_all_jobs()` terminates active sling jobs on shutdown ✅
+- `cl-revenue-ops.py`: SIGTERM handler calls both cleanup methods ✅
+
+#### 19. Optimize Database Indexes (Composite Indexing)
 **Context:** The Fee Controller runs `get_volume_since` for every channel every 30 minutes. The query filters by `out_channel` AND `timestamp`. Currently, these columns are indexed separately, requiring the database to scan results. On nodes with millions of forwards, this causes lag.
 **Tasks:**
 1.  **Modify `modules/database.py`** in `initialize`:
@@ -84,7 +86,7 @@ This document details the implementation steps for the remaining items in the ro
       ```
 **Benefit:** Changes query complexity from $O(N)$ to $O(\log N)$, ensuring instant fee calculations regardless of history size.
 
-#### 19. Implement In-Memory "Garbage Collection"
+#### 20. Implement In-Memory "Garbage Collection"
 **Context:** The `FeeController` caches state objects (`HillClimbState`, `ScarcityState`) in Python dictionaries. When channels are closed, these objects remain in memory forever, causing a slow memory leak over months of operation.
 **Tasks:**
 1.  **Modify `modules/fee_controller.py`**:
@@ -95,7 +97,7 @@ This document details the implementation steps for the remaining items in the ro
     - Similar logic for `self.source_failure_counts`.
 **Benefit:** Prevents memory bloat and ensures long-term stability without restarts.
 
-#### 20. Switch Flow Analysis to Local DB (The "Double-Dip" Fix)
+#### 21. Switch Flow Analysis to Local DB (The "Double-Dip" Fix)
 **Context:** Currently, `flow_analysis.py` calls the `listforwards` RPC every hour. On established nodes, this returns hundreds of megabytes of JSON, causing CPU spikes and potential Out-Of-Memory crashes. However, we *already* save every forward to our local SQLite DB via the `forward_event` hook.
 **Tasks:**
 1.  **Implement "Hydration" in `cl-revenue-ops.py`**:
@@ -180,19 +182,19 @@ This document details the implementation steps for the remaining items in the ro
 ## Phase 7.1: Optimization & Yield (Deferred to v1.4)
 *Reason: These features introduce game-theoretic risks requiring stable baseline data from v1.3*
 
-### 21. Flow Asymmetry (Rare Liquidity Premium) — DEFERRED
+### 22. Flow Asymmetry (Rare Liquidity Premium) — DEFERRED
 **Objective:** Charge a premium for "One-Way Street" channels (high outflow, zero organic refill).
 **Safety Guard:** **Velocity Gate.** Only apply to high-volume channels (>50k sats/day).
 **Deferral Reason:** Risk of false positive taxation on valid circular rebalances.
 
-### 22. Peer-Level Atomic Fee Syncing — DEFERRED
+### 23. Peer-Level Atomic Fee Syncing — DEFERRED
 **Objective:** Unified liquidity pool pricing per peer node.
 **Safety Guard:** **Exception Hierarchy.** Emergency states (Fire Sale/Congestion) take precedence.
 **Deferral Reason:** HIGH-02 "Anchor & Drain" arbitrage risk. Requires "Floor-Only" architecture.
 
 ### 📊 v1.4.0 Readiness (Data Analysis)
 
-#### 23. Traffic & Elasticity Analysis (The "Optimization" Audit)
+#### 24. Traffic & Elasticity Analysis (The "Optimization" Audit)
 **Context:** Before implementing **Flow Asymmetry** and **Peer Syncing** (v1.4), we need empirical proof that these strategies won't cannibalize revenue. We need ~30 days of v1.3 production data to distinguish structural market advantages from random noise.
 
 **Tasks:**
@@ -211,7 +213,7 @@ This document details the implementation steps for the remaining items in the ro
 
 ## Phase 8.0: Liquidity Dividend System (LDS)
 
-### 24. The "Channel Defibrillator" (Active Shock) ✅ COMPLETED
+### 25. The "Channel Defibrillator" (Active Shock) ✅ COMPLETED
 **Objective:** Prevent premature channel closures. Before the Lifecycle Manager assumes a channel is a "Zombie," the system must attempt a two-phase liveness check.
 
 **Implementation (v1.1):**
