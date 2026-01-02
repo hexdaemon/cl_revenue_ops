@@ -165,18 +165,6 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - **Safety Guard**: Exception Hierarchy - emergency states (Fire Sale/Congestion) take precedence over syncing.
     - *Deferred:* High-02 Arbitrage Risk. Requires "Baseline/Floor" architecture rather than "Leader Override."
 
-## Phase 8: Liquidity Dividend System (LDS)
-*Objective: Transform the node into a Community-Funded Market Maker using LNbits and a unified risk-averaged pool.*
-
-- [ ] **Solvency & TWAB Driver**:
-    - Implement hourly balance snapshots and 72h Time-Weighted Average Balance (TWAB) logic.
-    - **Safety Guard**: Solvency Engine to halt payouts if liabilities exceed 85% of physical local balance.
-- [ ] **LNbits "Vault" Extension**:
-    - Build a Spend Guard middleware to enforce lock-up periods for investor capital.
-- [ ] **Profit Distribution Loop**:
-    - Automated daily payout of net routing profits based on MFR (Management Fee Rebate) model.
-    - **Safety Guard**: High Water Mark (HWM) enforcement to recover OpEx before payouts.
-
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
 *Roadmap updated: January 2, 2026*
