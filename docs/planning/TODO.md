@@ -28,6 +28,88 @@ This document details the implementation steps for the remaining items in the ro
 ### 12. Implement "Virgin Channel Amnesty" (Fix Remote Open Pricing) ✅ COMPLETED
 **Status:** Implemented in `modules/fee_controller.py` → `_adjust_channel_fee()`. Remote-opened channels with zero outbound traffic (`sats_out == 0`) now bypass Scarcity Pricing to allow competitive fees during break-in period.
 
+### 🛡️ Liquidity Hardening & Efficiency (Immediate)
+
+#### 15. Implement "Orphan Job" Cleanup (Startup Hygiene)
+**Context:** `cln-sling` processes run independently of this plugin. If `cl-revenue-ops` restarts (crash, update, or manual restart), old sling jobs continue running in the background. This causes "Phantom Spending" where new logic fights with old logic.
+**Tasks:**
+1.  **Modify `modules/rebalancer.py`**: Add `cleanup_orphans()` method to `JobManager`.
+    - Call `sling-job` (list).
+    - Iterate and call `sling-deletejob` for every active job found.
+    - Log: *"Startup Hygiene: Terminated {count} orphan sling jobs."*
+2.  **Modify `cl-revenue-ops.py`**: In `init()`, immediately after initializing the `rebalancer` instance, call `rebalancer.job_manager.cleanup_orphans()`.
+
+#### 16. Implement Volume-Weighted Liquidity Targets (Smart Allocation)
+**Context:** Currently, the rebalancer targets fixed ratios (50% for Balanced, 85% for Source). On large channels (e.g., 10M sats) with low volume (e.g., 10k/day), this traps massive amounts of "Lazy Capital" (5M sats) that sits idle.
+**Tasks:**
+1.  **Modify `modules/rebalancer.py`** in `_analyze_rebalance_ev`:
+    - Retrieve flow stats: `state = self.database.get_channel_state(dest_channel)`.
+    - Calculate `daily_volume = (state['sats_in'] + state['sats_out']) / 7` (approx).
+    - **New Target Logic:**
+      ```python
+      # Target 3 days of buffer OR 50% capacity, whichever is LOWER
+      vol_target = daily_volume * 3
+      cap_target = int(capacity * target_ratio) # e.g. 0.5
+      
+      target_spendable = min(cap_target, vol_target)
+      
+      # Safety Floor: Never target less than min_rebalance_amount (e.g. 500k) to handle bursts
+      target_spendable = max(self.config.rebalance_min_amount, target_spendable)
+      ```
+**Benefit:** Frees up idle Bitcoin from slow-moving large channels to be deployed to high-velocity channels, significantly improving Return on Capital (ROC).
+
+#### 17. Implement "Futility" Circuit Breaker
+**Context:** Some channels have positive EV spreads but broken routing paths. Exponential backoff slows down retries, but doesn't stop them. After ~10 failures, the channel is likely a "Dead End" and further attempts waste gossip bandwidth and lock HTLCs.
+**Tasks:**
+1.  **Modify `modules/rebalancer.py`** in `find_rebalance_candidates`:
+    - Retrieve failure stats: `fail_count, last_fail = self.database.get_failure_count(channel_id)`.
+    - **Logic:**
+      ```python
+      # Hard Cap: If failed > 10 times, require 48h cooldown
+      if fail_count > 10:
+          if (now - last_fail) < 172800: # 48 hours
+              self.plugin.log(f"Skipping {channel_id}: Futility Circuit Breaker active ({fail_count} fails)", level='debug')
+              continue
+      ```
+
+### 🔧 Architectural Hardening & Optimization (High-Scale Stability)
+
+#### 18. Optimize Database Indexes (Composite Indexing)
+**Context:** The Fee Controller runs `get_volume_since` for every channel every 30 minutes. The query filters by `out_channel` AND `timestamp`. Currently, these columns are indexed separately, requiring the database to scan results. On nodes with millions of forwards, this causes lag.
+**Tasks:**
+1.  **Modify `modules/database.py`** in `initialize`:
+    - Add a composite index: 
+      ```sql
+      CREATE INDEX IF NOT EXISTS idx_forwards_composite ON forwards(out_channel, timestamp)
+      ```
+**Benefit:** Changes query complexity from $O(N)$ to $O(\log N)$, ensuring instant fee calculations regardless of history size.
+
+#### 19. Implement In-Memory "Garbage Collection"
+**Context:** The `FeeController` caches state objects (`HillClimbState`, `ScarcityState`) in Python dictionaries. When channels are closed, these objects remain in memory forever, causing a slow memory leak over months of operation.
+**Tasks:**
+1.  **Modify `modules/fee_controller.py`**:
+    - Add method `prune_state(active_channel_ids: Set[str])`.
+    - Iterate `list(self._hill_climb_states.keys())`. If key not in `active_channel_ids`, `del` it.
+    - Call this method at the end of `adjust_all_fees`.
+2.  **Modify `modules/rebalancer.py`**:
+    - Similar logic for `self.source_failure_counts`.
+**Benefit:** Prevents memory bloat and ensures long-term stability without restarts.
+
+#### 20. Switch Flow Analysis to Local DB (The "Double-Dip" Fix)
+**Context:** Currently, `flow_analysis.py` calls the `listforwards` RPC every hour. On established nodes, this returns hundreds of megabytes of JSON, causing CPU spikes and potential Out-Of-Memory crashes. However, we *already* save every forward to our local SQLite DB via the `forward_event` hook.
+**Tasks:**
+1.  **Implement "Hydration" in `cl-revenue-ops.py`**:
+    - On startup, check the timestamp of the last entry in `forwards` table.
+    - Call `listforwards` RPC *once* filtering `status=settled` since that timestamp to fill any gaps (while plugin was offline).
+2.  **Refactor `modules/flow_analysis.py`**:
+    - Change `_get_daily_flow_from_listforwards` to `_get_daily_flow_from_db`.
+    - Replace RPC call with SQL aggregation:
+      ```sql
+      SELECT timestamp, in_msat, out_msat FROM forwards 
+      WHERE timestamp > ? AND (in_channel = ? OR out_channel = ?)
+      ```
+**Benefit:** Eliminates the heaviest RPC call in the plugin. Reduces CPU usage by ~90% during flow analysis cycles.
+
 ---
 
 ## Phase 5.5: Stability & Efficiency Patches (Good Peer Evolution)
@@ -98,19 +180,19 @@ This document details the implementation steps for the remaining items in the ro
 ## Phase 7.1: Optimization & Yield (Deferred to v1.4)
 *Reason: These features introduce game-theoretic risks requiring stable baseline data from v1.3*
 
-### 15. Flow Asymmetry (Rare Liquidity Premium) — DEFERRED
+### 21. Flow Asymmetry (Rare Liquidity Premium) — DEFERRED
 **Objective:** Charge a premium for "One-Way Street" channels (high outflow, zero organic refill).
 **Safety Guard:** **Velocity Gate.** Only apply to high-volume channels (>50k sats/day).
 **Deferral Reason:** Risk of false positive taxation on valid circular rebalances.
 
-### 16. Peer-Level Atomic Fee Syncing — DEFERRED
+### 22. Peer-Level Atomic Fee Syncing — DEFERRED
 **Objective:** Unified liquidity pool pricing per peer node.
 **Safety Guard:** **Exception Hierarchy.** Emergency states (Fire Sale/Congestion) take precedence.
 **Deferral Reason:** HIGH-02 "Anchor & Drain" arbitrage risk. Requires "Floor-Only" architecture.
 
 ### 📊 v1.4.0 Readiness (Data Analysis)
 
-#### 17. Traffic & Elasticity Analysis (The "Optimization" Audit)
+#### 23. Traffic & Elasticity Analysis (The "Optimization" Audit)
 **Context:** Before implementing **Flow Asymmetry** and **Peer Syncing** (v1.4), we need empirical proof that these strategies won't cannibalize revenue. We need ~30 days of v1.3 production data to distinguish structural market advantages from random noise.
 
 **Tasks:**
@@ -129,7 +211,7 @@ This document details the implementation steps for the remaining items in the ro
 
 ## Phase 8.0: Liquidity Dividend System (LDS)
 
-### 17. The "Channel Defibrillator" (Active Shock) ✅ COMPLETED
+### 24. The "Channel Defibrillator" (Active Shock) ✅ COMPLETED
 **Objective:** Prevent premature channel closures. Before the Lifecycle Manager assumes a channel is a "Zombie," the system must attempt a two-phase liveness check.
 
 **Implementation (v1.1):**
