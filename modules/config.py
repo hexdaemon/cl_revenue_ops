@@ -3,10 +3,76 @@ Configuration module for cl-revenue-ops
 
 Contains the Config dataclass that holds all tunable parameters
 for the Revenue Operations plugin.
+
+Phase 7 additions:
+- ConfigSnapshot: Immutable snapshot for thread-safe cycle execution
+- Runtime configuration updates via RPC
+- Vegas Reflex and Scarcity Pricing settings
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, asdict, field
+from typing import Optional, Dict, Any, FrozenSet, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .database import Database
+
+
+# Immutable keys that cannot be changed at runtime
+IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
+    'db_path',
+    'dry_run',  # Safety: don't allow enabling dry_run to hide actions
+})
+
+# Type mapping for config fields (for validation)
+CONFIG_FIELD_TYPES: Dict[str, type] = {
+    'flow_interval': int,
+    'fee_interval': int,
+    'rebalance_interval': int,
+    'min_fee_ppm': int,
+    'max_fee_ppm': int,
+    'daily_budget_sats': int,
+    'min_wallet_reserve': int,
+    'low_liquidity_threshold': float,
+    'high_liquidity_threshold': float,
+    'htlc_congestion_threshold': float,
+    'enable_reputation': bool,
+    'enable_prometheus': bool,
+    'enable_kelly': bool,
+    'enable_proportional_budget': bool,
+    'proportional_budget_pct': float,
+    'kelly_fraction': float,
+    'reputation_decay': float,
+    'max_concurrent_jobs': int,
+    'sling_job_timeout_seconds': int,
+    'sling_chunk_size_sats': int,
+    'rebalance_min_profit': int,
+    'rebalance_max_amount': int,
+    'rebalance_min_amount': int,
+    'rebalance_cooldown_hours': int,
+    'inbound_fee_estimate_ppm': int,
+    'prometheus_port': int,
+    # Phase 7 additions
+    'enable_vegas_reflex': bool,
+    'vegas_decay_rate': float,
+    'enable_scarcity_pricing': bool,
+    'scarcity_threshold': float,
+}
+
+# Range constraints for numeric fields
+CONFIG_FIELD_RANGES: Dict[str, tuple] = {
+    'min_fee_ppm': (0, 100000),
+    'max_fee_ppm': (1, 100000),
+    'daily_budget_sats': (0, 10000000),
+    'min_wallet_reserve': (0, 100000000),
+    'low_liquidity_threshold': (0.0, 1.0),
+    'high_liquidity_threshold': (0.0, 1.0),
+    'htlc_congestion_threshold': (0.0, 1.0),
+    'reputation_decay': (0.0, 1.0),
+    'proportional_budget_pct': (0.0, 1.0),
+    'kelly_fraction': (0.0, 1.0),
+    'vegas_decay_rate': (0.0, 1.0),
+    'scarcity_threshold': (0.0, 1.0),
+}
 
 
 @dataclass
@@ -94,6 +160,266 @@ class Config:
     
     # Runtime dependency flags (set during init based on listplugins)
     sling_available: bool = True   # Set to False if sling plugin not detected
+    
+    # Phase 7 additions (v1.3.0)
+    enable_vegas_reflex: bool = True       # Mempool spike defense
+    vegas_decay_rate: float = 0.85         # Per-cycle decay (~30min half-life)
+    enable_scarcity_pricing: bool = True   # HTLC slot scarcity pricing
+    scarcity_threshold: float = 0.35       # Start pricing at 35% utilization
+    
+    # Deferred (v1.4.0)
+    enable_flow_asymmetry: bool = False    # Rare liquidity premium
+    enable_peer_sync: bool = False         # Peer-level fee syncing
+    
+    # Internal version tracking (not a user-configurable option)
+    _version: int = field(default=0, repr=False, compare=False)
+    
+    def snapshot(self) -> 'ConfigSnapshot':
+        """
+        Create an immutable snapshot for cycle execution.
+        
+        All worker cycles MUST capture a snapshot at cycle start and use
+        only that snapshot for the duration of the cycle. This prevents
+        torn reads when config is updated mid-cycle.
+        """
+        return ConfigSnapshot.from_config(self)
+    
+    def load_overrides(self, database: 'Database') -> None:
+        """Load config overrides from database on startup."""
+        overrides = database.get_all_config_overrides()
+        for key, value in overrides.items():
+            if hasattr(self, key) and key not in IMMUTABLE_CONFIG_KEYS:
+                self._apply_override(key, value)
+        self._version = database.get_config_version()
+    
+    def _apply_override(self, key: str, value: str) -> None:
+        """Apply a single override with type conversion."""
+        field_type = CONFIG_FIELD_TYPES.get(key, str)
+        try:
+            if field_type == bool:
+                typed_value = value.lower() in ('true', '1', 'yes', 'on')
+            elif field_type == int:
+                typed_value = int(value)
+            elif field_type == float:
+                typed_value = float(value)
+            else:
+                typed_value = value
+            setattr(self, key, typed_value)
+        except (ValueError, TypeError):
+            pass  # Keep default if conversion fails
+    
+    def update_runtime(self, database: 'Database', key: str, value: str) -> Dict[str, Any]:
+        """
+        Transactional runtime update: Validate → Write DB → Read-Back → Update Memory.
+        
+        This implements the CRITICAL-02/CRITICAL-03 defenses from the Red Team report:
+        - ConfigSnapshot pattern prevents torn reads
+        - Transactional update prevents Ghost Config
+        
+        Returns:
+            Dict with status, old_value, new_value, version
+        """
+        # 1. VALIDATE: Check if key exists and is mutable
+        if key in IMMUTABLE_CONFIG_KEYS:
+            return {"error": f"Key '{key}' cannot be changed at runtime"}
+        
+        if not hasattr(self, key) or key.startswith('_'):
+            return {"error": f"Unknown config key: {key}"}
+        
+        # 2. VALIDATE: Type check
+        field_type = CONFIG_FIELD_TYPES.get(key, str)
+        try:
+            if field_type == bool:
+                typed_value = value.lower() in ('true', '1', 'yes', 'on')
+            elif field_type == int:
+                typed_value = int(value)
+            elif field_type == float:
+                typed_value = float(value)
+            else:
+                typed_value = value
+        except (ValueError, TypeError) as e:
+            return {"error": f"Invalid value for {key} (expected {field_type.__name__}): {e}"}
+        
+        # 3. VALIDATE: Range check
+        if key in CONFIG_FIELD_RANGES:
+            min_val, max_val = CONFIG_FIELD_RANGES[key]
+            if not (min_val <= typed_value <= max_val):
+                return {"error": f"Value {typed_value} out of range [{min_val}, {max_val}] for {key}"}
+        
+        old_value = getattr(self, key)
+        
+        # 4. WRITE to database
+        new_version = database.set_config_override(key, value)
+        
+        # 5. READ-BACK verification (prevents Ghost Config - CRITICAL-03)
+        read_back = database.get_config_override(key)
+        if read_back != value:
+            return {"error": "Database write verification failed (Ghost Config prevention)"}
+        
+        # 6. UPDATE in-memory
+        setattr(self, key, typed_value)
+        self._version = new_version
+        
+        return {
+            "status": "success",
+            "key": key,
+            "old_value": old_value,
+            "new_value": typed_value,
+            "version": new_version
+        }
+
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    """
+    Immutable configuration snapshot for thread-safe cycle execution.
+    
+    All worker cycles MUST capture a snapshot at cycle start and use
+    only that snapshot for the duration of the cycle. This prevents
+    torn reads when config is updated mid-cycle (CRITICAL-02 defense).
+    
+    Usage:
+        def run_cycle(self):
+            cfg = self.config.snapshot()  # Immutable for this cycle
+            # All logic uses cfg, never self.config directly
+    """
+    # Database path
+    db_path: str
+    
+    # Timer intervals (in seconds)
+    flow_interval: int
+    fee_interval: int
+    rebalance_interval: int
+    
+    # Flow analysis parameters
+    target_flow: int
+    flow_window_days: int
+    
+    # Flow ratio thresholds for classification
+    source_threshold: float
+    sink_threshold: float
+    
+    # Fee parameters
+    min_fee_ppm: int
+    max_fee_ppm: int
+    base_fee_msat: int
+    
+    # Rebalancing parameters
+    rebalance_min_profit: int
+    rebalance_max_amount: int
+    rebalance_min_amount: int
+    low_liquidity_threshold: float
+    high_liquidity_threshold: float
+    rebalance_cooldown_hours: int
+    inbound_fee_estimate_ppm: int
+    
+    # clboss integration
+    clboss_enabled: bool
+    clboss_unmanage_duration_hours: int
+    
+    # Rebalancer plugin selection
+    rebalancer_plugin: str
+    
+    # Profitability tracking
+    estimated_open_cost_sats: int
+    
+    # Global Capital Controls
+    daily_budget_sats: int
+    min_wallet_reserve: int
+    
+    # Revenue-Proportional Budget
+    enable_proportional_budget: bool
+    proportional_budget_pct: float
+    
+    # HTLC Congestion threshold
+    htlc_congestion_threshold: float
+    
+    # Reputation-weighted volume
+    enable_reputation: bool
+    reputation_decay: float
+    
+    # Prometheus Metrics
+    enable_prometheus: bool
+    prometheus_port: int
+    
+    # Kelly Criterion Position Sizing
+    enable_kelly: bool
+    kelly_fraction: float
+    
+    # Async Job Queue
+    max_concurrent_jobs: int
+    sling_job_timeout_seconds: int
+    sling_chunk_size_sats: int
+    
+    # Safety flags
+    dry_run: bool
+    
+    # Runtime dependency flags
+    sling_available: bool
+    
+    # Phase 7 additions (v1.3.0)
+    enable_vegas_reflex: bool
+    vegas_decay_rate: float
+    enable_scarcity_pricing: bool
+    scarcity_threshold: float
+    
+    # Deferred (v1.4.0)
+    enable_flow_asymmetry: bool
+    enable_peer_sync: bool
+    
+    # Version tracking
+    version: int = 0
+    
+    @classmethod
+    def from_config(cls, config: 'Config') -> 'ConfigSnapshot':
+        """Create snapshot from mutable Config."""
+        return cls(
+            db_path=config.db_path,
+            flow_interval=config.flow_interval,
+            fee_interval=config.fee_interval,
+            rebalance_interval=config.rebalance_interval,
+            target_flow=config.target_flow,
+            flow_window_days=config.flow_window_days,
+            source_threshold=config.source_threshold,
+            sink_threshold=config.sink_threshold,
+            min_fee_ppm=config.min_fee_ppm,
+            max_fee_ppm=config.max_fee_ppm,
+            base_fee_msat=config.base_fee_msat,
+            rebalance_min_profit=config.rebalance_min_profit,
+            rebalance_max_amount=config.rebalance_max_amount,
+            rebalance_min_amount=config.rebalance_min_amount,
+            low_liquidity_threshold=config.low_liquidity_threshold,
+            high_liquidity_threshold=config.high_liquidity_threshold,
+            rebalance_cooldown_hours=config.rebalance_cooldown_hours,
+            inbound_fee_estimate_ppm=config.inbound_fee_estimate_ppm,
+            clboss_enabled=config.clboss_enabled,
+            clboss_unmanage_duration_hours=config.clboss_unmanage_duration_hours,
+            rebalancer_plugin=config.rebalancer_plugin,
+            estimated_open_cost_sats=config.estimated_open_cost_sats,
+            daily_budget_sats=config.daily_budget_sats,
+            min_wallet_reserve=config.min_wallet_reserve,
+            enable_proportional_budget=config.enable_proportional_budget,
+            proportional_budget_pct=config.proportional_budget_pct,
+            htlc_congestion_threshold=config.htlc_congestion_threshold,
+            enable_reputation=config.enable_reputation,
+            reputation_decay=config.reputation_decay,
+            enable_prometheus=config.enable_prometheus,
+            prometheus_port=config.prometheus_port,
+            enable_kelly=config.enable_kelly,
+            kelly_fraction=config.kelly_fraction,
+            max_concurrent_jobs=config.max_concurrent_jobs,
+            sling_job_timeout_seconds=config.sling_job_timeout_seconds,
+            sling_chunk_size_sats=config.sling_chunk_size_sats,
+            dry_run=config.dry_run,
+            sling_available=config.sling_available,
+            enable_vegas_reflex=config.enable_vegas_reflex,
+            vegas_decay_rate=config.vegas_decay_rate,
+            enable_scarcity_pricing=config.enable_scarcity_pricing,
+            scarcity_threshold=config.scarcity_threshold,
+            enable_flow_asymmetry=config.enable_flow_asymmetry,
+            enable_peer_sync=config.enable_peer_sync,
+            version=config._version,
+        )
 
 
 # Default chain cost assumptions for fee floor calculation

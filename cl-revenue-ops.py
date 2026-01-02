@@ -294,6 +294,31 @@ plugin.add_option(
     description='Multiplier for Kelly fraction (default: 0.5 = Half Kelly). Full Kelly (1.0) maximizes growth but has high volatility.'
 )
 
+# Phase 7 options (v1.3.0)
+plugin.add_option(
+    name='revenue-ops-vegas-reflex',
+    default='true',
+    description='Enable Vegas Reflex mempool spike defense (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-vegas-decay',
+    default='0.85',
+    description='Vegas Reflex decay rate per cycle, 0.0-1.0 (default: 0.85 = ~30min half-life)'
+)
+
+plugin.add_option(
+    name='revenue-ops-scarcity-pricing',
+    default='true',
+    description='Enable HTLC slot scarcity pricing (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-scarcity-threshold',
+    default='0.35',
+    description='Utilization threshold to start scarcity pricing, 0.0-1.0 (default: 0.35)'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -339,7 +364,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         enable_prometheus=options['revenue-ops-enable-prometheus'].lower() == 'true',
         prometheus_port=int(options['revenue-ops-prometheus-port']),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
-        kelly_fraction=float(options['revenue-ops-kelly-fraction'])
+        kelly_fraction=float(options['revenue-ops-kelly-fraction']),
+        # Phase 7 options (v1.3.0)
+        enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
+        vegas_decay_rate=float(options['revenue-ops-vegas-decay']),
+        enable_scarcity_pricing=options['revenue-ops-scarcity-pricing'].lower() == 'true',
+        scarcity_threshold=float(options['revenue-ops-scarcity-threshold'])
     )
     
     plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "
@@ -399,6 +429,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize database
     database = Database(config.db_path, safe_plugin)
     database.initialize()
+    
+    # Phase 7: Load config overrides from database (persisted runtime changes)
+    try:
+        config.load_overrides(database)
+        if config._version > 0:
+            plugin.log(f"Loaded config overrides from database (version {config._version})")
+    except Exception as e:
+        plugin.log(f"Warning: Could not load config overrides: {e}", level='warn')
     
     
     # Snapshot currently connected peers for baseline state on restart
@@ -1019,6 +1057,80 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
     
     ignored = database.get_ignored_peers()
     return {"ignored_peers": ignored, "count": len(ignored)}
+
+
+@plugin.method("revenue-config")
+def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = None) -> Dict[str, Any]:
+    """
+    Get or set runtime configuration (Phase 7: Dynamic Runtime Configuration).
+    
+    Usage:
+      lightning-cli revenue-config get           # Get all config
+      lightning-cli revenue-config get <key>     # Get specific key
+      lightning-cli revenue-config set <key> <value>  # Set key
+      lightning-cli revenue-config reset <key>   # Reset to default
+      lightning-cli revenue-config list-mutable  # List changeable keys
+    
+    Examples:
+      lightning-cli revenue-config get daily_budget_sats
+      lightning-cli revenue-config set daily_budget_sats 10000
+      lightning-cli revenue-config set enable_vegas_reflex false
+    """
+    if config is None or database is None:
+        return {"error": "Plugin not initialized"}
+    
+    if action == "get":
+        if key:
+            if not hasattr(config, key) or key.startswith('_'):
+                return {"error": f"Unknown config key: {key}"}
+            return {
+                "key": key,
+                "value": getattr(config, key),
+                "version": config._version
+            }
+        else:
+            # Return all config as dict (exclude private fields)
+            snapshot = config.snapshot()
+            from dataclasses import asdict
+            config_dict = asdict(snapshot)
+            return {
+                "config": config_dict,
+                "version": config._version
+            }
+    
+    elif action == "set":
+        if not key or value is None:
+            return {"error": "Usage: revenue-config set <key> <value>"}
+        
+        result = config.update_runtime(database, key, str(value))
+        
+        if result.get("status") == "success":
+            plugin.log(
+                f"CONFIG UPDATE: {key} changed from {result['old_value']} "
+                f"to {result['new_value']} (v{result['version']})",
+                level='info'
+            )
+        
+        return result
+    
+    elif action == "reset":
+        if not key:
+            return {"error": "Usage: revenue-config reset <key>"}
+        
+        if database.delete_config_override(key):
+            return {
+                "status": "success",
+                "message": f"Override for '{key}' removed. Restart plugin to apply default."
+            }
+        return {"error": f"No override found for '{key}'"}
+    
+    elif action == "list-mutable":
+        from modules.config import CONFIG_FIELD_TYPES, IMMUTABLE_CONFIG_KEYS
+        mutable = [k for k in CONFIG_FIELD_TYPES.keys() if k not in IMMUTABLE_CONFIG_KEYS]
+        return {"mutable_keys": sorted(mutable), "count": len(mutable)}
+    
+    else:
+        return {"error": f"Unknown action: {action}. Use 'get', 'set', 'reset', or 'list-mutable'"}
 
 
 # =============================================================================

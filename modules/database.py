@@ -293,6 +293,17 @@ class Database:
             )
         """)
         
+        # Config overrides table (Phase 7: Dynamic Runtime Configuration)
+        # Stores operator overrides that persist across restarts
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS config_overrides (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
@@ -1703,6 +1714,57 @@ class Database:
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM ignored_peers ORDER BY ignored_at DESC").fetchall()
         return [dict(row) for row in rows]
+    
+    # =========================================================================
+    # Config Overrides Methods (Phase 7: Dynamic Runtime Configuration)
+    # =========================================================================
+    
+    def get_config_override(self, key: str) -> Optional[str]:
+        """Get a single config override value."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT value FROM config_overrides WHERE key = ?", (key,)
+        ).fetchone()
+        return row['value'] if row else None
+
+    def set_config_override(self, key: str, value: str) -> int:
+        """
+        Set a config override with transactional safety.
+        
+        Returns:
+            New version number after update
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        
+        # Get current max version
+        row = conn.execute("SELECT MAX(version) as max_v FROM config_overrides").fetchone()
+        new_version = (row['max_v'] or 0) + 1
+        
+        conn.execute("""
+            INSERT OR REPLACE INTO config_overrides (key, value, version, updated_at)
+            VALUES (?, ?, ?, ?)
+        """, (key, value, new_version, now))
+        
+        return new_version
+
+    def get_all_config_overrides(self) -> Dict[str, str]:
+        """Get all config overrides as a dictionary."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT key, value FROM config_overrides").fetchall()
+        return {row['key']: row['value'] for row in rows}
+
+    def get_config_version(self) -> int:
+        """Get current config version (max version in table)."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT MAX(version) as max_v FROM config_overrides").fetchone()
+        return row['max_v'] or 0
+
+    def delete_config_override(self, key: str) -> bool:
+        """Delete a config override, returning to default."""
+        conn = self._get_connection()
+        cursor = conn.execute("DELETE FROM config_overrides WHERE key = ?", (key,))
+        return cursor.rowcount > 0
     
     def close(self):
         """Close the thread-local database connection (if any)."""

@@ -519,7 +519,7 @@ except Exception as e:
 # Lines 1449-1455 (rebalancer.py)
 # Capital Controls Check - diagnostic rebalances count against daily budget
 if not self._check_capital_controls():
-    self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warning')
+    self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warn')
     return {
         "success": True,
         "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
@@ -587,7 +587,7 @@ def manual_rebalance(self, from_channel: str, to_channel: str,
         self.plugin.log(
             "WARNING: Manual rebalance executing despite capital controls. "
             "Budget may be exhausted or reserve low.", 
-            level='warning'
+            level='warn'
         )
 ```
 
