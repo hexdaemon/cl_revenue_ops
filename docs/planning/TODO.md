@@ -67,20 +67,13 @@ This document details the implementation steps for the remaining items in the ro
 - Added `prune_stale_source_failures()` in `modules/rebalancer.py` (JobManager) - removes orphaned failure counts
 - Both methods called at end of their respective main loops (`adjust_all_fees` and `find_rebalance_candidates`)
 
-#### 19. Switch Flow Analysis to Local DB (The "Double-Dip" Fix)
-**Context:** Currently, `flow_analysis.py` calls the `listforwards` RPC every hour. On established nodes, this returns hundreds of megabytes of JSON, causing CPU spikes and potential Out-Of-Memory crashes. However, we *already* save every forward to our local SQLite DB via the `forward_event` hook.
-**Tasks:**
-1.  **Implement "Hydration" in `cl-revenue-ops.py`**:
-    - On startup, check the timestamp of the last entry in `forwards` table.
-    - Call `listforwards` RPC *once* filtering `status=settled` since that timestamp to fill any gaps (while plugin was offline).
-2.  **Refactor `modules/flow_analysis.py`**:
-    - Change `_get_daily_flow_from_listforwards` to `_get_daily_flow_from_db`.
-    - Replace RPC call with SQL aggregation:
-      ```sql
-      SELECT timestamp, in_msat, out_msat FROM forwards 
-      WHERE timestamp > ? AND (in_channel = ? OR out_channel = ?)
-      ```
-**Benefit:** Eliminates the heaviest RPC call in the plugin. Reduces CPU usage by ~90% during flow analysis cycles.
+#### 19. Switch Flow Analysis to Local DB (The "Double-Dip" Fix) ✅ COMPLETED
+**Status:** Implemented local database aggregation to eliminate heavy `listforwards` RPC calls.
+- Added `get_latest_forward_timestamp()` and `bulk_insert_forwards()` in `modules/database.py`
+- Added `get_daily_flow_buckets()` in `modules/database.py` for efficient SQL aggregation
+- Added hydration logic in `cl-revenue-ops.py` → `init()` to fill gaps on startup
+- Refactored `_get_daily_flow_from_listforwards()` in `modules/flow_analysis.py` to use local DB
+- **Result:** `listforwards` RPC called ONCE on startup (hydration), then never again
 
 ---
 

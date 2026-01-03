@@ -117,22 +117,22 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Runtime configurable via `revenue-config set enable_scarcity_pricing true`.
     - **Virgin Channel Amnesty:** Remote-opened channels with no outbound traffic bypass scarcity pricing to encourage break-in.
 
-### v1.3.1: Liquidity Hardening & Efficiency (Planned)
+### v1.3.1: Liquidity Hardening & Efficiency ✅ COMPLETED
 *Objective: Improve rebalancer efficiency and prevent resource waste.*
 
 - [x] **"Orphan Job" Cleanup (Startup Hygiene)**:
     - Terminate stale `sling` jobs on plugin restart to prevent "Phantom Spending."
     - `cleanup_orphans()` called during `init()`, `stop_all_jobs()` on shutdown.
 
-- [ ] **Volume-Weighted Liquidity Targets (Smart Allocation)**:
+- [x] **Volume-Weighted Liquidity Targets (Smart Allocation)**:
     - Target 3 days of buffer OR 50% capacity, whichever is lower.
     - Frees idle Bitcoin from slow-moving large channels to high-velocity channels.
 
-- [ ] **"Futility" Circuit Breaker**:
+- [x] **"Futility" Circuit Breaker**:
     - Hard cap on retry attempts (>10 failures = 48h cooldown).
     - Prevents wasted gossip bandwidth on broken routing paths.
 
-### v1.3.2: Architectural Hardening (Planned)
+### v1.3.2: Architectural Hardening ✅ COMPLETED
 *Objective: Optimize for high-scale nodes with millions of forwards.*
 
 - [x] **Plugin Lifecycle Management (Graceful Shutdown)**:
@@ -140,16 +140,17 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - All background loops use interruptible `shutdown_event.wait()`.
     - Enables instant plugin stop/restart without waiting for sleep timers.
 
-- [ ] **Composite Database Indexing**:
-    - Add `idx_forwards_composite ON forwards(out_channel, timestamp)`.
+- [x] **Composite Database Indexing**:
+    - Add `idx_forwards_out_channel_time ON forwards(out_channel, timestamp)`.
     - Changes query complexity from O(N) to O(log N).
 
-- [ ] **In-Memory Garbage Collection**:
-    - Prune `HillClimbState` and `ScarcityState` for closed channels.
+- [x] **In-Memory Garbage Collection**:
+    - Prune `HillClimbState` and `source_failure_counts` for closed channels.
     - Prevents memory bloat over months of operation.
 
-- [ ] **Flow Analysis Local DB Migration**:
+- [x] **Flow Analysis Local DB Migration**:
     - Replace `listforwards` RPC with local SQLite aggregation.
+    - Hydrates forwards table on startup, then uses only local DB.
     - Reduces CPU usage by ~90% during flow analysis cycles.
 
 ### v1.4.0: Optimization & Yield (Deferred)
@@ -183,4 +184,4 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
-*Roadmap updated: January 2, 2026*
+*Roadmap updated: January 3, 2026*
