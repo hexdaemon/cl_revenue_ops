@@ -76,15 +76,8 @@ This document details the implementation steps for the remaining items in the ro
 - `modules/rebalancer.py`: `stop_all_jobs()` terminates active sling jobs on shutdown ✅
 - `cl-revenue-ops.py`: SIGTERM handler calls both cleanup methods ✅
 
-#### 17. Optimize Database Indexes (Composite Indexing)
-**Context:** The Fee Controller runs `get_volume_since` for every channel every 30 minutes. The query filters by `out_channel` AND `timestamp`. Currently, these columns are indexed separately, requiring the database to scan results. On nodes with millions of forwards, this causes lag.
-**Tasks:**
-1.  **Modify `modules/database.py`** in `initialize`:
-    - Add a composite index: 
-      ```sql
-      CREATE INDEX IF NOT EXISTS idx_forwards_composite ON forwards(out_channel, timestamp)
-      ```
-**Benefit:** Changes query complexity from $O(N)$ to $O(\log N)$, ensuring instant fee calculations regardless of history size.
+#### 17. Optimize Database Indexes (Composite Indexing) ✅ COMPLETED
+**Status:** Added composite index `idx_forwards_out_channel_time ON forwards(out_channel, timestamp)` in `modules/database.py` → `initialize()`. Changes query complexity from O(N) to O(log N) for `get_volume_since` calls.
 
 #### 18. Implement In-Memory "Garbage Collection"
 **Context:** The `FeeController` caches state objects (`HillClimbState`, `ScarcityState`) in Python dictionaries. When channels are closed, these objects remain in memory forever, causing a slow memory leak over months of operation.

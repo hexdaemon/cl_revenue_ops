@@ -324,6 +324,11 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_time ON mempool_fee_history(timestamp)")
         
+        # Composite index for get_volume_since optimization (TODO #17)
+        # Fee Controller queries by out_channel + timestamp every 30min
+        # This changes query complexity from O(N) to O(log N)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_out_channel_time ON forwards(out_channel, timestamp)")
+        
         # Daily aggregated forwarding stats (Granular History)
         # Replacing the single 'lifetime_aggregates' counter with daily resolution
         conn.execute("""

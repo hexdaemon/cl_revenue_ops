@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Date** | January 1, 2026 |
+| **Date** | January 3, 2026 |
 | **Target Version** | cl-revenue-ops v1.3.0 |
 | **Status** | Ready for Implementation |
 | **Specification** | [`PHASE7_SPECIFICATION.md`](../specs/PHASE7_SPECIFICATION.md) |
@@ -14,13 +14,14 @@
 
 ## 1. Executive Summary
 
-This document provides step-by-step implementation details for Phase 7 v1.3.0. Three features are to be implemented in strict order due to dependencies:
+This document provides step-by-step implementation details for Phase 7 v1.3.0.
 
 | Priority | Feature | Vulnerabilities Addressed | Dependency |
 |----------|---------|---------------------------|------------|
 | 1 | Dynamic Runtime Configuration | CRITICAL-02, CRITICAL-03 | Foundation |
 | 2 | Mempool Acceleration (Vegas Reflex) | CRITICAL-01, HIGH-03 | Requires Feature 1 |
 | 3 | HTLC Slot Scarcity Pricing | HIGH-01, HIGH-02, MEDIUM-01 | Requires Feature 2 patterns |
+| 4 | Liquidity Efficiency Suite | Capital Efficiency / Resource Waste | Independent |
 
 ---
 
@@ -852,7 +853,47 @@ def execute_rebalance(self, candidate: RebalanceCandidate, ...) -> Dict[str, Any
 
 ---
 
-## 5. Configuration Additions
+## 5. Feature 4: Liquidity Efficiency Suite
+
+### 5.1 Objective
+Optimize how capital is deployed (Smart Allocation) and stop wasting resources on broken paths (Futility).
+
+### 5.2 Files to Modify
+| File | Changes |
+|------|---------|
+| `modules/rebalancer.py` | Update `_analyze_rebalance_ev` (Targets) and `find_rebalance_candidates` (Futility) |
+
+### 5.3 Volume-Weighted Targets (Smart Allocation)
+
+**Location:** `modules/rebalancer.py` → `_analyze_rebalance_ev`
+
+**Algorithm:**
+Instead of a blind 50% target, we calculate:
+1.  **Velocity:** Average daily volume over the last 7 days.
+2.  **Inventory Goal:** Enough liquidity for 3 days of flow.
+3.  **Cap:** Never exceed 50% of channel capacity (don't overfill).
+4.  **Floor:** Never drop below `rebalance_min_amount` (burst buffer).
+
+```python
+# Pseudo-code logic insertion
+daily_vol = (state.sats_in + state.sats_out) / 7
+vol_target = daily_vol * 3
+cap_target = capacity * 0.5
+target_spendable = max(min(cap_target, vol_target), config.rebalance_min_amount)
+```
+
+### 5.4 Futility Circuit Breaker
+
+**Location:** `modules/rebalancer.py` → `find_rebalance_candidates`
+
+**Logic:**
+Check the existing `channel_failures` table.
+- If `failure_count > 10` AND `last_failure < 48 hours ago`:
+- **SKIP** candidate. Do not calculate EV. Do not query graph.
+
+---
+
+## 6. Configuration Additions
 
 **Location:** `modules/config.py` → `Config` class
 
@@ -903,9 +944,9 @@ plugin.add_option(
 
 ---
 
-## 6. Testing Plan
+## 7. Testing Plan
 
-### 6.1 Unit Tests
+### 7.1 Unit Tests
 
 | Test ID | Feature | Description |
 |---------|---------|-------------|
@@ -922,8 +963,13 @@ plugin.add_option(
 | T3.2 | Scarcity | Dust Flood resistance (1000 tiny HTLCs ≠ 1000 slots) |
 | T3.3 | Scarcity | Asymmetric EMA (fast up, slow down) |
 | T3.4 | Scarcity | Rebalancer forecast blocks high-util |
+| T4.1 | Targets | High volume channel targets 50% capacity |
+| T4.2 | Targets | Low volume channel targets 3x daily volume |
+| T4.3 | Targets | Dead channel respects min_amount floor |
+| T4.4 | Futility | Channel with 11 fails is skipped |
+| T4.5 | Futility | Channel with 11 fails (old) is retried |
 
-### 6.2 Integration Tests
+### 7.2 Integration Tests
 
 | Test ID | Description | Expected Result |
 |---------|-------------|-----------------|
@@ -933,8 +979,10 @@ plugin.add_option(
 | I4 | Simulate spike removal, verify decay | Intensity decreases each cycle |
 | I5 | Fill channel with HTLCs, verify fee increase | Scarcity multiplier applied |
 | I6 | Attempt rebalance to 70% utilized channel | Rebalance blocked |
+| I7 | Rebalance dead channel 10x | 11th attempt is silenced (no log/activity) |
+| I8 | Check large low-vol channel | Target liquidity drops, capital freed |
 
-### 6.3 Adversarial Tests
+### 7.3 Adversarial Tests
 
 | Test ID | Attack | Defense | Expected Result |
 |---------|--------|---------|-----------------|
@@ -945,19 +993,20 @@ plugin.add_option(
 
 ---
 
-## 7. Implementation Timeline
+## 8. Implementation Timeline
 
 | Week | Feature | Tasks |
 |------|---------|-------|
 | 1 | Feature 1 | Database schema, Config methods, RPC commands |
 | 2 | Feature 2 | VegasReflexState, mempool history, integration |
 | 3 | Feature 3 | ScarcityState, rebalancer guard, integration |
-| 4 | Testing | Unit tests, integration tests, adversarial tests |
-| 5 | Release | Documentation, changelog, v1.3.0 release |
+| 4 | Feature 4 | Smart Targets, Futility Circuit Breaker |
+| 5 | Testing | Unit tests, integration tests, adversarial tests |
+| 6 | Release | Documentation, changelog, v1.3.0 release |
 
 ---
 
-## 8. Rollback Plan
+## 9. Rollback Plan
 
 All features have enable flags that default to `True` but can be disabled:
 
@@ -974,4 +1023,4 @@ Database schema changes are additive (new tables/columns) and do not break backw
 ---
 
 *Document Author: cl-revenue-ops Development Team*  
-*Last Updated: January 1, 2026*
+*Last Updated: January 3, 2026*
