@@ -371,12 +371,20 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
         
+        # Schema migration: Add last_broadcast_fee_ppm to fee_strategy_state
         try:
             conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_broadcast_fee_ppm INTEGER DEFAULT 0")
-            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_state TEXT DEFAULT 'balanced'")
-            self.plugin.log("Added last_broadcast_fee_ppm and last_state columns to fee_strategy_state")
+            self.plugin.log("Added last_broadcast_fee_ppm column to fee_strategy_state")
         except sqlite3.OperationalError:
-            pass  # Columns already exist
+            pass  # Column already exists
+        
+        # Schema migration: Add last_state to fee_strategy_state
+        # NOTE: Must be separate try/except to ensure it runs even if above column exists
+        try:
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_state TEXT DEFAULT 'balanced'")
+            self.plugin.log("Added last_state column to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
         # Schema migration: Add rebalance_type to rebalance_history
         try:
