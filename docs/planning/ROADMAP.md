@@ -183,12 +183,20 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - JSON output: TLV, Margins, ROC, and Warnings (Bleeders list).
 
 ## Phase 9: "The Hive" (External Integration)
-*Status: MOVED*
+*Status: IN PROGRESS*
 
 The distributed fleet coordination logic has been decoupled into a standalone plugin to improve modularity and security.
 
 *   **Repository:** `cl-hive`
 *   **Goal:** Provide API hooks in `cl-revenue-ops` to accept signals from `cl-hive` regarding whitelist fees and rebalance priorities.
+
+### v1.4.0: Hive Foundation ✅ COMPLETED
+
+- [x] **Strategic Rebalance Exemption (Zero-Fee Paradox Fix)**:
+    - Allow "negative EV" rebalances for Hive peers to facilitate inventory load balancing.
+    - New config: `hive_fee_ppm` (default: 0), `hive_rebalance_tolerance` (default: 50 sats).
+    - Rebalancer checks destination policy; Hive peers allow loss up to tolerance.
+    - Solves: Hive members at 0 PPM were blocked from ALL rebalances due to `expected_income = 0`.
 
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*

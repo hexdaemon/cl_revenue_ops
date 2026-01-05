@@ -332,6 +332,20 @@ plugin.add_option(
     description='Utilization threshold to start scarcity pricing, 0.0-1.0 (default: 0.35)'
 )
 
+plugin.add_option(
+    name='revenue-ops-hive-fee-ppm',
+    default='0',
+    description='Fee rate charged to Hive fleet members (default: 0)',
+    opt_type='int'
+)
+
+plugin.add_option(
+    name='revenue-ops-hive-rebalance-tolerance',
+    default='50',
+    description='Max sats allowed to lose when rebalancing TO a Hive member (Strategic CapEx)',
+    opt_type='int'
+)
+
 
 # =============================================================================
 # INITIALIZATION

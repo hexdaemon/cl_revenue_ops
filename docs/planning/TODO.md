@@ -212,7 +212,23 @@ This document details the implementation steps for the remaining items in the ro
 
 **Integration Points (for `cl-revenue-ops`):**
 
-#### 29. Implement Hive Signal API Hooks
+#### 29a. Strategic Rebalance Exemption (Zero-Fee Paradox Fix) ✅ COMPLETED
+**Objective:** Allow "negative EV" rebalances for Hive peers to facilitate inventory load balancing.
+**Problem Solved:** Hive members have 0 PPM fees, so `expected_income = 0`, causing ALL rebalances to be rejected as unprofitable.
+**Implementation:**
+- Added `hive_fee_ppm` (default: 0) and `hive_rebalance_tolerance` (default: 50 sats) config options
+- Modified `_analyze_rebalance_ev()` in `modules/rebalancer.py` to check destination policy
+- For `FeeStrategy.HIVE` peers: `profit_threshold = -hive_rebalance_tolerance` (allows strategic loss)
+- For normal peers: `profit_threshold = rebalance_min_profit` (unchanged behavior)
+- Added debug logging when Hive rebalances are skipped due to cost exceeding tolerance
+- Added info logging when Strategic Exemption allows negative EV rebalance
+
+**Context Files:**
+- `modules/config.py` (new fields)
+- `modules/rebalancer.py` (exemption logic)
+- `cl-revenue-ops.py` (plugin options)
+
+#### 29b. Implement Hive Signal API Hooks
 **Context:** Allow `cl-hive` to send fee and rebalance priority signals to this plugin.
 **Tasks:**
 1.  **Modify `modules/fee_controller.py`**:

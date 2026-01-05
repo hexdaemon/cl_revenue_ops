@@ -30,7 +30,7 @@ from .config import Config
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
 from .metrics import PrometheusExporter, MetricNames, METRIC_HELP
-from .policy_manager import PolicyManager, RebalanceMode
+from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -1150,8 +1150,36 @@ class EVRebalancer:
         expected_source_loss = (rebalance_amount * expected_utilization * source_fee_ppm * turnover_weight) // 1_000_000
         expected_profit = expected_income - max_budget_sats - expected_source_loss
         
-        if expected_profit < self.config.rebalance_min_profit: 
+        # Strategic Rebalance Exemption: Dynamic threshold based on destination policy
+        profit_threshold = self.config.rebalance_min_profit
+        is_hive_transfer = False
+        
+        if self.policy_manager:
+            dest_peer_id = dest_info.get("peer_id", "")
+            if dest_peer_id:
+                policy = self.policy_manager.get_policy(dest_peer_id)
+                if policy.strategy == FeeStrategy.HIVE:
+                    is_hive_transfer = True
+                    # Allow negative profit (cost) up to tolerance
+                    profit_threshold = -(self.config.hive_rebalance_tolerance)
+        
+        # Check Profit against Dynamic Threshold
+        if expected_profit < profit_threshold:
+            # Add debug logging to explain rejection
+            if is_hive_transfer:
+                self.plugin.log(
+                    f"HIVE REBALANCE SKIPPED: Cost too high. Profit {expected_profit} < Tolerance {-self.config.hive_rebalance_tolerance}",
+                    level='debug'
+                )
             return None
+        
+        # Log Success (Strategic override)
+        if is_hive_transfer and expected_profit < 0:
+            self.plugin.log(
+                f"STRATEGIC EXEMPTION: Allowing negative EV rebalance to Hive Peer {dest_channel}. "
+                f"Cost: {abs(expected_profit)} sats (Tolerance: {self.config.hive_rebalance_tolerance})",
+                level='info'
+            )
         
         return RebalanceCandidate(
             source_candidates=source_scids,

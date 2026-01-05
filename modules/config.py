@@ -56,6 +56,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'vegas_decay_rate': float,
     'enable_scarcity_pricing': bool,
     'scarcity_threshold': float,
+    # Hive Parameters
+    'hive_fee_ppm': int,
+    'hive_rebalance_tolerance': int,
 }
 
 # Range constraints for numeric fields
@@ -72,6 +75,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'kelly_fraction': (0.0, 1.0),
     'vegas_decay_rate': (0.0, 1.0),
     'scarcity_threshold': (0.0, 1.0),
+    'hive_fee_ppm': (0, 100000),
+    'hive_rebalance_tolerance': (0, 100000),
 }
 
 
@@ -166,6 +171,10 @@ class Config:
     vegas_decay_rate: float = 0.85         # Per-cycle decay (~30min half-life)
     enable_scarcity_pricing: bool = True   # HTLC slot scarcity pricing
     scarcity_threshold: float = 0.35       # Start pricing at 35% utilization
+    
+    # Hive Parameters (v1.4.0 - Strategic Rebalance Exemption)
+    hive_fee_ppm: int = 0              # The fee we charge fleet members (default 0)
+    hive_rebalance_tolerance: int = 50 # Max sats we are willing to LOSE to balance a friend
     
     # Deferred (v1.4.0)
     enable_flow_asymmetry: bool = False    # Rare liquidity premium
