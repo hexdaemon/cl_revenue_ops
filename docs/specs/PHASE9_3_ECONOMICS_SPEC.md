@@ -1,32 +1,45 @@
 # Phase 9.3 Spec: The Guard (Economics & Governance)
 
-## 1. Internal Economics
-**Rule:** Hive Members must offer **0-Fee Routing** (or <10 PPM floor) to other Members.
+| Field | Value |
+|-------|-------|
+| **Focus** | Membership Lifecycle, Incentives, and Ecological Limits |
+| **Status** | **APPROVED** |
 
-### 1.1 Enforcement (The "Internal Zero" Check)
-*   **Monitor:** Node B periodically checks Node A's channel update gossip.
-*   **Violation:** If Node A charges Node B > 10 PPM, Node B flags Node A as **NON-COMPLIANT**.
-*   **Penalty:** Node B revokes Node A's 0-fee privileges locally (Tit-for-Tat).
+---
 
-## 2. Anti-Leech Mechanisms
-**Threat:** A node joins to drain liquidity but refuses to route for the fleet.
+## 1. Internal Economics: The Two-Tier System
 
-### 2.1 The Contribution Ratio
-Each node calculates a local score for every peer:
-$$Ratio = \frac{\text{Liquidity\_Forwarded\_To\_Peer}}{\text{Liquidity\_Received\_From\_Peer}}$$
-*   **Action:** If `Ratio < 0.5` (Peer takes 2x what they give), the Rebalancer throttles "Push" operations to that peer.
+To prevent "Free Riders" and ensure value accretion, The Hive utilizes a tiered membership structure. Access to the "Zero-Fee" pool is earned, not given.
 
-## 3. Distributed Governance
+### 1.1 Neophyte (Probationary Status)
+**Role:** Revenue Source & Auditioning Candidate.
+*   **Fees:** **Discounted** (e.g., 50% of Public Rate). They pay to access Hive liquidity but get a better deal than the public.
+*   **Rebalancing:** **Pull Only.** Can request funds (paying the discounted fee) but does not receive proactive "Push" injections.
+*   **Data Access:** **Read-Only.** Receives topology data (where to open channels) but is excluded from high-value "Alpha" strategy gossip.
+*   **Duration:** Minimum 30-day evaluation period.
 
-### 3.1 Consensus Banning (The Borg Defense)
-*   **Trigger:** Node A detects toxic behavior (Jamming) from External Peer X.
-*   **Broadcast:** Node A signs `HIVE_BAN { peer: X, reason: JAMMING }`.
-*   **Adoption:**
-    *   Node B receives Ban.
-    *   Node B checks: "Have I received Bans for X from >30% of the Fleet?"
-    *   **If Yes:** Add X to `ignored_peers` table.
-    *   **If No:** Log "Strike 1" but do not ban yet (Prevents Griefing).
+### 1.2 Full Member (Vested Partner)
+**Role:** Owner & Operator.
+*   **Fees:** **Zero (0 PPM)** or Floor (10 PPM). Frictionless internal movement.
+*   **Rebalancing:** **Push & Pull.** Eligible for automated inventory load balancing.
+*   **Data Access:** **Read-Write.** Broadcasts strategies, votes on bans, receives "Alpha" immediately.
+*   **Governance:** Holds signing power for new member promotion.
 
-### 3.2 Strategy Gossip (Time-Delayed Alpha)
-*   **Rule:** Winning strategies (High Yield Routes) are shared with a **24-hour delay**.
-*   **Incentive:** The discoverer gets exclusivity to monetize the route first. Sharing essentially "buys" Reputation for future benefits.
+---
+
+## 2. The Promotion Protocol: "Proof of Utility"
+
+Transitioning from Neophyte to Member is an **Algorithmic Consensus** process, not a human vote. A Neophyte requests promotion via `HIVE_PROMOTION_REQUEST`. Existing Members run a local audit:
+
+### 2.1 The Value-Add Equation
+A Member signs a `VOUCH` message only if the Neophyte satisfies **ALL** criteria:
+
+1.  **Reliability:** Uptime > 99.5% over the 30-day probation. Zero "Toxic" incidents (no dust attacks, no jams).
+2.  **Contribution Ratio:** Ratio > 1.0. The Neophyte must have routed *more* volume for the Hive than they consumed from it.
+3.  **Topological Uniqueness (The Kicker):**
+    *   Does the Neophyte connect to a peer the Hive *doesn't* already have?
+    *   **YES:** High Value (Expansion) -> **PROMOTE**.
+    *   **NO:** Redundant (Cannibalization) -> **REJECT** (Remain Neophyte).
+
+### 2.2 Consensus Threshold
+Once a Neophyte collects `VOUCH` signatures from **51%** of the active fleet (or a fixed quoru
