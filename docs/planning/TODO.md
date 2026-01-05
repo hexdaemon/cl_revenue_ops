@@ -228,15 +228,15 @@ This document details the implementation steps for the remaining items in the ro
 - `modules/rebalancer.py` (exemption logic)
 - `cl-revenue-ops.py` (plugin options)
 
-#### 29b. Implement Hive Signal API Hooks
-**Context:** Allow `cl-hive` to send fee and rebalance priority signals to this plugin.
-**Tasks:**
-1.  **Modify `modules/fee_controller.py`**:
-    - Add `set_hive_fee_override(channel_id, fee_ppm, ttl)` method.
-    - Priority: Hive override > Alpha Sequence (if within TTL).
-2.  **Modify `modules/rebalancer.py`**:
-    - Add `set_hive_priority(channel_id, priority_score)` method.
-    - Boost candidate scoring for Hive-prioritized channels.
-3.  **Modify `cl-revenue-ops.py`**:
-    - Register `revenue-hive-signal` RPC for `cl-hive` to call.
-    - Validate signatures/authentication if cross-node communication is used.
+#### 29b. ~~Implement Hive Signal API Hooks~~ ✅ SUPERSEDED
+**Status:** Delivered via **Policy-Driven Architecture** (v1.4).
+**Resolution:** The `PolicyManager` module provides a cleaner, declarative approach:
+- `revenue-policy set <peer_id> strategy=hive` — Sets Hive fee behavior (0 PPM)
+- `revenue-policy set <peer_id> rebalance_mode=enabled` — Controls rebalance priority
+- `FeeStrategy.HIVE` checked by Fee Controller for fee overrides
+- `FeeStrategy.HIVE` checked by Rebalancer for Strategic Exemption
+
+**Original Tasks (No Longer Needed):**
+1.  ~~Add `set_hive_fee_override(channel_id, fee_ppm, ttl)` method~~ → Use `PolicyManager.set_policy()`
+2.  ~~Add `set_hive_priority(channel_id, priority_score)` method~~ → Use `rebalance_mode` policy field
+3.  ~~Register `revenue-hive-signal` RPC~~ → Use existing `revenue-policy` RPC commands
