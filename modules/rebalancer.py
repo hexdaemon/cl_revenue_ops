@@ -275,12 +275,19 @@ class JobManager:
         
         # Calculate chunk size (amount per rebalance attempt)
         chunk_size = min(candidate.amount_sats, self.chunk_size_sats)
+
+        # ZERO-TOLERANCE: Enforce sats-budget-derived fee cap on the execution unit (chunk).
+        budget_ppm = (candidate.max_budget_sats * 1_000_000) // chunk_size if chunk_size > 0 else 0
+        maxppm = max(1, min(candidate.max_fee_ppm, budget_ppm)) if budget_ppm > 0 else 0
+        if maxppm <= 0:
+            return {"success": False, "error": "Budget too small to allow any routing fee (maxppm=0)"}
         
         try:
             primary_source = source_scids_sling[0] if source_scids_sling else "none"
             self.plugin.log(
                 f"Starting sling-job: {to_scid} <- [{len(source_scids_sling)} candidates], "
-                f"primary={primary_source}, amount={chunk_size}, maxppm={candidate.max_fee_ppm}, "
+                f"primary={primary_source}, amount={chunk_size}, "
+                f"maxppm={maxppm}, budget_sats={candidate.max_budget_sats}, "
                 f"target_total={candidate.amount_sats}"
             )
             
@@ -290,7 +297,7 @@ class JobManager:
                 "scid": to_scid,
                 "direction": "pull",
                 "amount": chunk_size,
-                "maxppm": candidate.max_fee_ppm,
+                "maxppm": maxppm,
                 "candidates": source_scids_sling,
                 "target": 0.5  # Stop when 50% balance reached (we'll stop earlier ourselves)
             })
@@ -313,7 +320,7 @@ class JobManager:
                 rebalance_id=rebalance_id,
                 target_amount_sats=candidate.amount_sats,
                 initial_local_sats=initial_balance,
-                max_fee_ppm=candidate.max_fee_ppm,
+                max_fee_ppm=maxppm,  # Use enforced budget-derived maxppm
                 status=JobStatus.RUNNING
             )
             self._active_jobs[normalized_scid] = job
@@ -435,6 +442,17 @@ class JobManager:
             
             # Get job-specific stats from sling
             job_stats = sling_stats.get(job.scid, {})
+
+            # ZERO-TOLERANCE: Abort if the job is spending at/above its sats budget.
+            fee_sats = job_stats.get("fee_total_sats", 0) or 0
+            if not fee_sats:
+                fee_msat = job_stats.get("fee_total_msat", 0) or 0
+                fee_sats = fee_msat // 1000 if fee_msat else 0
+
+            if fee_sats and job.candidate and fee_sats > job.candidate.max_budget_sats:
+                self._handle_job_budget_exceeded(job, fee_sats, job_stats)
+                summary["failed"] += 1
+                continue
             
             # Check for success: any positive transfer means we've achieved something
             if amount_transferred > 0:
@@ -596,6 +614,37 @@ class JobManager:
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
+    
+    def _handle_job_budget_exceeded(self, job: ActiveJob, fee_sats: int,
+                                    stats: Dict[str, Any]) -> None:
+        """Handle a job that exceeded its configured sats budget."""
+        error_msg = stats.get("last_error", "")
+        budget_sats = job.candidate.max_budget_sats if job.candidate else 0
+        msg = f"Exceeded sats budget: fee_sats={fee_sats} > budget_sats={budget_sats}"
+        if error_msg:
+            msg = f"{msg}; last_error={error_msg}"
+
+        self.plugin.log(
+            f"Rebalance FAILED (budget): {job.scid} - {msg}",
+            level='warn'
+        )
+
+        # Update database (treat as failure with explicit error message)
+        self.database.update_rebalance_result(
+            job.rebalance_id,
+            'failed',
+            actual_fee_sats=fee_sats,
+            error_message=f"exceeded_budget: {msg}"
+        )
+        self.database.increment_failure_count(job.scid_normalized)
+
+        # Penalize primary source reliability (it led us into an overspend scenario)
+        if job.candidate and job.candidate.source_candidates:
+            primary_source = job.candidate.source_candidates[0]
+            self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
+
+        # Stop the job
+        self.stop_job(job.scid_normalized, reason="exceeded_budget")
     
     def _handle_job_timeout(self, job: ActiveJob) -> None:
         """Handle a timed-out job."""
@@ -1006,6 +1055,11 @@ class EVRebalancer:
 
         capacity = dest_info.get("capacity", 0)
         spendable = dest_info.get("spendable_sats", 0)
+
+        # ZERO-TOLERANCE: Never attempt to rebalance channels with non-positive capacity.
+        # These can appear transiently (closing/failed states) or via incomplete channel info.
+        if capacity <= 0:
+            return None
         
         # Dynamic targeting based on flow state
         if dest_flow_state == "source": 
@@ -1038,6 +1092,18 @@ class EVRebalancer:
         else:
             daily_volume = 0
         
+        # =====================================================================
+        # HOTFIX 0.1: Destination Sizing Guard
+        # =====================================================================
+        # Problem: target_spendable = max(min_amount, target_spendable) could force
+        # target above capacity, causing repeated failures and pathological candidates.
+        # Solution: Clamp to capacity and skip tiny channels that can't meet min_amount.
+        # =====================================================================
+        
+        # Guard: Skip zero-capacity channels entirely
+        if capacity <= 0:
+            return None
+        
         # Calculate volume-based target (3 days of buffer)
         vol_target = int(daily_volume * 3)
         
@@ -1048,13 +1114,25 @@ class EVRebalancer:
         # This prevents overfilling slow channels while still allowing fast channels
         # to be fully stocked
         if vol_target > 0:
-            target_spendable = min(cap_target, vol_target)
+            raw_target = min(cap_target, vol_target)
         else:
             # No volume data yet - fall back to capacity-based target
-            target_spendable = cap_target
+            raw_target = cap_target
         
-        # Safety Floor: Never target less than min_rebalance_amount to handle bursts
-        target_spendable = max(self.config.rebalance_min_amount, target_spendable)
+        # CRITICAL: Clamp raw_target to capacity (never exceed what's possible)
+        raw_target = min(raw_target, capacity)
+        
+        # Skip tiny channels that can't meet the minimum rebalance amount
+        # Instead of force-filling them (which caused target > capacity), we skip them
+        if raw_target < self.config.rebalance_min_amount:
+            self.plugin.log(
+                f"SIZING GUARD: Skipping {dest_channel[:12]}... - raw_target {raw_target:,} < "
+                f"min_amount {self.config.rebalance_min_amount:,} (capacity: {capacity:,})",
+                level='debug'
+            )
+            return None
+        
+        target_spendable = raw_target
         
         # Log when volume-weighting reduces target significantly
         if vol_target > 0 and vol_target < cap_target * 0.8:
@@ -1069,8 +1147,23 @@ class EVRebalancer:
         if amount_needed <= 0: 
             return None
         
-        rebalance_amount = max(self.config.rebalance_min_amount, 
-                             min(self.config.rebalance_max_amount, amount_needed))
+        # ZERO-TOLERANCE: Never attempt to push more sats than the channel can accept.
+        headroom = max(0, capacity - spendable)
+        if headroom <= 0:
+            return None
+
+        # Compute desired amount, then clamp to headroom and execute per-chunk.
+        desired_amount = min(
+            self.config.rebalance_max_amount,
+            max(self.config.rebalance_min_amount, amount_needed)
+        )
+        desired_amount = min(desired_amount, headroom)
+        if desired_amount <= 0:
+            return None
+
+        # ZERO-TOLERANCE: Evaluate EV on the actual execution unit (one chunk).
+        # This matches the "stop after first success" execution model.
+        rebalance_amount = min(desired_amount, self.config.sling_chunk_size_sats)
         amount_msat = rebalance_amount * 1000
         
         # BROADCAST FEE ALIGNMENT (Phase 5.5): Use confirmed broadcast fee for EV
@@ -1133,8 +1226,14 @@ class EVRebalancer:
             max_budget_msat = max_budget_sats * 1000
 
         if amount_msat > 0:
-            effective_max_fee_ppm = inbound_fee_ppm + (spread_ppm // 2)
-            max_fee_ppm = max(1, min(effective_max_fee_ppm, spread_ppm + inbound_fee_ppm))
+            # ZERO-TOLERANCE: Derive max routing fee from the sats budget for this chunk.
+            # Our EV math subtracts max_budget_sats as a worst-case routing cost, so we must
+            # ensure execution cannot exceed that budget.
+            budget_ppm = (max_budget_sats * 1_000_000) // rebalance_amount if rebalance_amount > 0 else 0
+
+            # Optional heuristic upper bound, but ALWAYS clamp to the sats-budget-derived ppm.
+            heuristic_ppm = inbound_fee_ppm + (spread_ppm // 2)
+            max_fee_ppm = max(1, min(heuristic_ppm, budget_ppm)) if budget_ppm > 0 else 0
         else:
             max_fee_ppm = 0
             
@@ -1151,7 +1250,12 @@ class EVRebalancer:
         expected_profit = expected_income - max_budget_sats - expected_source_loss
         
         # Strategic Rebalance Exemption: Dynamic threshold based on destination policy
-        profit_threshold = self.config.rebalance_min_profit
+        # PPM-BASED PROFIT GATE: When rebalance_min_profit_ppm > 0, the threshold
+        # scales linearly with rebalance_amount, decoupling acceptance from chunk size.
+        if self.config.rebalance_min_profit_ppm > 0:
+            profit_threshold = (rebalance_amount * self.config.rebalance_min_profit_ppm) // 1_000_000
+        else:
+            profit_threshold = self.config.rebalance_min_profit
         is_hive_transfer = False
         
         if self.policy_manager:
@@ -1404,8 +1508,13 @@ class EVRebalancer:
                 continue
             
             # Check minimum profit threshold
+            # PPM-BASED PROFIT GATE: Scale threshold with amount to decouple from chunk size
             expected_profit_estimate = (spread_ppm * amount_needed) // 1_000_000
-            if expected_profit_estimate < self.config.rebalance_min_profit:
+            if self.config.rebalance_min_profit_ppm > 0:
+                min_profit_threshold = (amount_needed * self.config.rebalance_min_profit_ppm) // 1_000_000
+            else:
+                min_profit_threshold = self.config.rebalance_min_profit
+            if expected_profit_estimate < min_profit_threshold:
                 continue
             
             # Calculate score for sorting (higher is better)

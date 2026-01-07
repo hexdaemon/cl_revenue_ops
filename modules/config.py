@@ -46,6 +46,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'sling_job_timeout_seconds': int,
     'sling_chunk_size_sats': int,
     'rebalance_min_profit': int,
+    'rebalance_min_profit_ppm': int,
     'rebalance_max_amount': int,
     'rebalance_min_amount': int,
     'rebalance_cooldown_hours': int,
@@ -77,6 +78,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'scarcity_threshold': (0.0, 1.0),
     'hive_fee_ppm': (0, 100000),
     'hive_rebalance_tolerance': (0, 100000),
+    'sling_chunk_size_sats': (1, 50000000),
+    'rebalance_min_profit_ppm': (0, 100000),
 }
 
 
@@ -110,7 +113,9 @@ class Config:
     base_fee_msat: int = 0         # Base fee (we focus on PPM)
     
     # Rebalancing parameters
-    rebalance_min_profit: int = 10     # Min profit in sats to trigger
+    rebalance_min_profit: int = 10     # Min profit in sats to trigger (legacy, used when ppm=0)
+    rebalance_min_profit_ppm: int = 0  # Min profit in PPM (0 = use sats threshold, >0 = use ppm)
+                                        # Recommended: 20 ppm (~10 sats per 500k chunk)
     rebalance_max_amount: int = 5000000  # Max rebalance amount in sats
     rebalance_min_amount: int = 50000    # Min rebalance amount in sats
     low_liquidity_threshold: float = 0.2  # Below 20% = low outbound
@@ -315,6 +320,7 @@ class ConfigSnapshot:
     
     # Rebalancing parameters
     rebalance_min_profit: int
+    rebalance_min_profit_ppm: int
     rebalance_max_amount: int
     rebalance_min_amount: int
     low_liquidity_threshold: float
@@ -395,6 +401,7 @@ class ConfigSnapshot:
             max_fee_ppm=config.max_fee_ppm,
             base_fee_msat=config.base_fee_msat,
             rebalance_min_profit=config.rebalance_min_profit,
+            rebalance_min_profit_ppm=config.rebalance_min_profit_ppm,
             rebalance_max_amount=config.rebalance_max_amount,
             rebalance_min_amount=config.rebalance_min_amount,
             low_liquidity_threshold=config.low_liquidity_threshold,
