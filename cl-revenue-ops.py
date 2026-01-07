@@ -482,13 +482,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-rebalance-min-profit-ppm',
-    default='0',
-    description='Minimum profit threshold in PPM for rebalances (0 disables; recommended ~20 for ~10 sats/500k chunk)'
-)
-
-
-plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
@@ -505,13 +498,6 @@ plugin.add_option(
     default='sling',
     description='Rebalancer plugin to use (default: sling)'
 )
-
-plugin.add_option(
-    name='revenue-ops-sling-chunk-size-sats',
-    default='500000',
-    description='Sling rebalance execution chunk size in sats (default: 500000)'
-)
-
 
 plugin.add_option(
     name='revenue-ops-daily-budget-sats',
@@ -667,11 +653,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_fee_ppm=int(options['revenue-ops-min-fee-ppm']),
         max_fee_ppm=int(options['revenue-ops-max-fee-ppm']),
         rebalance_min_profit=int(options['revenue-ops-rebalance-min-profit']),
-        rebalance_min_profit_ppm=int(options['revenue-ops-rebalance-min-profit-ppm']),
         flow_window_days=int(options['revenue-ops-flow-window-days']),
         clboss_enabled=options['revenue-ops-clboss-enabled'].lower() == 'true',
         rebalancer_plugin=options['revenue-ops-rebalancer'],
-        sling_chunk_size_sats=int(options['revenue-ops-sling-chunk-size-sats']),
         daily_budget_sats=int(options['revenue-ops-daily-budget-sats']),
         min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
         enable_proportional_budget=options['revenue-ops-proportional-budget'].lower() == 'true',
@@ -794,7 +778,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Forwards table empty. Hydrating last {hydrate_days} days of forwards...")
         else:
             # Have data - only fetch what we missed while offline
-            start_time = last_forward_ts
+            start_time = max(0, last_forward_ts - 3600)
             plugin.log(f"Hydrating forwards since {time.strftime('%Y-%m-%d %H:%M', time.localtime(start_time))}...")
         
         # Fetch from RPC - this is the ONLY listforwards call we make
@@ -811,8 +795,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     'in_msat': fwd.get("in_msat", fwd.get("in_msatoshi", 0)),
                     'out_msat': fwd.get("out_msat", fwd.get("out_msatoshi", 0)),
                     'fee_msat': fwd.get("fee_msat", fwd.get("fee_msatoshi", 0)),
-                    'resolution_time': fwd.get("resolved_time", 0) - received_time if fwd.get("resolved_time") else 0,
-                    'received_time': received_time
+                    'resolution_time': (fwd.get("resolved_time", 0) - received_time) if fwd.get("resolved_time") else 0,
+                    'received_time': received_time,
+                    'resolved_time': int(fwd.get("resolved_time", 0) or 0)
                 })
         
         if forwards_to_insert:
@@ -2092,7 +2077,7 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         resolved_time = forward_event.get("resolved_time", 0)
         resolution_duration = resolved_time - received_time if resolved_time > 0 else 0
         
-        database.record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_duration)
+        database.record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat, int(received_time or 0), int(resolved_time or 0), resolution_duration)
 
 
 @plugin.subscribe("connect")

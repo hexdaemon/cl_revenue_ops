@@ -78,6 +78,10 @@ class Database:
             # WAL allows readers and writers to operate concurrently
             self._local.conn.execute("PRAGMA journal_mode=WAL;")
             
+            # Reduce "database is locked" errors under contention
+            self._local.conn.execute("PRAGMA busy_timeout=5000;")
+            # Reasonable durability/performance tradeoff for WAL mode
+            self._local.conn.execute("PRAGMA synchronous=NORMAL;")
             self.plugin.log(
                 f"Database: Created new thread-local connection (thread={threading.current_thread().name})",
                 level='debug'
@@ -189,9 +193,13 @@ class Database:
                 out_msat INTEGER NOT NULL,
                 fee_msat INTEGER NOT NULL,
                 resolution_time REAL DEFAULT 0,
-                timestamp INTEGER NOT NULL
+                timestamp INTEGER NOT NULL,
+                resolved_time INTEGER DEFAULT 0
             )
         """)
+        # Phase 2: Ensure forwards schema is idempotent and restart-safe
+        self._migrate_forwards_schema(conn)
+
         
         # Clboss unmanage tracking
         conn.execute("""
@@ -412,6 +420,66 @@ class Database:
         
         self.plugin.log("Database initialized successfully")
     
+
+    def _migrate_forwards_schema(self, conn: sqlite3.Connection) -> None:
+        """
+        Phase 2: Make forwards ingestion idempotent and restart-safe.
+
+        - Adds resolved_time column if missing
+        - Backfills resolved_time from timestamp + resolution_time (best-effort)
+        - Deduplicates existing rows prior to enforcing uniqueness
+        - Creates a UNIQUE index so INSERT OR IGNORE can safely skip duplicates
+        """
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(forwards)").fetchall()]
+            if "resolved_time" not in cols:
+                self.plugin.log("DB migration: adding forwards.resolved_time column", level="info")
+                conn.execute("ALTER TABLE forwards ADD COLUMN resolved_time INTEGER")
+
+            # Backfill resolved_time where missing/zero (best-effort).
+            # resolution_time is stored as REAL seconds; round down to int seconds for stable keying.
+            conn.execute("""
+                UPDATE forwards
+                SET resolved_time = COALESCE(resolved_time, 0)
+                WHERE resolved_time IS NULL
+            """)
+            conn.execute("""
+                UPDATE forwards
+                SET resolved_time = timestamp + CAST(resolution_time AS INTEGER)
+                WHERE (resolved_time IS NULL OR resolved_time = 0)
+                  AND resolution_time IS NOT NULL
+                  AND resolution_time > 0
+            """)
+
+            # Deduplicate rows before adding a UNIQUE index (keep earliest id).
+            # Key includes resolved_time to reduce collision risk within the same second.
+            self.plugin.log("DB migration: deduplicating forwards table (if needed)", level="debug")
+            conn.execute("""
+                DELETE FROM forwards
+                WHERE id NOT IN (
+                    SELECT MIN(id)
+                    FROM forwards
+                    GROUP BY
+                        in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp,
+                        COALESCE(resolved_time, 0)
+                )
+            """)
+
+            # Enforce idempotency: duplicates become no-ops.
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_forwards_unique
+                ON forwards(in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp, resolved_time)
+            """)
+
+            # Helpful indexes for per-channel lookups (keeps queries fast as forwards grow)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_in_time ON forwards(in_channel, timestamp)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_out_time ON forwards(out_channel, timestamp)")
+
+        except Exception as e:
+            # Non-fatal: plugin can still run, but may double-dip without uniqueness.
+            self.plugin.log(f"DB migration warning: forwards schema migration failed: {e}", level="warn")
+
+
     def _migrate_ignored_peers_to_policies(self, conn):
         """
         Migrate legacy ignored_peers table to peer_policies.
@@ -952,46 +1020,58 @@ class Database:
         row = conn.execute("SELECT MAX(timestamp) as max_ts FROM forwards").fetchone()
         return row['max_ts'] if row and row['max_ts'] else None
     
-    def bulk_insert_forwards(self, forwards: list) -> int:
-        """
-        Bulk insert forwards from RPC hydration.
-        
-        Used during startup to fill gaps in the forwards table for periods
-        when the plugin was offline.
-        
-        Args:
-            forwards: List of forward dicts with keys:
-                      in_channel, out_channel, in_msat, out_msat, fee_msat,
-                      received_time (timestamp)
-        
-        Returns:
-            Number of forwards inserted
-        """
-        conn = self._get_connection()
-        inserted = 0
-        
-        for fwd in forwards:
-            try:
-                conn.execute("""
-                    INSERT INTO forwards 
-                    (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    fwd.get('in_channel', ''),
-                    fwd.get('out_channel', ''),
-                    fwd.get('in_msat', 0),
-                    fwd.get('out_msat', 0),
-                    fwd.get('fee_msat', 0),
-                    fwd.get('resolution_time', 0),
-                    int(fwd.get('received_time', 0))
-                ))
-                inserted += 1
-            except Exception:
-                # Skip duplicates or invalid records
-                pass
-        
-        return inserted
     
+    def bulk_insert_forwards(self, forwards: list) -> int:
+            """
+            Bulk insert forwards from RPC hydration.
+
+            Phase 2: Idempotent insert using INSERT OR IGNORE under a UNIQUE index.
+
+            Args:
+                forwards: List of dicts with keys:
+                          in_channel, out_channel, in_msat, out_msat, fee_msat,
+                          received_time (timestamp), resolved_time (optional),
+                          resolution_time (optional)
+
+            Returns:
+                Number of forwards inserted (best-effort count)
+            """
+            conn = self._get_connection()
+            inserted = 0
+
+            for fwd in forwards:
+                try:
+                    in_chan = (fwd.get('in_channel', '') or '').replace(':', 'x')
+                    out_chan = (fwd.get('out_channel', '') or '').replace(':', 'x')
+                    ts = int(fwd.get('received_time', 0) or 0)
+                    rt = int(fwd.get('resolved_time', 0) or 0)
+                    res_dur = float(fwd.get('resolution_time', 0) or 0)
+                    if rt <= 0 and res_dur and ts:
+                        rt = ts + int(res_dur)
+
+                    cur = conn.execute("""
+                        INSERT OR IGNORE INTO forwards
+                        (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        in_chan,
+                        out_chan,
+                        int(fwd.get('in_msat', 0) or 0),
+                        int(fwd.get('out_msat', 0) or 0),
+                        int(fwd.get('fee_msat', 0) or 0),
+                        res_dur,
+                        ts,
+                        rt
+                    ))
+                    # sqlite3 cursor.rowcount is 1 for inserted, 0 for ignored
+                    if getattr(cur, "rowcount", 0) == 1:
+                        inserted += 1
+                except Exception:
+                    # Skip invalid records
+                    pass
+
+            return inserted
+
     def get_daily_flow_buckets(self, window_days: int = 7, channel_id: Optional[str] = None) -> Dict[str, list]:
         """
         Get daily flow buckets from the local forwards table.
@@ -1061,19 +1141,35 @@ class Database:
         
         return flow_data
     
-    def record_forward(self, in_channel: str, out_channel: str, 
-                       in_msat: int, out_msat: int, fee_msat: int,
-                       resolution_time: float = 0):
-        """Record a completed forward for real-time tracking."""
-        conn = self._get_connection()
-        now = int(time.time())
-        
-        conn.execute("""
-            INSERT INTO forwards 
-            (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, now))
     
+    def record_forward(self, in_channel: str, out_channel: str,
+                           in_msat: int, out_msat: int, fee_msat: int,
+                           received_time: int, resolved_time: int,
+                           resolution_time: float = 0):
+            """
+            Record a completed forward for real-time tracking.
+
+            Phase 2: Use canonical forward times (received_time/resolved_time) and
+            INSERT OR IGNORE under a UNIQUE index to prevent double-dips on restart.
+            """
+            conn = self._get_connection()
+
+            # Normalize SCIDs for consistency
+            in_channel = (in_channel or "").replace(":", "x")
+            out_channel = (out_channel or "").replace(":", "x")
+
+            # Best-effort derive times if missing
+            ts = int(received_time or 0) or int(time.time())
+            rt = int(resolved_time or 0)
+            if rt <= 0 and resolution_time and resolution_time > 0:
+                rt = ts + int(resolution_time)
+
+            conn.execute("""
+                INSERT OR IGNORE INTO forwards
+                (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (in_channel, out_channel, int(in_msat), int(out_msat), int(fee_msat), float(resolution_time or 0), ts, rt))
+
     def get_channel_forwards(self, channel_id: str, since_timestamp: int) -> Dict[str, int]:
         """Get aggregate forward stats for a channel since a timestamp."""
         conn = self._get_connection()
