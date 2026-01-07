@@ -60,6 +60,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Hive Parameters
     'hive_fee_ppm': int,
     'hive_rebalance_tolerance': int,
+    # Phase 1: Operational Hardening
+    'rpc_timeout_seconds': int,
+    'rpc_circuit_breaker_seconds': int,
 }
 
 # Range constraints for numeric fields
@@ -80,6 +83,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hive_rebalance_tolerance': (0, 100000),
     'sling_chunk_size_sats': (1, 50000000),
     'rebalance_min_profit_ppm': (0, 100000),
+    'rpc_timeout_seconds': (1, 300),
+    'rpc_circuit_breaker_seconds': (0, 3600),
 }
 
 
@@ -141,6 +146,10 @@ class Config:
     enable_proportional_budget: bool = False  # If True, scale daily budget based on revenue
     proportional_budget_pct: float = 0.05     # Budget = max(daily_budget_sats, revenue_24h * pct)
                                                # Default 5% of 24h revenue
+    
+    # Phase 1: Operational Hardening
+    rpc_timeout_seconds: int = 15
+    rpc_circuit_breaker_seconds: int = 60
     
     # HTLC Congestion threshold
     htlc_congestion_threshold: float = 0.8  # Mark channel as CONGESTED if >80% HTLC slots used
@@ -382,6 +391,10 @@ class ConfigSnapshot:
     enable_flow_asymmetry: bool
     enable_peer_sync: bool
     
+    # Phase 1: Operational Hardening
+    rpc_timeout_seconds: int
+    rpc_circuit_breaker_seconds: int
+    
     # Version tracking
     version: int = 0
     
@@ -434,6 +447,8 @@ class ConfigSnapshot:
             scarcity_threshold=config.scarcity_threshold,
             enable_flow_asymmetry=config.enable_flow_asymmetry,
             enable_peer_sync=config.enable_peer_sync,
+            rpc_timeout_seconds=config.rpc_timeout_seconds,
+            rpc_circuit_breaker_seconds=config.rpc_circuit_breaker_seconds,
             version=config._version,
         )
 

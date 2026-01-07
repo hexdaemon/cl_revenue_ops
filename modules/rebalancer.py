@@ -1793,7 +1793,8 @@ class EVRebalancer:
             }
 
     def manual_rebalance(self, from_channel: str, to_channel: str, 
-                         amount_sats: int, max_fee_sats: Optional[int] = None) -> Dict[str, Any]:
+                         amount_sats: int, max_fee_sats: Optional[int] = None,
+                         force: bool = False) -> Dict[str, Any]:
         """Execute a manual rebalance between two channels.
         
         Note: Manual rebalances bypass capital controls by design (user override),
@@ -1802,6 +1803,11 @@ class EVRebalancer:
         # Warn if capital controls would block this (but don't enforce for manual)
         capital_ok = self._check_capital_controls()
         if not capital_ok:
+            if not force:
+                return {
+                    "success": False,
+                    "error": "Capital controls (budget or reserve) would block this rebalance. Use force=true to bypass."
+                }
             self.plugin.log(
                 "WARNING: Manual rebalance executing despite capital controls. "
                 "Budget may be exhausted or reserve low.", 

@@ -39,7 +39,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
 from pathlib import Path
+import concurrent.futures
 
+import multiprocessing
+import queue
+import uuid
+import traceback
 from pyln.client import Plugin, RpcError
 
 # Import our modules
@@ -77,75 +82,333 @@ shutdown_event = threading.Event()
 RPC_LOCK = threading.Lock()
 
 
+class RPCTimeoutError(RpcError):
+    """Exception raised when an RPC call times out."""
+    def __init__(self, method):
+        self.method = method
+        # Initialize RpcError with compatible fields
+        super().__init__(method, {}, f"RPC timeout for method: {method}")
+
+
+class RPCBreakerOpen(RpcError):
+    """Exception raised when the circuit breaker is open for a method group."""
+    def __init__(self, group, until_ts):
+        self.group = group
+        self.until_ts = until_ts
+        until_str = datetime.fromtimestamp(until_ts).strftime('%H:%M:%S')
+        # Initialize RpcError with compatible fields
+        super().__init__(group, {}, f"RPC circuit breaker open for group '{group}' until {until_str}")
+
+
+class RpcBroker:
+    """
+    A hardened RPC broker that executes lightningd RPC calls in a separate process.
+
+    Why:
+    - pyln-client RPC can hang indefinitely on certain transport / plugin interactions.
+    - A thread timeout (ThreadPoolExecutor) does not stop a hung RPC call.
+    - By isolating RPC calls in a subprocess, we can terminate and restart the broker
+      on timeout, guaranteeing bounded waiting for callers.
+
+    Design:
+    - One broker process + one request queue + one response queue
+    - Calls are serialized via an internal call lock (matches prior max_workers=1)
+    - On timeout: terminate broker, recreate queues, restart broker, raise TimeoutError
+    """
+
+    def __init__(self, socket_path: str, plugin_instance: Plugin):
+        self.socket_path = socket_path
+        self._plugin = plugin_instance
+
+        # Use spawn for safety (avoid forking a process after threads have started).
+        self._ctx = multiprocessing.get_context("spawn")
+
+        self._proc: Optional[multiprocessing.Process] = None
+        self._req_q: Any = None
+        self._resp_q: Any = None
+
+        # Serialize calls (behaviorally equivalent to the old single-worker executor).
+        self._call_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+
+        self.start()
+
+    @staticmethod
+    def _broker_main(socket_path: str, req_q, resp_q):
+        # NOTE: Runs in a separate process.
+        from pyln.client import LightningRpc, RpcError as _RpcError
+        import traceback as _traceback
+
+        rpc = LightningRpc(socket_path)
+
+        while True:
+            req = req_q.get()
+            if not req:
+                continue
+            if req.get("op") == "stop":
+                break
+
+            req_id = req.get("id")
+            kind = req.get("kind", "call")
+            method = req.get("method")
+            payload = req.get("payload")
+            args = req.get("args") or []
+            kwargs = req.get("kwargs") or {}
+
+            try:
+                if kind == "attr":
+                    # E.g. listpeers(), plugin("list"), listforwards(status="settled")
+                    result = getattr(rpc, method)(*args, **kwargs)
+                else:
+                    # Generic rpc.call(method, payload)
+                    result = rpc.call(method, {} if payload is None else payload)
+
+                resp_q.put({"id": req_id, "ok": True, "result": result})
+            except _RpcError as e:
+                # Serialize error details; caller reconstructs a compatible RpcError.
+                resp_q.put({
+                    "id": req_id,
+                    "ok": False,
+                    "error_type": "RpcError",
+                    "error": getattr(e, "error", None),
+                    "message": str(e),
+                })
+            except Exception as e:
+                resp_q.put({
+                    "id": req_id,
+                    "ok": False,
+                    "error_type": "Exception",
+                    "message": str(e),
+                    "traceback": _traceback.format_exc(),
+                })
+
+    def start(self):
+        with self._lifecycle_lock:
+            # Fresh queues each start to avoid stale messages after restarts.
+            self._req_q = self._ctx.Queue()
+            self._resp_q = self._ctx.Queue()
+
+            self._proc = self._ctx.Process(
+                target=RpcBroker._broker_main,
+                args=(self.socket_path, self._req_q, self._resp_q),
+                daemon=True,
+                name="rpc_broker",
+            )
+            self._proc.start()
+
+    def stop(self):
+        with self._lifecycle_lock:
+            if self._proc is None:
+                return
+            try:
+                if self._req_q:
+                    self._req_q.put_nowait({"op": "stop"})
+            except Exception:
+                pass
+
+            try:
+                if self._proc.is_alive():
+                    self._proc.terminate()
+                    self._proc.join(timeout=1.0)
+            except Exception:
+                pass
+
+            self._proc = None
+            self._req_q = None
+            self._resp_q = None
+
+    def restart(self, reason: str):
+        # Keep logs rate-limited in caller layer; here we log once per restart.
+        self._plugin.log(f"RPC broker restart: {reason}", level="warn")
+        self.stop()
+        self.start()
+
+    def request(self, *, kind: str, method: str, payload: Any = None,
+                args: Optional[List[Any]] = None, kwargs: Optional[Dict[str, Any]] = None,
+                timeout: int = 15):
+        """
+        Perform a single RPC request through the broker.
+
+        Raises:
+            TimeoutError: if the broker does not return within timeout.
+            RpcError: reconstructed from broker error payload.
+        """
+        if not method:
+            raise RpcError("request", {}, "Empty RPC method")
+
+        with self._call_lock:
+            # Broker may have died; restart defensively.
+            if self._proc is None or (hasattr(self._proc, "is_alive") and not self._proc.is_alive()):
+                self.restart("broker not running")
+
+            req_id = uuid.uuid4().hex
+            req = {
+                "id": req_id,
+                "kind": kind,
+                "method": method,
+                "payload": payload,
+                "args": args or [],
+                "kwargs": kwargs or {},
+            }
+
+            assert self._req_q is not None and self._resp_q is not None
+
+            self._req_q.put(req)
+
+            try:
+                resp = self._resp_q.get(timeout=timeout)
+                # In normal operation (serialized), the first response is ours.
+                # If we ever see mismatch (stale message), drain until match.
+                while resp and resp.get("id") != req_id:
+                    resp = self._resp_q.get(timeout=timeout)
+            except queue.Empty:
+                # Hard guarantee: kill the hung broker, restart, and surface timeout.
+                self.restart(f"timeout waiting for RPC response ({timeout}s) on {method}")
+                raise TimeoutError(f"RPC broker timeout on {method}")
+
+            if resp.get("ok"):
+                return resp.get("result")
+
+            # Reconstruct a compatible RpcError in the main process.
+            if resp.get("traceback"):
+                self._plugin.log(
+                    f"RPC broker exception in {method}: {resp.get('message')}\n{resp.get('traceback')}",
+                    level="error"
+                )
+
+            err = resp.get("error")
+            msg = resp.get("message") or "RPC error"
+            raise RpcError(method, {} if payload is None else payload, err if err is not None else msg)
+
+
 class ThreadSafeRpcProxy:
     """
-    A thread-safe proxy for the plugin's RPC interface.
-    
-    This wrapper ensures that all RPC calls are serialized through a lock,
-    preventing race conditions when multiple background threads make
-    concurrent calls to lightningd.
-    
-    Usage:
-        # Instead of: plugin.rpc.listpeers()
-        # Modules use: self.plugin.rpc.listpeers()  (unchanged syntax)
-        # But the plugin they receive has this proxy as its .rpc attribute
-    """
-    
-    def __init__(self, rpc):
-        """Wrap the original RPC object."""
-        self._rpc = rpc
-    
-    def __getattr__(self, name):
-        """
-        Intercept attribute access to wrap RPC method calls.
-        
-        Returns a thread-safe wrapper function that acquires the lock
-        before calling the actual RPC method.
-        """
-        original_method = getattr(self._rpc, name)
-        
-        if callable(original_method):
-            def thread_safe_method(*args, **kwargs):
-                with RPC_LOCK:
-                    return original_method(*args, **kwargs)
-            return thread_safe_method
-        else:
-            # For non-callable attributes, return directly
-            return original_method
-    
-    def call(self, method_name, payload=None):
-        """
-        Thread-safe wrapper for the generic RPC call method.
-        
-        This is used for plugin-specific calls like sling-job, sling-stats, etc.
-        """
-        with RPC_LOCK:
-            if payload:
-                return self._rpc.call(method_name, payload)
-            return self._rpc.call(method_name)
+    A thread-safe proxy for the plugin's RPC interface with timeouts and circuit breakers.
 
+    Phase 1 Hardening (revised):
+    - Bounded execution (RPC broker subprocess with hard timeouts)
+    - Circuit Breaker (group-based cooldowns)
+    - Broker restart on timeout (guarantees forward progress)
+    """
+
+    def __init__(self, broker: RpcBroker, plugin_instance: Plugin):
+        self._broker = broker
+        self._plugin = plugin_instance
+        self._breakers: Dict[str, float] = {}
+        self._log_history: Dict[Tuple[str, str], float] = {}
+
+    def _get_group(self, method_name: str) -> str:
+        """Determine method group for circuit breaking."""
+        if method_name.startswith("sling-"):
+            return "sling"
+        if method_name.startswith("bkpr-"):
+            return "bkpr"
+        if method_name == "listforwards":
+            return "listforwards"
+        return "general"
+
+    def _should_log(self, group: str, msg_type: str, cooldown: int = 60) -> bool:
+        """Rate-limit logs to once per cooldown window."""
+        now = time.time()
+        key = (group, msg_type)
+        if now - self._log_history.get(key, 0) > cooldown:
+            self._log_history[key] = now
+            return True
+        return False
+
+    def __getattr__(self, name):
+        # Internal attribute access
+        if name in ("_broker", "_plugin", "_breakers", "_log_history",
+                    "call", "_get_group", "_should_log"):
+            return super().__getattribute__(name)
+
+        # Expose a callable wrapper matching pyln-client's LightningRpc style.
+        def wrapper(*args, **kwargs):
+            # For normal methods (listpeers, listchannels, plugin, etc), we treat this
+            # as an attribute call and let the broker execute getattr(rpc, name)(*args, **kwargs).
+            return self.call(name, list(args) if args else None, **kwargs)
+
+        return wrapper
+
+    def call(self, method_name: str, payload: Any = None, **kwargs):
+        """
+        Thread-safe wrapper for RPC calls with timeout and circuit breaker.
+        """
+        group = self._get_group(method_name)
+        now = time.time()
+
+        # 1. Circuit Breaker
+        until = self._breakers.get(group, 0)
+        if until > now:
+            if self._should_log(group, "breaker_open"):
+                self._plugin.log(
+                    f"RPC Circuit Breaker OPEN for group '{group}' until "
+                    f"{datetime.fromtimestamp(until).strftime('%H:%M:%S')}. Skipping call.",
+                    level="warn",
+                )
+            raise RPCBreakerOpen(group, until)
+
+        # 2. Timeouts from config
+        timeout = 15
+        breaker_window = 60
+        if config:
+            timeout = config.rpc_timeout_seconds
+            breaker_window = config.rpc_circuit_breaker_seconds
+
+        try:
+            # If payload is a list, this came from an attribute-style call like
+            # rpc.plugin("list") or rpc.listforwards(status="settled").
+            if isinstance(payload, list) or payload is None and kwargs:
+                args = payload if isinstance(payload, list) else []
+                return self._broker.request(
+                    kind="attr",
+                    method=method_name,
+                    args=args,
+                    kwargs=kwargs,
+                    timeout=timeout,
+                )
+
+            # Otherwise treat it as generic rpc.call(method, payload_dict).
+            return self._broker.request(
+                kind="call",
+                method=method_name,
+                payload={} if payload is None else payload,
+                timeout=timeout,
+            )
+
+        except TimeoutError:
+            # Trip breaker on timeout and surface RPCTimeoutError
+            self._breakers[group] = time.time() + breaker_window
+            self._plugin.log(
+                f"RPC TIMEOUT after {timeout}s on {method_name}. "
+                f"Group '{group}' breaker tripped for {breaker_window}s.",
+                level="warn",
+            )
+            raise RPCTimeoutError(method_name)
+        except RpcError:
+            raise
+        except Exception as e:
+            self._plugin.log(f"RPC ERROR on {method_name}: {e}", level="error")
+            raise
 
 class ThreadSafePluginProxy:
     """
-    A proxy for the Plugin object that provides thread-safe RPC access.
-    
-    This allows modules to use the same interface (self.plugin.rpc.method())
-    while ensuring all RPC calls are serialized through the lock.
+    A proxy for the Plugin object that provides thread-safe resilient RPC access.
     """
-    
-    def __init__(self, plugin):
-        """Wrap the original plugin with a thread-safe RPC proxy."""
-        self._plugin = plugin
-        self.rpc = ThreadSafeRpcProxy(plugin.rpc)
-    
+
+    def __init__(self, plugin_instance: Plugin, rpc_broker: RpcBroker):
+        """Wrap the original plugin with a resilient RPC proxy."""
+        self._plugin = plugin_instance
+        self._rpc_broker = rpc_broker
+        self.rpc = ThreadSafeRpcProxy(rpc_broker, plugin_instance)
+
     def log(self, message, level='info'):
         """Delegate logging to the original plugin."""
         self._plugin.log(message, level=level)
-    
+
     def __getattr__(self, name):
         """Delegate all other attribute access to the original plugin."""
         return getattr(self._plugin, name)
-
 
 # Global instances (initialized in init)
 flow_analyzer: Optional[FlowAnalyzer] = None
@@ -157,6 +420,7 @@ config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 capacity_planner: Optional[CapacityPlanner] = None
 metrics_exporter: Optional[PrometheusExporter] = None
+rpc_broker: Optional['RpcBroker'] = None  # RPC broker subprocess
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 
@@ -218,6 +482,13 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-rebalance-min-profit-ppm',
+    default='0',
+    description='Minimum profit threshold in PPM for rebalances (0 disables; recommended ~20 for ~10 sats/500k chunk)'
+)
+
+
+plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
@@ -234,6 +505,13 @@ plugin.add_option(
     default='sling',
     description='Rebalancer plugin to use (default: sling)'
 )
+
+plugin.add_option(
+    name='revenue-ops-sling-chunk-size-sats',
+    default='500000',
+    description='Sling rebalance execution chunk size in sats (default: 500000)'
+)
+
 
 plugin.add_option(
     name='revenue-ops-daily-budget-sats',
@@ -346,6 +624,18 @@ plugin.add_option(
     opt_type='int'
 )
 
+plugin.add_option(
+    name='revenue-ops-rpc-timeout-seconds',
+    default='15',
+    description='Hard timeout for all RPC calls to lightningd (default: 15)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rpc-circuit-breaker-seconds',
+    default='60',
+    description='Cooldown period after an RPC timeout for that method group (default: 60)'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -377,9 +667,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_fee_ppm=int(options['revenue-ops-min-fee-ppm']),
         max_fee_ppm=int(options['revenue-ops-max-fee-ppm']),
         rebalance_min_profit=int(options['revenue-ops-rebalance-min-profit']),
+        rebalance_min_profit_ppm=int(options['revenue-ops-rebalance-min-profit-ppm']),
         flow_window_days=int(options['revenue-ops-flow-window-days']),
         clboss_enabled=options['revenue-ops-clboss-enabled'].lower() == 'true',
         rebalancer_plugin=options['revenue-ops-rebalancer'],
+        sling_chunk_size_sats=int(options['revenue-ops-sling-chunk-size-sats']),
         daily_budget_sats=int(options['revenue-ops-daily-budget-sats']),
         min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
         enable_proportional_budget=options['revenue-ops-proportional-budget'].lower() == 'true',
@@ -396,7 +688,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
         vegas_decay_rate=float(options['revenue-ops-vegas-decay']),
         enable_scarcity_pricing=options['revenue-ops-scarcity-pricing'].lower() == 'true',
-        scarcity_threshold=float(options['revenue-ops-scarcity-threshold'])
+        scarcity_threshold=float(options['revenue-ops-scarcity-threshold']),
+        rpc_timeout_seconds=int(options['revenue-ops-rpc-timeout-seconds']),
+        rpc_circuit_breaker_seconds=int(options['revenue-ops-rpc-circuit-breaker-seconds'])
     )
     
     plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "
@@ -411,10 +705,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # Try modern 'plugin list' command first, fallback to 'listplugins' for older nodes
         try:
             # Modern CLN (v23.08+)
-            plugins_result = plugin.rpc.plugin("list")
+            plugins_result = safe_plugin.rpc.plugin("list")
         except RpcError:
             # Fallback for older CLN versions
-            plugins_result = plugin.rpc.listplugins()
+            plugins_result = safe_plugin.rpc.listplugins()
             
         active_plugins = [p.get("name", "").lower() for p in plugins_result.get("plugins", [])]
         
@@ -450,8 +744,24 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Create thread-safe RPC proxy (Phase 5.5: High-Uptime Stability)
     # All background threads share a single RPC connection - serialize access
     # to prevent corruption from concurrent calls to lightningd
-    safe_plugin = ThreadSafePluginProxy(plugin)
-    plugin.log("Thread-safe RPC proxy initialized")
+
+    # Phase 1: RPC Broker (subprocess) + thread-safe proxy
+    rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
+    if not rpc_socket_path:
+        # Best-effort derive from CLN init configuration if available.
+        ldir = configuration.get("lightning-dir") or configuration.get("lightning_dir")
+        rpcfile = configuration.get("rpc-file") or configuration.get("rpc_file")
+        if ldir and rpcfile:
+            rpc_socket_path = rpcfile if os.path.isabs(rpcfile) else os.path.join(ldir, rpcfile)
+
+    if not rpc_socket_path:
+        # Last-resort fallback (common default)
+        ldir = configuration.get("lightning-dir") or "~/.lightning"
+        rpc_socket_path = os.path.expanduser(os.path.join(ldir, "lightning-rpc"))
+
+    rpc_broker = RpcBroker(str(rpc_socket_path), plugin)
+    safe_plugin = ThreadSafePluginProxy(plugin, rpc_broker)
+    plugin.log(f"RPC broker initialized (socket={rpc_socket_path})", level="info")
     
     # Initialize database
     database = Database(config.db_path, safe_plugin)
@@ -605,6 +915,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                         METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
                     )
                     
+            except (RPCTimeoutError, RPCBreakerOpen) as e:
+                plugin.log(f"RPC degraded in flow analysis: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
                 plugin.log(f"Error in flow analysis: {e}", level='error')
             
@@ -638,6 +950,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                         {"task": "fee"},
                         METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
                     )
+            except (RPCTimeoutError, RPCBreakerOpen) as e:
+                plugin.log(f"RPC degraded in fee adjustment: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
                 plugin.log(f"Error in fee adjustment: {e}", level='error')
             
@@ -676,6 +990,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                         {"task": "rebalance"},
                         METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
                     )
+            except (RPCTimeoutError, RPCBreakerOpen) as e:
+                plugin.log(f"RPC degraded in rebalance check: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
                 plugin.log(f"Error in rebalance check: {e}", level='error')
             
@@ -753,6 +1069,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 metrics_exporter.stop_server()
             except Exception as e:
                 plugin.log(f"Error stopping metrics server: {e}", level='warn')
+
+        # Stop RPC broker subprocess
+        if rpc_broker:
+            try:
+                rpc_broker.stop()
+            except Exception:
+                pass
     
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
     
@@ -977,14 +1300,34 @@ def revenue_capacity_report(plugin: Plugin, **kwargs):
 
 
 @plugin.method("revenue-set-fee")
-def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int) -> Dict[str, Any]:
+def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool = False) -> Dict[str, Any]:
     """
     Manually set fee for a channel (with clboss unmanage).
     
-    Usage: lightning-cli revenue-set-fee channel_id fee_ppm
+    Usage: lightning-cli revenue-set-fee channel_id fee_ppm [force=false]
     """
-    if fee_controller is None:
+    if fee_controller is None or config is None:
         return {"error": "Plugin not fully initialized"}
+    
+    # 1. Validation
+    try:
+        fee_ppm = int(fee_ppm)
+        if fee_ppm < 0:
+            return {"status": "error", "error": "fee_ppm must be non-negative"}
+    except ValueError:
+        return {"status": "error", "error": "fee_ppm must be an integer"}
+        
+    # Basic SCID or PeerID format check (simple regex-less check)
+    if not (":" in channel_id or "x" in channel_id or len(channel_id) == 66):
+        return {"status": "error", "error": "Invalid channel_id or node_id format"}
+
+    # 2. Force Gates
+    if not force:
+        if fee_ppm < config.min_fee_ppm or fee_ppm > config.max_fee_ppm:
+            return {
+                "status": "error", 
+                "error": f"Fee {fee_ppm} is outside configured range [{config.min_fee_ppm}, {config.max_fee_ppm}]. Use force=true to override."
+            }
     
     try:
         result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True)
@@ -998,11 +1341,12 @@ def revenue_rebalance(plugin: Plugin,
                       from_channel: str, 
                       to_channel: str, 
                       amount_sats: int,
-                      max_fee_sats: Optional[int] = None) -> Dict[str, Any]:
+                      max_fee_sats: Optional[int] = None,
+                      force: bool = False) -> Dict[str, Any]:
     """
-    Manually trigger a rebalance with profit constraints.
+    Manually trigger a rebalance with profit/budget constraints.
     
-    Usage: lightning-cli revenue-rebalance from_channel to_channel amount_sats [max_fee_sats]
+    Usage: lightning-cli revenue-rebalance from_channel to_channel amount_sats [max_fee_sats] [force=false]
     """
     if rebalancer is None:
         return {"error": "Plugin not fully initialized"}
@@ -1010,8 +1354,29 @@ def revenue_rebalance(plugin: Plugin,
     if config and not config.sling_available:
         return {"error": "Rebalancing disabled: sling plugin not found. Install cln-sling to enable."}
     
+    # 1. Validation
     try:
-        result = rebalancer.manual_rebalance(from_channel, to_channel, amount_sats, max_fee_sats)
+        amount_sats = int(amount_sats)
+        if amount_sats < 1:
+            return {"status": "error", "error": "amount_sats must be at least 1"}
+    except ValueError:
+        return {"status": "error", "error": "amount_sats must be an integer"}
+        
+    if max_fee_sats is not None:
+        try:
+            max_fee_sats = int(max_fee_sats)
+            if max_fee_sats < 0:
+                return {"status": "error", "error": "max_fee_sats must be non-negative"}
+        except ValueError:
+            return {"status": "error", "error": "max_fee_sats must be an integer or null"}
+
+    # Basic SCID format check
+    for cid in (from_channel, to_channel):
+        if not (":" in cid or "x" in cid):
+            return {"status": "error", "error": f"Invalid channel format for {cid}. Use SCID format."}
+
+    try:
+        result = rebalancer.manual_rebalance(from_channel, to_channel, amount_sats, max_fee_sats, force=force)
         return {"status": "success", **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
