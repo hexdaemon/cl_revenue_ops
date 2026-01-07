@@ -710,6 +710,7 @@ class HillClimbingFeeController:
             is_fire_sale = False
         
         # Target Decision Block (The Alpha Sequence)
+        base_new_fee = None  # For observability; set in Hill Climbing branch
         new_fee_ppm = 0
         target_found = False
         
@@ -909,11 +910,18 @@ class HillClimbingFeeController:
 
         # Build reason string (with rate info)
         volatility_note = " [VOLATILITY_RESET]" if volatility_reset else ""
-        reason = (f"HillClimb: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
-                 f"direction={'up' if new_direction > 0 else 'down'}, "
-                 f"step={step_ppm}ppm, state={flow_state}, "
-                 f"liquidity={bucket} ({outbound_ratio:.0%}), "
-                 f"{marginal_roi_info}")
+        applied_delta = int(new_fee_ppm) - int(current_fee_ppm)
+        applied_dir = "up" if applied_delta > 0 else ("down" if applied_delta < 0 else "flat")
+        hill_dir = "up" if new_direction > 0 else "down"
+        base_fee_note = f", base={int(base_new_fee)}ppm" if base_new_fee is not None else ""
+        mult_note = f", mult=liq{liquidity_multiplier:.2f}*prof{profitability_multiplier:.2f}"
+        reason = (
+            f"HillClimb: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
+            f"hill_dir={hill_dir}, applied={applied_dir}({applied_delta:+d}ppm), "
+            f"step={step_ppm}ppm{base_fee_note}{mult_note}, state={flow_state}, "
+            f"liquidity={bucket} ({outbound_ratio:.0%}), "
+            f"{marginal_roi_info}"
+        )
         
         # IDEMPOTENCY GUARD: Skip RPC if target is physically set (Phase 5.5)
         if new_fee_ppm == raw_chain_fee:
@@ -1151,49 +1159,30 @@ class HillClimbingFeeController:
                 floor_ppm = int(floor_ppm * 1.2)
                 
         # 2. Calculate Risk Premium (Congestion Defense)
-            # When mempool is congested, force-closing becomes expensive.
-            # We must charge enough to justify the risk of smaller HTLCs getting stuck/trimmed.
+        # When mempool is congested, force-closing becomes expensive.
+        # We must charge enough to justify the risk of smaller HTLCs getting stuck/trimmed.
+        if dynamic_costs:
             sat_per_vbyte = dynamic_costs.get("sat_per_vbyte", 0.0)
-            
+
             if sat_per_vbyte > 0:
                 # Conservative estimate for a commitment tx weight (approx 150 vbytes)
                 COMMITMENT_TX_VBYTES = 150
                 # Reference HTLC size to evaluate risk against (50k sats = ~$50)
                 # Smaller values mean we charge HIGHER fees to discourage dust
                 AVG_HTLC_SIZE_SATS = 50_000
-                
+
                 # RISK PROBABILITY: The chance that any specific HTLC will force-close the channel.
-                # We don't charge the full on-chain cost for every packet (that would be ~180,000 PPM).
-                # We charge the Expectation of cost: Cost * Probability.
-                # Assumes ~1 in 1000 HLTCs causes a force-close scenario.
-                RISK_PROBABILITY = 0.001
-                
-                # Formula: (Cost to enforce * Probability) / Value protected * 1M
-                # (sat_vbyte * 150 * 0.001) / 250k * 1M
-                risk_premium_ppm = int((sat_per_vbyte * COMMITMENT_TX_VBYTES * RISK_PROBABILITY * 1_000_000) / AVG_HTLC_SIZE_SATS)
-                
-                # Apply Risk Premium if it exceeds the base floor
-                if risk_premium_ppm > floor_ppm:
-                    # Log warning only if congestion is significant (e.g. > 100 sat/vB)
-                    if sat_per_vbyte > 100:
-                        self.plugin.log(
-                            f"CONGESTION DEFENSE: High fees ({sat_per_vbyte:.1f} sat/vB). "
-                            f"Raising floor from {floor_ppm} to {risk_premium_ppm} PPM "
-                            f"(Risk Premium).",
-                            level='info'
-                        )
-                    floor_ppm = risk_premium_ppm
-        
-        # Phase 7: Vegas Reflex - apply mempool acceleration multiplier
-        vegas_multiplier = self._vegas_state.get_floor_multiplier()
-        if vegas_multiplier > 1.0:
-            original_floor = floor_ppm
-            floor_ppm = int(floor_ppm * vegas_multiplier)
-            self.plugin.log(
-                f"VEGAS REFLEX: Applied {vegas_multiplier:.2f}x multiplier to floor "
-                f"({original_floor} -> {floor_ppm} PPM)",
-                level='debug'
-            )
+                # We approximate this by assuming 1 force-close per 1,000 forwards as a baseline.
+                # (This is conservative; most channels never force-close.)
+                force_close_probability = 0.001
+
+                # Expected on-chain enforcement cost (sats) per HTLC-sized forward
+                expected_enforcement_cost = sat_per_vbyte * COMMITMENT_TX_VBYTES * force_close_probability
+
+                # Convert the expected cost to a PPM floor relative to the average HTLC size
+                if AVG_HTLC_SIZE_SATS > 0:
+                    risk_premium_ppm = (expected_enforcement_cost / AVG_HTLC_SIZE_SATS) * 1_000_000
+                    floor_ppm = max(floor_ppm, int(risk_premium_ppm))
         
         return max(1, int(floor_ppm))
     
