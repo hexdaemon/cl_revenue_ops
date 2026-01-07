@@ -19,7 +19,7 @@ import json
 import math
 import threading
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Union
 from pathlib import Path
 
 
@@ -1142,33 +1142,79 @@ class Database:
         return flow_data
     
     
-    def record_forward(self, in_channel: str, out_channel: str,
-                           in_msat: int, out_msat: int, fee_msat: int,
-                           received_time: int, resolved_time: int,
-                           resolution_time: float = 0):
-            """
-            Record a completed forward for real-time tracking.
 
-            Phase 2: Use canonical forward times (received_time/resolved_time) and
-            INSERT OR IGNORE under a UNIQUE index to prevent double-dips on restart.
-            """
-            conn = self._get_connection()
+def record_forward(
+    self,
+    in_channel: str,
+    out_channel: str,
+    in_msat: int,
+    out_msat: int,
+    fee_msat: int,
+    received_time: Optional[Union[int, float]] = None,
+    resolved_time: Optional[int] = None,
+    resolution_time: float = 0,
+) -> None:
+    """
+    Record a completed forward for real-time tracking.
 
-            # Normalize SCIDs for consistency
-            in_channel = (in_channel or "").replace(":", "x")
-            out_channel = (out_channel or "").replace(":", "x")
+    Phase 2: Use canonical forward times (received_time/resolved_time) and
+    INSERT OR IGNORE under a UNIQUE index to prevent double-dips on restart.
 
-            # Best-effort derive times if missing
-            ts = int(received_time or 0) or int(time.time())
-            rt = int(resolved_time or 0)
-            if rt <= 0 and resolution_time and resolution_time > 0:
-                rt = ts + int(resolution_time)
+    Backward compatibility:
+      Legacy callers invoked:
+        record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time)
+      In that case, the 6th positional arg arrives as `received_time` and `resolved_time` is None.
+      We treat that 6th arg as resolution_time and use best-effort wall-clock timestamps.
+    """
+    conn = self._get_connection()
 
-            conn.execute("""
-                INSERT OR IGNORE INTO forwards
-                (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (in_channel, out_channel, int(in_msat), int(out_msat), int(fee_msat), float(resolution_time or 0), ts, rt))
+    # Normalize SCIDs for consistency
+    in_channel = (in_channel or "").replace(":", "x")
+    out_channel = (out_channel or "").replace(":", "x")
+
+    # Legacy signature detection: only 6 args passed after fee_msat
+    if resolved_time is None and resolution_time == 0 and received_time is not None:
+        legacy_resolution_time = float(received_time)
+        received_time = int(time.time())
+        resolved_time = received_time + int(legacy_resolution_time) if legacy_resolution_time > 0 else 0
+        resolution_time = legacy_resolution_time
+
+        # One-time warning to surface version skew during rollout.
+        if not getattr(self, "_warned_legacy_record_forward", False):
+            self._warned_legacy_record_forward = True
+            self.plugin.log(
+                "WARNING: legacy record_forward() call detected (missing received_time/resolved_time). "
+                "Upgrade cl-revenue-ops.py to pass canonical times; continuing with best-effort timestamps.",
+                level="warn",
+            )
+
+    # Best-effort derive times if missing/zero
+    ts = int(received_time or 0) if received_time is not None else 0
+    if ts <= 0:
+        ts = int(time.time())
+
+    rt = int(resolved_time or 0) if resolved_time is not None else 0
+    if rt <= 0 and resolution_time and resolution_time > 0:
+        rt = ts + int(resolution_time)
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO forwards
+        (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            in_channel,
+            out_channel,
+            int(in_msat),
+            int(out_msat),
+            int(fee_msat),
+            float(resolution_time or 0),
+            ts,
+            rt,
+        ),
+    )
+
 
     def get_channel_forwards(self, channel_id: str, since_timestamp: int) -> Dict[str, int]:
         """Get aggregate forward stats for a channel since a timestamp."""
