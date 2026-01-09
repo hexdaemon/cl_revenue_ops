@@ -197,9 +197,21 @@ class ClbossManager:
                 
             except RpcError as e:
                 error_str = str(e)
+                error_lower = error_str.lower()
+                
+                # Handle clboss versions without clboss-unmanage
+                if "unknown command" in error_lower and "clboss-unmanage" in error_lower:
+                    result["success"] = False
+                    result["skipped"] = True
+                    result["message"] = "clboss-unmanage not available"
+                    self.plugin.log(
+                        "clboss-unmanage not available - skipping override",
+                        level='debug'
+                    )
+                    return result
                 
                 # Handle case where peer is not managed by clboss
-                if "not managed" in error_str.lower() or "already unmanaged" in error_str.lower():
+                if "not managed" in error_lower or "already unmanaged" in error_lower:
                     result["success"] = True
                     result["message"] = f"Peer {peer_id} already not managed by clboss for {tag}"
                 else:
@@ -220,6 +232,9 @@ class ClbossManager:
         
         Use this to hand control back to clboss for a peer we previously
         unmanaged. If no tag is specified, re-enable all tags.
+        
+        Note: clboss resumes full management when clboss-unmanage is
+        called with an empty string for tags.
         
         Args:
             peer_id: The node ID of the peer
@@ -248,7 +263,15 @@ class ClbossManager:
         try:
             # Determine which tags to manage
             if tag is None:
-                tags_to_process = ClbossTags.ALL
+                # Per clboss docs, empty string restores full management
+                self.plugin.rpc.call(
+                    "clboss-unmanage",
+                    [peer_id, ""]
+                )
+                result["success"] = True
+                result["message"] = f"Re-enabled clboss management for {peer_id}"
+                self.plugin.log(f"Remanaged peer {peer_id[:16]}... to clboss")
+                return result
             elif isinstance(tag, list):
                 tags_to_process = tag
             else:
