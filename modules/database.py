@@ -364,6 +364,19 @@ class Database:
             )
         """)
         
+        # Budget reservations table for atomic budget management (CRITICAL-01 fix)
+        # Prevents race conditions where multiple concurrent jobs can overspend
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS budget_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                reserved_sats INTEGER NOT NULL,
+                reserved_at INTEGER NOT NULL,
+                job_channel_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active'  -- 'active', 'spent', 'released'
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_budget_reservations_status ON budget_reservations(status, reserved_at)")
+
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
         try:
@@ -955,7 +968,181 @@ class Database:
         
         # Convert msat to sats
         return (row['total_fees_msat'] // 1000) if row else 0
-    
+
+    # =========================================================================
+    # Atomic Budget Reservation System (CRITICAL-01 fix)
+    # =========================================================================
+
+    def reserve_budget(self, reservation_id: str, amount_sats: int,
+                      channel_id: str, budget_limit: int,
+                      since_timestamp: int) -> Tuple[bool, int]:
+        """
+        Atomically reserve budget for a rebalance operation.
+
+        This prevents race conditions where multiple concurrent jobs could
+        all pass budget validation before any of them records their spend.
+
+        The reservation is atomic: it checks current spend + active reservations
+        and only creates the reservation if within budget, all in one transaction.
+
+        Args:
+            reservation_id: Unique ID for this reservation (e.g., rebalance_id)
+            amount_sats: Amount to reserve
+            channel_id: Channel this reservation is for
+            budget_limit: Maximum daily budget in sats
+            since_timestamp: Start of budget period (e.g., 24h ago)
+
+        Returns:
+            Tuple of (success: bool, remaining_budget: int)
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            # Use a transaction to ensure atomicity
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Get actual spent (from completed successful rebalances)
+            spent_row = conn.execute("""
+                SELECT COALESCE(SUM(actual_fee_sats), 0) as spent
+                FROM rebalance_history
+                WHERE timestamp >= ? AND status = 'success' AND actual_fee_sats IS NOT NULL
+            """, (since_timestamp,)).fetchone()
+            actual_spent = spent_row['spent'] if spent_row else 0
+
+            # Get active reservations (not yet spent or released)
+            reserved_row = conn.execute("""
+                SELECT COALESCE(SUM(reserved_sats), 0) as reserved
+                FROM budget_reservations
+                WHERE status = 'active' AND reserved_at >= ?
+            """, (since_timestamp,)).fetchone()
+            active_reserved = reserved_row['reserved'] if reserved_row else 0
+
+            # Calculate total committed budget
+            total_committed = actual_spent + active_reserved
+            remaining = budget_limit - total_committed
+
+            # Check if we have room for this reservation
+            if amount_sats > remaining:
+                conn.execute("ROLLBACK")
+                return (False, remaining)
+
+            # Create the reservation
+            conn.execute("""
+                INSERT INTO budget_reservations
+                (reservation_id, reserved_sats, reserved_at, job_channel_id, status)
+                VALUES (?, ?, ?, ?, 'active')
+            """, (reservation_id, amount_sats, now, channel_id))
+
+            conn.execute("COMMIT")
+            return (True, remaining - amount_sats)
+
+        except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except:
+                pass
+            self.plugin.log(f"Budget reservation failed: {e}", level='error')
+            return (False, 0)
+
+    def release_budget_reservation(self, reservation_id: str) -> bool:
+        """
+        Release a budget reservation (job failed/timed out without spending).
+
+        Args:
+            reservation_id: The reservation to release
+
+        Returns:
+            True if released, False if not found
+        """
+        conn = self._get_connection()
+        cursor = conn.execute("""
+            UPDATE budget_reservations
+            SET status = 'released'
+            WHERE reservation_id = ? AND status = 'active'
+        """, (reservation_id,))
+        return cursor.rowcount > 0
+
+    def mark_budget_spent(self, reservation_id: str, actual_spent: int) -> bool:
+        """
+        Mark a reservation as spent (job completed successfully).
+
+        The actual spend is recorded in rebalance_history, so we just
+        update the reservation status to prevent double-counting.
+
+        Args:
+            reservation_id: The reservation that was spent
+            actual_spent: Actual amount spent (for logging)
+
+        Returns:
+            True if marked, False if not found
+        """
+        conn = self._get_connection()
+        cursor = conn.execute("""
+            UPDATE budget_reservations
+            SET status = 'spent'
+            WHERE reservation_id = ? AND status = 'active'
+        """, (reservation_id,))
+        return cursor.rowcount > 0
+
+    def cleanup_stale_reservations(self, max_age_seconds: int = 14400) -> int:
+        """
+        Clean up stale reservations older than max_age.
+
+        Reservations that are still 'active' after max_age are likely
+        from crashed jobs and should be released.
+
+        Args:
+            max_age_seconds: Maximum age before auto-release (default 4 hours)
+
+        Returns:
+            Number of stale reservations cleaned up
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        cursor = conn.execute("""
+            UPDATE budget_reservations
+            SET status = 'released'
+            WHERE status = 'active' AND reserved_at < ?
+        """, (cutoff,))
+        count = cursor.rowcount
+        if count > 0:
+            self.plugin.log(f"Cleaned up {count} stale budget reservations", level='info')
+        return count
+
+    def get_budget_status(self, since_timestamp: int) -> Dict[str, int]:
+        """
+        Get current budget status including reservations.
+
+        Args:
+            since_timestamp: Start of budget period
+
+        Returns:
+            Dict with 'spent', 'reserved', 'total_committed' keys
+        """
+        conn = self._get_connection()
+
+        spent_row = conn.execute("""
+            SELECT COALESCE(SUM(actual_fee_sats), 0) as spent
+            FROM rebalance_history
+            WHERE timestamp >= ? AND status = 'success' AND actual_fee_sats IS NOT NULL
+        """, (since_timestamp,)).fetchone()
+
+        reserved_row = conn.execute("""
+            SELECT COALESCE(SUM(reserved_sats), 0) as reserved
+            FROM budget_reservations
+            WHERE status = 'active' AND reserved_at >= ?
+        """, (since_timestamp,)).fetchone()
+
+        spent = spent_row['spent'] if spent_row else 0
+        reserved = reserved_row['reserved'] if reserved_row else 0
+
+        return {
+            'spent': spent,
+            'reserved': reserved,
+            'total_committed': spent + reserved
+        }
+
     def get_rebalance_history_by_peer(self, peer_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Get rebalance history for channels belonging to a specific peer.

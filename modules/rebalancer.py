@@ -578,11 +578,14 @@ class JobManager:
         # Update metrics
         if self.metrics:
             self.metrics.inc_counter(
-                MetricNames.REBALANCE_COST_TOTAL_SATS, 
-                fee_sats, 
+                MetricNames.REBALANCE_COST_TOTAL_SATS,
+                fee_sats,
                 {"channel_id": job.scid_normalized}
             )
-        
+
+        # Mark budget reservation as spent (CRITICAL-01 fix)
+        self.database.mark_budget_spent(job.rebalance_id, fee_sats)
+
         # Stop the job
         self.stop_job(job.scid_normalized, reason="success")
     
@@ -611,6 +614,9 @@ class JobManager:
             # Penalize the primary source
             primary_source = job.candidate.source_candidates[0]
             self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
+
+        # Release budget reservation (CRITICAL-01 fix)
+        self.database.release_budget_reservation(job.rebalance_id)
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
@@ -642,6 +648,9 @@ class JobManager:
         if job.candidate and job.candidate.source_candidates:
             primary_source = job.candidate.source_candidates[0]
             self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
+
+        # Release budget reservation - job failed (CRITICAL-01 fix)
+        self.database.release_budget_reservation(job.rebalance_id)
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="exceeded_budget")
@@ -677,7 +686,10 @@ class JobManager:
                 error_message=f"Timeout after {elapsed_hours:.1f} hours"
             )
             self.database.increment_failure_count(job.scid_normalized)
-        
+
+        # Release budget reservation - job timed out (CRITICAL-01 fix)
+        self.database.release_budget_reservation(job.rebalance_id)
+
         # Stop the job
         self.stop_job(job.scid_normalized, reason="timeout")
     
@@ -833,11 +845,15 @@ class EVRebalancer:
         - Uses ephemeral fee cache for listchannels calls
         """
         candidates = []
-        
+
         # Initialize ephemeral fee cache for this run (cleared at end)
         self._fee_cache: Dict[str, Optional[int]] = {}
-        
+
         try:
+            # CRITICAL-01 FIX: Clean up stale budget reservations periodically
+            # Reservations older than 4 hours are likely from crashed jobs
+            self.database.cleanup_stale_reservations(max_age_seconds=14400)
+
             # First, monitor existing jobs and clean up finished ones
             if self.job_manager.active_job_count > 0:
                 monitor_result = self.job_manager.monitor_jobs()
@@ -1655,15 +1671,48 @@ class EVRebalancer:
             
             # Record rebalance attempt in database using SAFE primitives
             rebalance_id = self.database.record_rebalance(
-                db_from_channel, 
-                db_to_channel, 
+                db_from_channel,
+                db_to_channel,
                 db_amount,
-                db_max_fee, 
-                db_profit, 
+                db_max_fee,
+                db_profit,
                 'pending',
                 rebalance_type=kwargs.get('rebalance_type', 'normal')
             )
-            
+
+            # CRITICAL-01 FIX: Atomic budget reservation
+            # Reserve budget BEFORE starting the job to prevent concurrent overspend
+            now = int(time.time())
+            since_24h = now - 86400
+
+            # Calculate effective budget (same logic as _check_capital_controls)
+            effective_budget = self.config.daily_budget_sats
+            if self.config.enable_proportional_budget:
+                revenue_24h = self.database.get_total_routing_revenue(since_24h)
+                proportional_budget = int(revenue_24h * self.config.proportional_budget_pct)
+                effective_budget = max(self.config.daily_budget_sats, proportional_budget)
+
+            reserved, remaining = self.database.reserve_budget(
+                reservation_id=rebalance_id,
+                amount_sats=db_max_fee,
+                channel_id=db_to_channel,
+                budget_limit=effective_budget,
+                since_timestamp=since_24h
+            )
+
+            if not reserved:
+                self.database.update_rebalance_result(
+                    rebalance_id, 'failed',
+                    error_message=f"Budget exhausted: {remaining} sats remaining of {effective_budget}"
+                )
+                result["message"] = f"Budget exhausted: only {remaining} sats remaining"
+                self.plugin.log(
+                    f"CAPITAL CONTROL: Budget reservation failed for {db_to_channel}. "
+                    f"Remaining: {remaining} sats",
+                    level='warn'
+                )
+                return result
+
             if self.config.dry_run:
                 self.plugin.log(f"[DRY RUN] Would rebalance {candidate.amount_sats} sats "
                               f"from {candidate.from_channel} to {candidate.to_channel}")

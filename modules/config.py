@@ -67,7 +67,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
 
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
-    'min_fee_ppm': (0, 100000),
+    'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
     'max_fee_ppm': (1, 100000),
     'daily_budget_sats': (0, 10000000),
     'min_wallet_reserve': (0, 100000000),
@@ -390,11 +390,15 @@ class ConfigSnapshot:
     # Deferred (v1.4.0)
     enable_flow_asymmetry: bool
     enable_peer_sync: bool
-    
+
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int
     rpc_circuit_breaker_seconds: int
-    
+
+    # Hive Parameters (v1.4.0) - MAJOR-12 FIX: Added missing fields
+    hive_fee_ppm: int
+    hive_rebalance_tolerance: int
+
     # Version tracking
     version: int = 0
     
@@ -449,6 +453,8 @@ class ConfigSnapshot:
             enable_peer_sync=config.enable_peer_sync,
             rpc_timeout_seconds=config.rpc_timeout_seconds,
             rpc_circuit_breaker_seconds=config.rpc_circuit_breaker_seconds,
+            hive_fee_ppm=config.hive_fee_ppm,
+            hive_rebalance_tolerance=config.hive_rebalance_tolerance,
             version=config._version,
         )
 
