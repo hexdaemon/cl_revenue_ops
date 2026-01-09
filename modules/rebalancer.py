@@ -1232,17 +1232,33 @@ class EVRebalancer:
         # Use ceiling sats for conservative accounting.
         max_budget_sats = (max_budget_msat + 999) // 1000
         
-        # Kelly logic
+        # MAJOR-13 DOCUMENTATION: Modified Kelly Criterion for Per-Trade Sizing
+        #
+        # This is NOT classical Kelly for portfolio allocation. Instead, we apply
+        # Kelly scaling to each individual rebalance "bet" to size the maximum fee
+        # we're willing to pay based on:
+        #   - p: Success probability (peer reputation score, 0-1)
+        #   - b: Odds offered (outbound_fee_ppm / cost_ppm ratio)
+        #
+        # Kelly formula: f* = p - (1-p)/b
+        #   - If f* > 0: We have positive EV, scale budget by f* * kelly_fraction
+        #   - If f* <= 0: Negative EV, reject this rebalance
+        #
+        # The kelly_fraction (default 0.5 = "Half Kelly") reduces volatility drag.
+        # Full Kelly (1.0) maximizes theoretical growth but suffers from high variance.
+        #
+        # Note: This applies to max_budget_sats (the fee cap for this trade), not
+        # total routing capital. For daily budget management, see reserve_budget().
         if self.config.enable_kelly:
             reputation = self.database.get_peer_reputation(dest_info.get("peer_id", ""))
-            p = reputation.get('score', 0.5)
+            p = reputation.get('score', 0.5)  # Success probability
             cost_ppm = inbound_fee_ppm + weighted_opp_cost
-            b = outbound_fee_ppm / cost_ppm if cost_ppm > 0 else float('inf')
-            kelly_f = p - (1 - p) / b if b > 0 else -1.0
+            b = outbound_fee_ppm / cost_ppm if cost_ppm > 0 else float('inf')  # Odds
+            kelly_f = p - (1 - p) / b if b > 0 else -1.0  # Raw Kelly fraction
             kelly_safe = min(kelly_f * self.config.kelly_fraction, 1.0)
-            
-            if kelly_safe <= 0: 
-                return None
+
+            if kelly_safe <= 0:
+                return None  # Negative EV, reject
             max_budget_sats = int(max_budget_sats * kelly_safe)
             max_budget_msat = max_budget_sats * 1000
 

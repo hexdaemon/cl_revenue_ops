@@ -1062,7 +1062,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 rpc_broker.stop()
             except Exception:
                 pass
-    
+
+        # MAJOR-11 FIX: Clean up database connections on shutdown
+        if database:
+            try:
+                database.close_all_connections()
+            except Exception as e:
+                plugin.log(f"Error closing database: {e}", level='warn')
+
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
     
     # =========================================================================
