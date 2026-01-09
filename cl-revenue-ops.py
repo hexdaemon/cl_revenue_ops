@@ -2170,9 +2170,10 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         if out_channel:
             out_channel = out_channel.replace(':', 'x')
             
-        in_msat = _parse_msat(forward_event.get("in_msatoshi", 0))
-        out_msat = _parse_msat(forward_event.get("out_msatoshi", 0))
-        fee_msat = _parse_msat(forward_event.get("fee_msatoshi", 0))
+        # CLN v23.05+ uses in_msat/out_msat/fee_msat; older versions used *_msatoshi
+        in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
+        out_msat = _parse_msat(forward_event.get("out_msat", forward_event.get("out_msatoshi", 0)))
+        fee_msat = _parse_msat(forward_event.get("fee_msat", forward_event.get("fee_msatoshi", 0)))
         
         # Calculate resolution duration (Risk Premium tracking)
         # durations in CLN are usually in seconds (float)
