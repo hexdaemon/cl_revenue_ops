@@ -59,6 +59,89 @@ from modules.capacity_planner import CapacityPlanner
 from modules.metrics import PrometheusExporter, MetricNames, METRIC_HELP
 from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
 
+
+# =============================================================================
+# RATE LIMITER FOR FORCE OPERATIONS (MAJOR-09 FIX)
+# =============================================================================
+# Prevents abuse of force=true parameters which bypass safety checks.
+# Implements a simple sliding window rate limiter per command.
+
+class ForceRateLimiter:
+    """
+    Rate limiter for force=true RPC operations.
+
+    Prevents abuse by limiting how often force operations can be called.
+    Uses a sliding window algorithm with configurable limits.
+    """
+
+    def __init__(self, max_calls: int = 10, window_seconds: int = 60):
+        """
+        Initialize rate limiter.
+
+        Args:
+            max_calls: Maximum force calls allowed per window
+            window_seconds: Window duration in seconds
+        """
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self._timestamps: Dict[str, list] = {}  # command -> list of timestamps
+        self._lock = threading.Lock()
+
+    def check_rate_limit(self, command: str) -> Tuple[bool, str]:
+        """
+        Check if a force operation is allowed.
+
+        Args:
+            command: The RPC command name
+
+        Returns:
+            Tuple of (allowed: bool, message: str)
+        """
+        now = time.time()
+        cutoff = now - self.window_seconds
+
+        with self._lock:
+            # Get or create timestamp list for this command
+            if command not in self._timestamps:
+                self._timestamps[command] = []
+
+            # Clean old timestamps
+            self._timestamps[command] = [
+                ts for ts in self._timestamps[command] if ts > cutoff
+            ]
+
+            # Check limit
+            if len(self._timestamps[command]) >= self.max_calls:
+                remaining = self._timestamps[command][0] + self.window_seconds - now
+                return (False, f"Rate limit exceeded for force={command}. "
+                              f"Try again in {int(remaining)}s. "
+                              f"({self.max_calls} calls per {self.window_seconds}s)")
+
+            # Record this call
+            self._timestamps[command].append(now)
+            return (True, "")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current rate limiter status."""
+        now = time.time()
+        cutoff = now - self.window_seconds
+
+        with self._lock:
+            status = {}
+            for cmd, timestamps in self._timestamps.items():
+                recent = [ts for ts in timestamps if ts > cutoff]
+                status[cmd] = {
+                    "calls_in_window": len(recent),
+                    "max_calls": self.max_calls,
+                    "window_seconds": self.window_seconds
+                }
+            return status
+
+
+# Global rate limiter for force operations (10 calls per 60 seconds)
+force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
+
+
 # Initialize the plugin
 plugin = Plugin()
 
@@ -1296,12 +1379,18 @@ def revenue_capacity_report(plugin: Plugin, **kwargs):
 def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool = False) -> Dict[str, Any]:
     """
     Manually set fee for a channel (with clboss unmanage).
-    
+
     Usage: lightning-cli revenue-set-fee channel_id fee_ppm [force=false]
     """
     if fee_controller is None or config is None:
         return {"error": "Plugin not fully initialized"}
-    
+
+    # MAJOR-09 FIX: Rate limit force operations
+    if force:
+        allowed, msg = force_rate_limiter.check_rate_limit("revenue-set-fee")
+        if not allowed:
+            return {"status": "error", "error": msg}
+
     # 1. Validation
     try:
         fee_ppm = int(fee_ppm)
@@ -1309,7 +1398,7 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
             return {"status": "error", "error": "fee_ppm must be non-negative"}
     except ValueError:
         return {"status": "error", "error": "fee_ppm must be an integer"}
-        
+
     # Basic SCID or PeerID format check (simple regex-less check)
     if not (":" in channel_id or "x" in channel_id or len(channel_id) == 66):
         return {"status": "error", "error": "Invalid channel_id or node_id format"}
@@ -1330,20 +1419,26 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
 
 
 @plugin.method("revenue-rebalance")
-def revenue_rebalance(plugin: Plugin, 
-                      from_channel: str, 
-                      to_channel: str, 
+def revenue_rebalance(plugin: Plugin,
+                      from_channel: str,
+                      to_channel: str,
                       amount_sats: int,
                       max_fee_sats: Optional[int] = None,
                       force: bool = False) -> Dict[str, Any]:
     """
     Manually trigger a rebalance with profit/budget constraints.
-    
+
     Usage: lightning-cli revenue-rebalance from_channel to_channel amount_sats [max_fee_sats] [force=false]
     """
     if rebalancer is None:
         return {"error": "Plugin not fully initialized"}
-    
+
+    # MAJOR-09 FIX: Rate limit force operations
+    if force:
+        allowed, msg = force_rate_limiter.check_rate_limit("revenue-rebalance")
+        if not allowed:
+            return {"status": "error", "error": msg}
+
     if config and not config.sling_available:
         return {"error": "Rebalancing disabled: sling plugin not found. Install cln-sling to enable."}
     

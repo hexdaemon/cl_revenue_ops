@@ -1427,12 +1427,23 @@ class Database:
         if rt <= 0 and resolution_time and resolution_time > 0:
             rt = ts + int(resolution_time)
 
-        conn.execute("""
+        # MAJOR-10 FIX: Return whether this was a new insert or duplicate
+        # Use cursor.rowcount to detect if INSERT OR IGNORE actually inserted
+        cursor = conn.execute("""
             INSERT OR IGNORE INTO forwards
             (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (in_channel, out_channel, int(in_msat), int(out_msat), int(fee_msat),
                 float(resolution_time or 0), ts, rt))
+
+        # Log duplicate detection for observability
+        if cursor.rowcount == 0:
+            self.plugin.log(
+                f"Forward duplicate detected (already recorded): "
+                f"{in_channel[:12]}... -> {out_channel[:12]}... "
+                f"(received={received_time}, resolved={resolved_time})",
+                level='debug'
+            )
 
     def get_channel_forwards(self, channel_id: str, since_timestamp: int) -> Dict[str, int]:
         """Get aggregate forward stats for a channel since a timestamp."""
