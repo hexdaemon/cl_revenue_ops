@@ -1060,7 +1060,26 @@ class HillClimbingFeeController:
                 self.config.base_fee_msat,     # feebase (msat)
                 fee_ppm                        # feeppm
             )
-            
+
+            # MAJOR-08 FIX: Verify fee was actually set (detect CLBOSS reversion)
+            # Small delay to allow gossip propagation, then verify
+            time.sleep(0.1)  # 100ms
+            try:
+                verify_channels = self._get_channels_info()
+                verify_info = verify_channels.get(channel_id, {})
+                actual_fee = verify_info.get("fee_proportional_millionths", -1)
+                if actual_fee != fee_ppm and actual_fee != -1:
+                    self.plugin.log(
+                        f"CLBOSS CONFLICT: Fee for {channel_id[:16]}... was reverted "
+                        f"(wanted {fee_ppm}, got {actual_fee}). Re-unmanaging and retrying.",
+                        level='warn'
+                    )
+                    # Re-unmanage and retry once
+                    self.clboss.unmanage(peer_id, ClbossTags.FEE_AND_BALANCE)
+                    self.plugin.rpc.setchannel(channel_id, self.config.base_fee_msat, fee_ppm)
+            except Exception as verify_err:
+                self.plugin.log(f"Fee verification failed: {verify_err}", level='debug')
+
             # Step 3: Record the change
             self.database.record_fee_change(
                 channel_id=channel_id,

@@ -87,7 +87,46 @@ class Database:
                 level='debug'
             )
         return self._local.conn
-    
+
+    def close_connection(self) -> None:
+        """
+        Close the thread-local database connection.
+
+        MAJOR-11 FIX: Explicit cleanup to prevent connection leaks in
+        long-running plugins with many threads.
+
+        Should be called when a thread is about to exit or during shutdown.
+        """
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            try:
+                self._local.conn.close()
+                self.plugin.log(
+                    f"Database: Closed thread-local connection (thread={threading.current_thread().name})",
+                    level='debug'
+                )
+            except Exception as e:
+                self.plugin.log(f"Error closing connection: {e}", level='debug')
+            finally:
+                self._local.conn = None
+
+    def close_all_connections(self) -> None:
+        """
+        Close the main thread's connection and checkpoint WAL.
+
+        Should be called during plugin shutdown to ensure clean state.
+        """
+        conn = getattr(self._local, 'conn', None)
+        if conn:
+            try:
+                # Checkpoint WAL to ensure all writes are in main database
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.close()
+                self.plugin.log("Database: Shutdown checkpoint complete", level='info')
+            except Exception as e:
+                self.plugin.log(f"Error during shutdown: {e}", level='warn')
+            finally:
+                self._local.conn = None
+
     def initialize(self):
         """Create database tables if they don't exist."""
         conn = self._get_connection()
