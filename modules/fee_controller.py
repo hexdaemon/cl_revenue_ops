@@ -384,7 +384,7 @@ class HillClimbingFeeController:
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
                         if current_fee != policy.fee_ppm_target:
                             try:
-                                self._set_channel_fee(channel_id, policy.fee_ppm_target, current_fee)
+                                self.set_channel_fee(channel_id, policy.fee_ppm_target, reason="Policy: STATIC")
                                 adjustments.append(FeeAdjustment(
                                     channel_id=channel_id,
                                     peer_id=peer_id,
@@ -405,7 +405,7 @@ class HillClimbingFeeController:
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
                         if current_fee != hive_fee:
                             try:
-                                self._set_channel_fee(channel_id, hive_fee, current_fee)
+                                self.set_channel_fee(channel_id, hive_fee, reason="Policy: HIVE")
                                 adjustments.append(FeeAdjustment(
                                     channel_id=channel_id,
                                     peer_id=peer_id,
