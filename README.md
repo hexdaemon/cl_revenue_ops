@@ -60,6 +60,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the **clbos
 - **`revenue-status`**: Check plugin health and active background jobs.
 
 ### Reporting
+- **`revenue-dashboard [window_days]`**: Financial health overview with TLV, margins, ROC, and bleeder warnings.
 - **`revenue-report summary`**: View Net Worth, Operating Margin, and active channel counts.
 - **`revenue-report peer <id>`**: Deep dive into a specific peer's flow state and profitability.
 - **`revenue-capacity-report`**: Strategic advice for Splicing/Closing channels ("Winners & Losers").

@@ -167,20 +167,23 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - *Deferred:* High-02 Arbitrage Risk. Requires "Baseline/Floor" architecture rather than "Leader Override."
 
 ## Phase 8: The Sovereign Dashboard (P&L Engine)
+*Status: COMPLETED (v1.5.0)*
 *Objective: Provide comprehensive financial visibility and identify underperforming channels.*
 
-- [ ] **Financial Snapshots (Database)**:
-    - Record node TLV (Total Locked Value) daily to track Net Worth over time.
-    - New `financial_snapshots` table with `record_financial_snapshot()` and `get_financial_history()` methods.
+- [x] **Financial Snapshots (Database)**:
+    - Record node TLV (Total Liquidating Value) daily to track Net Worth over time.
+    - New `financial_snapshots` table with `record_financial_snapshot()`, `get_financial_history()`, `get_latest_financial_snapshot()`, and `get_lifetime_stats()` methods.
+    - Background thread takes snapshots every 24 hours with jitter.
 
-- [ ] **P&L Logic & "Bleeder" Detection**:
-    - Calculate Gross Revenue, OpEx, Net Profit, and Margin via `profitability_analyzer`.
-    - Identify "Bleeders": channels where `rebalance_costs > revenue` over 30 days.
-    - Calculate Return on Capacity (ROC) metric per channel.
+- [x] **P&L Logic & "Bleeder" Detection**:
+    - Calculate Gross Revenue, OpEx, Net Profit, and Margin via `profitability_analyzer.get_pnl_summary()`.
+    - Identify "Bleeders" via `identify_bleeders()`: channels where `rebalance_costs > revenue`.
+    - Calculate Return on Capacity (ROC) via `calculate_roc()` with annualization.
+    - Calculate TLV via `get_tlv()` (on-chain + local channel balances).
 
-- [ ] **`revenue-dashboard` RPC Command**:
+- [x] **`revenue-dashboard` RPC Command**:
     - Single command for operator to check node financial health.
-    - JSON output: TLV, Margins, ROC, and Warnings (Bleeders list).
+    - JSON output: `financial_health` (TLV, net profit, margin, ROC), `period` (window, revenue, opex), `warnings` (bleeders list).
 
 ## Phase 9: "The Hive" (External Integration)
 *Status: IN PROGRESS — Implementation Plan Approved*
@@ -220,4 +223,4 @@ The distributed fleet coordination logic has been decoupled into a standalone pl
 
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
-*Roadmap updated: January 5, 2026*
+*Roadmap updated: January 10, 2026*

@@ -174,33 +174,30 @@ This document details the implementation steps for the remaining items in the ro
 
 ---
 
-### 📊 Phase 8: The Sovereign Dashboard (P&L Engine)
+### 📊 Phase 8: The Sovereign Dashboard (P&L Engine) ✅ COMPLETED
 
-#### 26. Implement Financial Snapshots (Database)
-**Context:** To track Net Worth (TLV) over time, we need to record the state of the node periodically.
-**Tasks:**
-1.  **Modify `modules/database.py`**:
-    - Add `financial_snapshots` table schema in `initialize()`.
-    - Add `record_financial_snapshot(...)` method.
-    - Add `get_financial_history(limit=30)` method.
-2.  **Modify `cl-revenue-ops.py`**:
-    - Add a background timer (24h interval) or hook into an existing loop to take a snapshot once per day.
+#### 26. Implement Financial Snapshots (Database) ✅ COMPLETED
+**Status:** Implemented in `modules/database.py`.
+- Added `financial_snapshots` table schema in `initialize()`
+- Added `record_financial_snapshot(...)` method
+- Added `get_financial_history(limit=30)` method
+- Added `get_latest_financial_snapshot()` method
+- Added `get_lifetime_stats()` for accumulated revenue/cost totals
+- Added `get_channel_pnl()` for per-channel profitability
+- Added 24h background timer (`financial_snapshot_loop`) in `cl-revenue-ops.py`
 
-#### 27. Implement P&L Logic & "Bleeder" Detection
-**Context:** We need to identify channels that are operationally active but financially negative (burning rebalance fees).
-**Tasks:**
-1.  **Modify `modules/profitability_analyzer.py`**:
-    - Add `get_pnl_summary(window_days)`: Calculate Gross Rev, OpEx, Net Profit, and Margin.
-    - Add `identify_bleeders()`: Find channels where `rebalance_costs > revenue` over the last 30 days.
-    - Add `calculate_roc()`: Return on Capacity metric.
+#### 27. Implement P&L Logic & "Bleeder" Detection ✅ COMPLETED
+**Status:** Implemented in `modules/profitability_analyzer.py`.
+- Added `get_pnl_summary(window_days)`: Calculates Gross Revenue, OpEx, Net Profit, and Operating Margin
+- Added `identify_bleeders(window_days)`: Finds channels where `rebalance_costs > revenue`
+- Added `calculate_roc(window_days)`: Annualized Return on Capacity metric
+- Added `get_tlv()`: Total Liquidating Value (on-chain + local channel balances)
 
-#### 28. Implement `revenue-dashboard` RPC
-**Context:** Provide a single command for the operator to check the financial health of the node.
-**Tasks:**
-1.  **Modify `cl-revenue-ops.py`**:
-    - Register `revenue-dashboard` command.
-    - Aggregate data from `profitability_analyzer` and `database`.
-    - Format JSON output containing TLV, Margins, ROC, and Warnings (Bleeders).
+#### 28. Implement `revenue-dashboard` RPC ✅ COMPLETED
+**Status:** Implemented in `cl-revenue-ops.py`.
+- Registered `revenue-dashboard` command with optional `window_days` parameter (default: 30)
+- Aggregates data from `profitability_analyzer` and `database`
+- Returns JSON with `financial_health` (TLV, net profit, margin, ROC), `period` (window, revenue, opex), and `warnings` (bleeder channels)
 
 ---
 
