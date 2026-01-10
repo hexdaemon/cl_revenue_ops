@@ -1409,6 +1409,140 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     }
 
 
+@plugin.method("revenue-rebalance-debug")
+def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Diagnostic command to understand why rebalancing may not be happening.
+
+    Shows:
+    - Capital control status (budget/reserve)
+    - Depleted channels (potential destinations)
+    - Source channels (potential sources)
+    - Why candidates are rejected
+
+    Usage: lightning-cli revenue-rebalance-debug
+    """
+    if rebalancer is None:
+        return {"error": "Rebalancer not initialized"}
+
+    result = {
+        "sling_available": config.sling_available if config else False,
+        "dry_run": config.dry_run if config else False,
+        "capital_controls": {},
+        "thresholds": {},
+        "channels": {
+            "depleted": [],
+            "source": [],
+            "active_jobs": []
+        },
+        "rejection_reasons": []
+    }
+
+    if not config.sling_available:
+        result["rejection_reasons"].append("Sling plugin not available - rebalancing disabled")
+        return result
+
+    # Get thresholds
+    cfg = config.snapshot()
+    result["thresholds"] = {
+        "low_liquidity_threshold": cfg.low_liquidity_threshold,
+        "high_liquidity_threshold": cfg.high_liquidity_threshold,
+        "rebalance_min_profit_sats": cfg.rebalance_min_profit
+    }
+
+    # Check capital controls
+    try:
+        listfunds = plugin.rpc.listfunds()
+        onchain_sats = sum(
+            (int(str(o.get("amount_msat", "0")).replace("msat", "")) // 1000)
+            for o in listfunds.get("outputs", [])
+            if o.get("status") == "confirmed"
+        )
+        channel_sats = sum(
+            (int(str(c.get("our_amount_msat", "0")).replace("msat", "")) // 1000)
+            for c in listfunds.get("channels", [])
+        )
+        total_liquid = onchain_sats + channel_sats
+
+        daily_spent = database.get_daily_rebalance_spend() if database else 0
+        daily_budget = cfg.rebalance_budget_sats
+        budget_remaining = daily_budget - daily_spent
+
+        result["capital_controls"] = {
+            "onchain_sats": onchain_sats,
+            "channel_sats": channel_sats,
+            "total_liquid_sats": total_liquid,
+            "wallet_reserve_sats": cfg.wallet_reserve_sats,
+            "reserve_ok": total_liquid >= cfg.wallet_reserve_sats,
+            "daily_budget_sats": daily_budget,
+            "daily_spent_sats": daily_spent,
+            "budget_remaining_sats": budget_remaining,
+            "budget_ok": budget_remaining > 0
+        }
+
+        if total_liquid < cfg.wallet_reserve_sats:
+            result["rejection_reasons"].append(
+                f"Wallet reserve violated: {total_liquid} < {cfg.wallet_reserve_sats}"
+            )
+        if budget_remaining <= 0:
+            result["rejection_reasons"].append(
+                f"Daily budget exhausted: spent {daily_spent} of {daily_budget}"
+            )
+    except Exception as e:
+        result["capital_controls"]["error"] = str(e)
+
+    # Get channel analysis
+    try:
+        channels = rebalancer._get_channels_with_balances()
+        active_channels = set(rebalancer.job_manager.active_channels)
+
+        for cid, info in channels.items():
+            capacity = info.get("capacity", 0)
+            if capacity == 0:
+                continue
+
+            spendable = info.get("spendable_sats", 0)
+            ratio = spendable / capacity
+            fee_ppm = info.get("fee_ppm", 0)
+            peer_id = info.get("peer_id", "")[:16]
+
+            state = database.get_channel_state(cid) if database else {}
+            flow_state = state.get("state", "unknown") if state else "unknown"
+
+            channel_info = {
+                "scid": cid[:20],
+                "peer": peer_id,
+                "local_pct": round(ratio * 100, 1),
+                "fee_ppm": fee_ppm,
+                "flow_state": flow_state
+            }
+
+            if cid in active_channels:
+                result["channels"]["active_jobs"].append(channel_info)
+            elif ratio < cfg.low_liquidity_threshold:
+                channel_info["reason"] = "low local balance"
+                if flow_state == "sink":
+                    channel_info["skip_reason"] = "SINK - filling naturally"
+                result["channels"]["depleted"].append(channel_info)
+            elif ratio > cfg.high_liquidity_threshold:
+                channel_info["reason"] = "high local balance"
+                result["channels"]["source"].append(channel_info)
+
+        if not result["channels"]["depleted"]:
+            result["rejection_reasons"].append(
+                f"No depleted channels (none below {cfg.low_liquidity_threshold*100}% local balance)"
+            )
+        if not result["channels"]["source"]:
+            result["rejection_reasons"].append(
+                f"No source channels (none above {cfg.high_liquidity_threshold*100}% local balance)"
+            )
+
+    except Exception as e:
+        result["channels"]["error"] = str(e)
+
+    return result
+
+
 @plugin.method("revenue-analyze")
 def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[str, Any]:
     """
