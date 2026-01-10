@@ -1805,38 +1805,47 @@ class Database:
     # Clboss Unmanage Tracking
     # =========================================================================
     
-    def record_unmanage(self, peer_id: str, tag: str):
+    def record_unmanage(self, peer_id: str, tag):
         """Record that we unmanaged a peer/tag from clboss."""
         conn = self._get_connection()
         now = int(time.time())
-        
+
+        # Normalize tag: convert list to comma-separated string
+        tag_str = ",".join(tag) if isinstance(tag, list) else tag
+
         conn.execute("""
-            INSERT OR REPLACE INTO clboss_unmanaged 
+            INSERT OR REPLACE INTO clboss_unmanaged
             (peer_id, tag, unmanaged_at)
             VALUES (?, ?, ?)
-        """, (peer_id, tag, now))
-    
-    def remove_unmanage(self, peer_id: str, tag: Optional[str] = None):
+        """, (peer_id, tag_str, now))
+
+    def remove_unmanage(self, peer_id: str, tag=None):
         """Remove unmanage record (when remanaging)."""
         conn = self._get_connection()
-        
+
         if tag:
+            # Normalize tag: convert list to comma-separated string
+            tag_str = ",".join(tag) if isinstance(tag, list) else tag
             conn.execute(
                 "DELETE FROM clboss_unmanaged WHERE peer_id = ? AND tag = ?",
-                (peer_id, tag)
+                (peer_id, tag_str)
             )
         else:
             conn.execute(
                 "DELETE FROM clboss_unmanaged WHERE peer_id = ?",
                 (peer_id,)
             )
-    
-    def is_unmanaged(self, peer_id: str, tag: str) -> bool:
+
+    def is_unmanaged(self, peer_id: str, tag) -> bool:
         """Check if a peer/tag is currently unmanaged."""
         conn = self._get_connection()
+
+        # Normalize tag: convert list to comma-separated string
+        tag_str = ",".join(tag) if isinstance(tag, list) else tag
+
         row = conn.execute(
             "SELECT 1 FROM clboss_unmanaged WHERE peer_id = ? AND tag = ?",
-            (peer_id, tag)
+            (peer_id, tag_str)
         ).fetchone()
         return row is not None
     
