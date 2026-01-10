@@ -218,8 +218,9 @@ class JobManager:
         return scid.replace(':', 'x')
     
     def _to_sling_scid(self, scid: str) -> str:
-        """Convert SCID to sling's expected colon format."""
-        return scid.replace('x', ':')
+        """Normalize SCID to sling's expected 'x' separator format."""
+        # Sling expects format like 930866x2599x2 (with 'x' separators)
+        return scid.replace(':', 'x')
     
     def _get_channel_local_balance(self, channel_id: str) -> int:
         """Get current local balance of a channel in sats."""
