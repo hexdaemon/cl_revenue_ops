@@ -1868,19 +1868,27 @@ class EVRebalancer:
                 "message": f"Zero-Fee flag set, but active shock failed: {e}"
             }
 
-    def manual_rebalance(self, from_channel: str, to_channel: str, 
-                         amount_sats: int, max_fee_sats: Optional[int] = None) -> Dict[str, Any]:
+    def manual_rebalance(self, from_channel: str, to_channel: str,
+                         amount_sats: int, max_fee_sats: Optional[int] = None,
+                         force: bool = False) -> Dict[str, Any]:
         """Execute a manual rebalance between two channels.
-        
+
         Note: Manual rebalances bypass capital controls by design (user override),
         but fees ARE recorded and count toward the daily budget for automated rebalances.
+
+        Args:
+            from_channel: Source channel ID (where liquidity comes from)
+            to_channel: Destination channel ID (where liquidity goes)
+            amount_sats: Amount to rebalance in satoshis
+            max_fee_sats: Maximum fee willing to pay (optional)
+            force: If True, suppress capital control warnings
         """
         # Warn if capital controls would block this (but don't enforce for manual)
         capital_ok = self._check_capital_controls()
-        if not capital_ok:
+        if not capital_ok and not force:
             self.plugin.log(
                 "WARNING: Manual rebalance executing despite capital controls. "
-                "Budget may be exhausted or reserve low.", 
+                "Budget may be exhausted or reserve low.",
                 level='warn'
             )
         
@@ -1925,11 +1933,11 @@ class EVRebalancer:
             source_turnover_rate=0.0
         )
         result = self.execute_rebalance(cand, rebalance_type='manual')
-        
-        # Include capital controls warning in result
-        if not capital_ok:
+
+        # Include capital controls warning in result (unless force=True)
+        if not capital_ok and not force:
             result['capital_controls_warning'] = "Budget exhausted or reserve low (manual override)"
-        
+
         return result
 
     def _check_capital_controls(self, cfg: Optional[ConfigSnapshot] = None) -> bool:
