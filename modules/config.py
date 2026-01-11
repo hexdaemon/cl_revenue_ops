@@ -507,7 +507,8 @@ class ChainCostDefaults:
     # Estimated on-chain costs in sats
     CHANNEL_OPEN_COST_SATS: int = 5000      # ~$3-5 at typical fee rates
     CHANNEL_CLOSE_COST_SATS: int = 3000     # Usually cheaper than open
-    
+    SPLICE_COST_SATS: int = 2000            # Splice tx fee (similar to single input/output)
+
     # Estimated channel lifetime
     CHANNEL_LIFETIME_DAYS: int = 365        # 1 year average
     

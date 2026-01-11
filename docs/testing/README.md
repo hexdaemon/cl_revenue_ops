@@ -38,6 +38,7 @@ Automated test suite for the cl-revenue-ops plugin.
 | `clboss` | CLBoss integration |
 | `database` | Database operations |
 | `closure_costs` | Channel closure cost tracking |
+| `splice_costs` | Splice cost tracking |
 | `metrics` | Metrics collection |
 | `reset` | Reset plugin state |
 | `all` | Run all tests |
@@ -145,10 +146,27 @@ Run closure cost tests:
 ./test.sh closure_costs 1
 ```
 
+### Accounting v2.0: Splice Cost Tracking
+Tracks channel splice costs for accurate P&L accounting:
+
+| Component | Description |
+|-----------|-------------|
+| **channel_state_changed subscription** | Detects splice completion via state transition |
+| **Splice detection** | Triggers on `CHANNELD_AWAITING_SPLICE` → `CHANNELD_NORMAL` |
+| **Bookkeeper integration** | Queries `bkpr-listaccountevents` for splice on-chain fees |
+| **Splice type detection** | Classifies: splice_in (capacity increase), splice_out (capacity decrease) |
+| **splice_costs table** | Stores splice fees and capacity changes |
+| **Updated lifetime stats** | `get_lifetime_stats()` includes `total_splice_cost_sats` |
+
+Run splice cost tests:
+```bash
+./test.sh splice_costs 1
+```
+
 ### Profitability Analyzer
 - ROI calculation
 - Revenue tracking
-- Cost tracking (including closure costs)
+- Cost tracking (including closure and splice costs)
 
 ### CLBoss Integration
 - Status monitoring

@@ -292,9 +292,9 @@ Six security-hardened improvements for policy management:
     - Added `fee_multiplier_min REAL`, `fee_multiplier_max REAL`, `expires_at INTEGER` columns.
     - Backwards-compatible with existing policies.
 
-## Phase 11: Accounting v2.0 (Channel Closure Cost Tracking)
-*Status: COMPLETED (v1.8.0)*
-*Objective: Fix overstated P&L by tracking channel closure costs that were previously missing from financial reports.*
+## Phase 11: Accounting v2.0 (Closure & Splice Cost Tracking)
+*Status: COMPLETED (v1.8.1)*
+*Objective: Fix overstated P&L by tracking channel closure and splice costs that were previously missing from financial reports.*
 
 ### v1.8.0: Channel Closure Cost Tracking ✅ COMPLETED
 
@@ -303,7 +303,7 @@ Channel closure costs were the missing piece in accurate P&L accounting. Previou
 Net P&L = Revenue - (Opening Costs + Rebalance Costs)
 ```
 
-Now the complete formula is:
+Now the formula includes closure costs:
 ```
 Net P&L = Revenue - (Opening Costs + Closure Costs + Rebalance Costs)
 ```
@@ -343,6 +343,36 @@ Net P&L = Revenue - (Opening Costs + Closure Costs + Rebalance Costs)
     - `_archive_closed_channel()` captures complete P&L before data is orphaned.
     - Queries `listclosedchannels` (CLN v23.11+) for capacity.
     - Preserves historical data for accurate lifetime reporting.
+
+### v1.8.1: Splice Cost Tracking ✅ COMPLETED
+
+With CLN v23.08+ supporting splicing, splice fees must also be tracked. The complete formula is now:
+```
+Net P&L = Revenue - (Opening Costs + Closure Costs + Splice Costs + Rebalance Costs)
+```
+
+- [x] **Splice Detection via Channel State**:
+    - Detect splice completion: `CHANNELD_AWAITING_SPLICE` → `CHANNELD_NORMAL`.
+    - Handler: `_handle_splice_completion()`.
+
+- [x] **Bookkeeper Integration for Splice Fees**:
+    - Query `bkpr-listaccountevents` for splice on-chain fees.
+    - Extract `onchain_fee` events after splice transaction.
+    - Detect capacity changes to classify splice type.
+    - Security: Fallback to `ChainCostDefaults.SPLICE_COST_SATS` if unavailable.
+
+- [x] **Splice Costs Table**:
+    - New `splice_costs` table with: `channel_id`, `peer_id`, `splice_type`,
+      `amount_sats`, `fee_sats`, `old_capacity_sats`, `new_capacity_sats`, `txid`.
+    - Methods: `record_splice()`, `get_channel_splice_history()`, `get_total_splice_costs()`, `get_splice_summary()`.
+
+- [x] **Updated Lifetime Stats**:
+    - `get_lifetime_stats()` now returns `total_splice_cost_sats`.
+    - P&L formula includes splice costs in all reports.
+
+- [x] **Profitability Analyzer Updates**:
+    - `get_lifetime_report()` includes `lifetime_splice_costs_sats`.
+    - Total costs calculation: Opening + Closure + Splice + Rebalance.
 
 ---
 *Roadmap updated: January 11, 2026*

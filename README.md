@@ -56,13 +56,15 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the **clbos
 - **Zero-Fee Routing:** Supports internal fleet whitelisting.
 - **Inventory Load Balancing:** Supports "Push" rebalancing to fleet members via Strategic Exemptions.
 
-### Module 7: Accounting v2.0 (Closure Cost Tracking)
-- **Complete P&L Formula:** `Net P&L = Revenue - (Opening + Closure + Rebalance)`.
+### Module 7: Accounting v2.0 (Closure & Splice Cost Tracking)
+- **Complete P&L Formula:** `Net P&L = Revenue - (Opening + Closure + Splice + Rebalance)`.
 - **Channel Closure Detection:** Subscribes to `channel_state_changed` notification.
+- **Splice Detection:** Detects splice completion via `CHANNELD_AWAITING_SPLICE` → `CHANNELD_NORMAL` transition.
 - **Bookkeeper Integration:** Queries `bkpr-listaccountevents` for actual on-chain fees.
 - **Close Type Tracking:** Distinguishes mutual, local unilateral, and remote unilateral closes.
+- **Splice Type Tracking:** Tracks splice_in (capacity increase) and splice_out (capacity decrease).
 - **Closed Channel History:** Preserves complete P&L for closed channels via `closed_channels` table.
-- **Accurate Lifetime Reports:** `revenue-history` now includes closure costs.
+- **Accurate Lifetime Reports:** `revenue-history` now includes closure and splice costs.
 
 ---
 

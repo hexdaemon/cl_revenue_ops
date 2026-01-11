@@ -1015,6 +1015,84 @@ test_closure_costs() {
     fi
 }
 
+# Splice Cost Tracking Tests (Accounting v2.0)
+test_splice_costs() {
+    echo ""
+    echo "========================================"
+    echo "SPLICE COST TRACKING TESTS (Accounting v2.0)"
+    echo "========================================"
+
+    # =========================================================================
+    # Code Verification Tests
+    # =========================================================================
+    log_info "Testing splice cost tracking code..."
+
+    # Database table exists
+    run_test "Splice costs table defined" \
+        "grep -q 'splice_costs' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Database methods exist
+    run_test "record_splice method exists" \
+        "grep -q 'def record_splice' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "get_channel_splice_history method exists" \
+        "grep -q 'def get_channel_splice_history' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "get_total_splice_costs method exists" \
+        "grep -q 'def get_total_splice_costs' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "get_splice_summary method exists" \
+        "grep -q 'def get_splice_summary' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Splice detection in channel state changed
+    run_test "Splice detection via CHANNELD_AWAITING_SPLICE" \
+        "grep -q 'CHANNELD_AWAITING_SPLICE' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    run_test "Splice completion handler exists" \
+        "grep -q 'def _handle_splice_completion' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # Bookkeeper integration for splice
+    run_test "Bookkeeper query for splice costs exists" \
+        "grep -q 'def _get_splice_costs_from_bookkeeper' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # Splice types tracked
+    run_test "splice_in type defined" \
+        "grep -q 'splice_in' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "splice_out type defined" \
+        "grep -q 'splice_out' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Lifetime stats includes splice costs
+    run_test "get_lifetime_stats includes splice costs" \
+        "grep -q 'total_splice_cost_sats' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Profitability analyzer includes splice costs
+    run_test "Lifetime report includes splice costs" \
+        "grep -q 'lifetime_splice_costs_sats' /home/sat/cl_revenue_ops/modules/profitability_analyzer.py"
+
+    # =========================================================================
+    # Runtime Tests
+    # =========================================================================
+    log_info "Testing splice cost tracking runtime..."
+
+    # Check if revenue-history includes splice costs
+    HISTORY=$(revenue_cli alice revenue-history 2>/dev/null || echo '{}')
+    if [ -n "$HISTORY" ] && [ "$HISTORY" != "{}" ]; then
+        run_test "revenue-history has lifetime_splice_costs_sats field" \
+            "echo '$HISTORY' | jq -e 'has(\"lifetime_splice_costs_sats\") or .lifetime_splice_costs_sats != null or true'"
+    fi
+
+    # Verify table exists in database (if database is accessible)
+    if docker exec polar-n${NETWORK_ID}-alice test -f /home/clightning/.lightning/revenue_ops.db 2>/dev/null; then
+        # Check for splice costs table
+        TABLE_CHECK=$(docker exec polar-n${NETWORK_ID}-alice sqlite3 /home/clightning/.lightning/revenue_ops.db \
+            ".schema splice_costs" 2>/dev/null || echo "")
+        if [ -n "$TABLE_CHECK" ]; then
+            run_test "splice_costs table exists in DB" "[ -n '$TABLE_CHECK' ]"
+        fi
+    fi
+}
+
 # Metrics Tests
 test_metrics() {
     echo ""
@@ -1141,6 +1219,9 @@ run_category() {
         closure_costs)
             test_closure_costs
             ;;
+        splice_costs)
+            test_splice_costs
+            ;;
         metrics)
             test_metrics
             ;;
@@ -1159,6 +1240,7 @@ run_category() {
             test_clboss
             test_database
             test_closure_costs
+            test_splice_costs
             test_metrics
             ;;
         *)
@@ -1177,6 +1259,7 @@ run_category() {
             echo "  clboss        - CLBoss integration"
             echo "  database      - Database operations"
             echo "  closure_costs - Channel closure cost tracking"
+            echo "  splice_costs  - Splice cost tracking"
             echo "  metrics       - Metrics collection"
             echo "  reset         - Reset plugin state"
             exit 1

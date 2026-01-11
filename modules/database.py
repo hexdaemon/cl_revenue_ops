@@ -478,6 +478,26 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_channels_peer ON closed_channels(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_channels_time ON closed_channels(closed_at)")
 
+        # Splice Costs table (Accounting v2.0)
+        # Tracks on-chain fees for splice-in and splice-out operations
+        # Splices modify channel capacity without closing/reopening
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS splice_costs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                splice_type TEXT NOT NULL,  -- 'splice_in' or 'splice_out'
+                amount_sats INTEGER NOT NULL,  -- Amount added (positive) or removed (negative)
+                fee_sats INTEGER NOT NULL,
+                old_capacity_sats INTEGER,
+                new_capacity_sats INTEGER,
+                txid TEXT,
+                timestamp INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_splice_costs_channel ON splice_costs(channel_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_splice_costs_time ON splice_costs(timestamp)")
+
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
         try:
@@ -2253,6 +2273,12 @@ class Database:
         ).fetchone()
         total_closure_cost_sats = closure_row["total"] if closure_row else 0
 
+        # Total splice costs from splice_costs table (Accounting v2.0)
+        splice_row = conn.execute(
+            "SELECT COALESCE(SUM(fee_sats), 0) as total FROM splice_costs"
+        ).fetchone()
+        total_splice_cost_sats = splice_row["total"] if splice_row else 0
+
         # Current forward count from forwards table
         count_row = conn.execute(
             "SELECT COUNT(*) as total FROM forwards"
@@ -2273,6 +2299,7 @@ class Database:
             "total_rebalance_cost_sats": total_rebalance_cost_sats,
             "total_opening_cost_sats": total_opening_cost_sats,
             "total_closure_cost_sats": total_closure_cost_sats,  # Accounting v2.0
+            "total_splice_cost_sats": total_splice_cost_sats,  # Accounting v2.0
             "total_forwards": total_forwards
         }
     
@@ -2566,6 +2593,127 @@ class Database:
             "total_forwards": 0,
             "total_net_pnl": 0,
             "avg_days_open": 0
+        }
+
+    # =========================================================================
+    # Splice Cost Tracking (Accounting v2.0)
+    # =========================================================================
+
+    def record_splice(
+        self,
+        channel_id: str,
+        peer_id: str,
+        splice_type: str,
+        amount_sats: int,
+        fee_sats: int,
+        old_capacity_sats: Optional[int] = None,
+        new_capacity_sats: Optional[int] = None,
+        txid: Optional[str] = None
+    ) -> bool:
+        """
+        Record a splice operation and its on-chain cost.
+
+        Splices modify channel capacity without closing/reopening the channel.
+        This tracks the on-chain fees for accurate P&L accounting.
+
+        Args:
+            channel_id: The channel short ID (SCID)
+            peer_id: The peer node ID
+            splice_type: Type of splice ('splice_in' or 'splice_out')
+            amount_sats: Amount added (positive for splice_in) or removed (negative for splice_out)
+            fee_sats: On-chain fee paid for the splice transaction
+            old_capacity_sats: Channel capacity before splice
+            new_capacity_sats: Channel capacity after splice
+            txid: The splice transaction ID
+
+        Returns:
+            True if recorded successfully, False otherwise
+        """
+        try:
+            conn = self._get_connection()
+            now = int(time.time())
+
+            conn.execute("""
+                INSERT INTO splice_costs
+                (channel_id, peer_id, splice_type, amount_sats, fee_sats,
+                 old_capacity_sats, new_capacity_sats, txid, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (channel_id, peer_id, splice_type, amount_sats, fee_sats,
+                  old_capacity_sats, new_capacity_sats, txid, now))
+            conn.commit()
+
+            self.plugin.log(
+                f"Recorded splice for {channel_id}: type={splice_type}, "
+                f"amount={amount_sats} sats, fee={fee_sats} sats",
+                level='info'
+            )
+            return True
+
+        except Exception as e:
+            self.plugin.log(f"Error recording splice for {channel_id}: {e}", level='error')
+            return False
+
+    def get_channel_splice_history(self, channel_id: str) -> List[Dict[str, Any]]:
+        """
+        Get splice history for a specific channel.
+
+        Args:
+            channel_id: The channel short ID
+
+        Returns:
+            List of splice records, ordered by timestamp (most recent first)
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM splice_costs
+            WHERE channel_id = ?
+            ORDER BY timestamp DESC
+        """, (channel_id,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_total_splice_costs(self) -> int:
+        """
+        Get the total splice costs across all channels.
+
+        Returns:
+            Total splice costs in sats
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(fee_sats), 0) as total
+            FROM splice_costs
+        """).fetchone()
+
+        return row["total"] if row else 0
+
+    def get_splice_summary(self) -> Dict[str, Any]:
+        """
+        Get summary statistics for all splice operations.
+
+        Returns:
+            Dict with aggregate statistics for splices
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT
+                COUNT(*) as splice_count,
+                COALESCE(SUM(CASE WHEN splice_type = 'splice_in' THEN 1 ELSE 0 END), 0) as splice_in_count,
+                COALESCE(SUM(CASE WHEN splice_type = 'splice_out' THEN 1 ELSE 0 END), 0) as splice_out_count,
+                COALESCE(SUM(CASE WHEN splice_type = 'splice_in' THEN amount_sats ELSE 0 END), 0) as total_splice_in_sats,
+                COALESCE(SUM(CASE WHEN splice_type = 'splice_out' THEN ABS(amount_sats) ELSE 0 END), 0) as total_splice_out_sats,
+                COALESCE(SUM(fee_sats), 0) as total_fees_sats
+            FROM splice_costs
+        """).fetchone()
+
+        return dict(row) if row else {
+            "splice_count": 0,
+            "splice_in_count": 0,
+            "splice_out_count": 0,
+            "total_splice_in_sats": 0,
+            "total_splice_out_sats": 0,
+            "total_fees_sats": 0
         }
 
     # =========================================================================

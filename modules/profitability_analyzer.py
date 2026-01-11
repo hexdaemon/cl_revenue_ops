@@ -698,8 +698,9 @@ class ChannelProfitabilityAnalyzer:
                 - lifetime_revenue_sats: Total routing fees earned
                 - lifetime_opening_costs_sats: Total channel opening fees
                 - lifetime_closure_costs_sats: Total channel closure fees (Accounting v2.0)
+                - lifetime_splice_costs_sats: Total splice fees (Accounting v2.0)
                 - lifetime_rebalance_costs_sats: Total rebalancing fees paid
-                - lifetime_total_costs_sats: Opening + Closure + Rebalance costs
+                - lifetime_total_costs_sats: Opening + Closure + Splice + Rebalance costs
                 - lifetime_net_profit_sats: Revenue - Total Costs
                 - lifetime_roi_percent: ROI percentage
                 - lifetime_forward_count: Total number of forwards
@@ -711,15 +712,17 @@ class ChannelProfitabilityAnalyzer:
         # Convert revenue from msat to sats
         lifetime_revenue_sats = stats["total_revenue_msat"] // 1000
 
-        # Get costs (including closure costs - Accounting v2.0)
+        # Get costs (including closure and splice costs - Accounting v2.0)
         lifetime_opening_costs_sats = stats["total_opening_cost_sats"]
         lifetime_closure_costs_sats = stats.get("total_closure_cost_sats", 0)
+        lifetime_splice_costs_sats = stats.get("total_splice_cost_sats", 0)
         lifetime_rebalance_costs_sats = stats["total_rebalance_cost_sats"]
 
-        # Calculate totals (now includes closure costs)
+        # Calculate totals (now includes closure and splice costs)
         lifetime_total_costs_sats = (
             lifetime_opening_costs_sats +
             lifetime_closure_costs_sats +
+            lifetime_splice_costs_sats +
             lifetime_rebalance_costs_sats
         )
         lifetime_net_profit_sats = lifetime_revenue_sats - lifetime_total_costs_sats
@@ -740,6 +743,7 @@ class ChannelProfitabilityAnalyzer:
             "lifetime_revenue_sats": lifetime_revenue_sats,
             "lifetime_opening_costs_sats": lifetime_opening_costs_sats,
             "lifetime_closure_costs_sats": lifetime_closure_costs_sats,
+            "lifetime_splice_costs_sats": lifetime_splice_costs_sats,
             "lifetime_rebalance_costs_sats": lifetime_rebalance_costs_sats,
             "lifetime_total_costs_sats": lifetime_total_costs_sats,
             "lifetime_net_profit_sats": lifetime_net_profit_sats,
