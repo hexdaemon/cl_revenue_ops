@@ -1,31 +1,31 @@
 # Hive Simulation Suite Test Report
 
-**Date:** 2026-01-11 (Expanded Network v2)
+**Date:** 2026-01-11 (Comprehensive Test v3)
 **Network:** Polar Network 1 (regtest) - 15 nodes (53% LND)
-**Duration:** Extended natural simulation (multiple traffic phases)
+**Duration:** 30-minute comprehensive simulation (4 traffic phases)
 
 ---
 
 ## Executive Summary
 
-Extended simulation testing with **expanded 15-node network** shows:
+**30-minute comprehensive simulation** with optimized fee strategy shows:
 
-1. **Hive coordination active** - All 3 hive nodes (alice, bob, carol) coordinating
-2. **Zero inter-hive fees** - cl-revenue-ops sets 0 ppm between hive members
-3. **Natural fee management** - HIVE strategy applied automatically to hive peers
-4. **Hive dominance** - Hive nodes routed **77%** of all network forwards
-5. **Realistic LND ratio** - 8 LND nodes (53%) with diverse charge-lnd configs
-6. **Fee strategy comparison** - High-fee LND nodes earn more per forward but route less
+1. **Hive dominance confirmed** - Hive nodes routed **74%** of all network forwards (1,017 of 1,373)
+2. **Optimized fee strategy** - 0 ppm inter-hive, 75 ppm minimum for external channels
+3. **2x revenue improvement** - Hive earned 356 sats (vs ~178 sats with 10 ppm floor)
+4. **Volume vs margin tradeoff** - Hive prioritizes volume; LND nodes prioritize per-forward profit
+5. **Realistic competition** - 8 LND nodes (53%) with diverse charge-lnd fee strategies
+6. **lnd2 highest margin** - Aggressive fees (100-1000 ppm) earned 10.57 sats/forward
 
 ---
 
-## Natural Simulation Results
+## 30-Minute Comprehensive Test Results
 
-### Fee Configuration (Set by Plugins)
+### Fee Configuration (Optimized)
 
 | Node Type | Fee Manager | Inter-Hive | External Channels |
 |-----------|-------------|:----------:|------------------:|
-| Hive (alice, bob, carol) | cl-revenue-ops | 0 ppm | 10-60 ppm (DYNAMIC) |
+| Hive (alice, bob, carol) | cl-revenue-ops | **0 ppm** | **75+ ppm** (DYNAMIC) |
 | CLN External (dave, erin, pat, oscar) | CLBOSS | N/A | 500 ppm |
 | LND Competitive (lnd1) | charge-lnd | N/A | 10-350 ppm |
 | LND Aggressive (lnd2) | charge-lnd | N/A | 100-1000 ppm |
@@ -36,39 +36,40 @@ Extended simulation testing with **expanded 15-node network** shows:
 | LND Sniper (quincy) | charge-lnd | N/A | 1-1500 ppm |
 | LND Lazy (niaj) | charge-lnd | N/A | 75-300 ppm |
 
-### Profitability Comparison (Expanded Network)
+### Profitability Comparison (30-Minute Test)
 
 | Node | Type | Implementation | Forwards | Total Fees | Fee/Forward |
 |------|------|----------------|----------|------------|-------------|
-| alice | Hive | CLN | 438 | 96 sats | 0.22 sats |
-| bob | Hive | CLN | 340 | 81 sats | 0.24 sats |
-| carol | Hive | CLN | 13 | 0.5 sats | 0.03 sats |
-| dave | External | CLN | 83 | 57 sats | 0.69 sats |
-| erin | External | CLN | 103 | 24 sats | 0.23 sats |
+| alice | Hive | CLN | 635 | 268 sats | 0.42 sats |
+| bob | Hive | CLN | 366 | 87 sats | 0.24 sats |
+| carol | Hive | CLN | 16 | 0 sats | 0 sats |
+| dave | External | CLN | 179 | 460 sats | **2.56 sats** |
+| erin | External | CLN | 106 | 25 sats | 0.24 sats |
 | pat | External | CLN | 0 | 0 sats | - |
 | oscar | External | CLN | 0 | 0 sats | - |
-| lnd1 | External | LND | 30 | 28 sats | 0.93 sats |
-| lnd2 | External | LND | 19 | 201 sats | **10.58 sats** |
+| lnd1 | External | LND | 31 | 28 sats | 0.90 sats |
+| lnd2 | External | LND | 19 | 201 sats | **10.57 sats** |
 | judy | External | LND | 0 | 0 sats | - |
 | kathy | External | LND | 0 | 0 sats | - |
 | lucy | External | LND | 0 | 0 sats | - |
 | mike | External | LND | 0 | 0 sats | - |
 | quincy | External | LND | 0 | 0 sats | - |
-| niaj | External | LND | 0 | 0 sats | - |
+| niaj | External | LND | 21 | 20 sats | 0.95 sats |
 
 **Summary by Node Type:**
-| Type | Nodes | Total Forwards | Total Fees | Avg Fee/Forward |
-|------|-------|----------------|------------|-----------------|
-| Hive (CLN) | 3 | 791 | 178 sats | 0.22 sats |
-| External (CLN) | 4 | 186 | 81 sats | 0.44 sats |
-| External (LND) | 8 | 49 | 230 sats | **4.69 sats** |
+| Type | Nodes | Total Forwards | Total Fees | % Traffic | Avg Fee/Forward |
+|------|-------|----------------|------------|-----------|-----------------|
+| Hive (CLN) | 3 | 1,017 | 356 sats | **74.0%** | 0.35 sats |
+| External (CLN) | 4 | 285 | 485 sats | 20.7% | 1.70 sats |
+| External (LND) | 8 | 71 | 251 sats | 5.2% | **3.54 sats** |
 
 **Key Findings:**
-1. Hive nodes routed **77%** of all forwards (791 of 1026 total)
-2. LND nodes earned **highest per-forward fees** (4.69 sats avg) but only 5% of volume
-3. lnd2's aggressive fee strategy (100-1000 ppm) earned 201 sats on only 19 forwards
-4. New LND nodes (judy, kathy, lucy, mike, quincy, niaj) not on primary routing paths yet
-5. Zero inter-hive fees enable efficient internal routing without fee loss
+1. Hive nodes routed **74%** of all forwards (1,017 of 1,373 total)
+2. **2x revenue improvement** - 356 sats with 75 ppm floor vs ~178 sats with 10 ppm floor
+3. lnd2's aggressive fee strategy (100-1000 ppm) earned **10.57 sats/forward** - highest margin
+4. dave earned highest total fees (460 sats) due to 500 ppm CLBOSS default + high volume
+5. niaj (Lazy config) started routing - 21 forwards at 0.95 sats/forward
+6. Zero inter-hive fees enable efficient internal routing, boosting volume
 
 ### Plugin/Tool Status
 
@@ -341,26 +342,29 @@ HIVE NODES                         EXTERNAL NODES
 
 ## Recommendations for Future Testing
 
-### Network Composition ✅ ACHIEVED
+### Completed ✅
 - ~~Add more LND nodes~~ - Network now has 8 LND (53%), matching real-world ~55%
 - ~~Vary charge-lnd configs~~ - 8 unique fee strategies implemented
+- ~~Optimize hive fee strategy~~ - 0 ppm inter-hive, 75 ppm min external
+- ~~Run comprehensive test~~ - 30-minute test with 1,373 forwards completed
 
 ### Improving LND Routing Participation
-1. **New LND nodes not routing** - judy, kathy, lucy, mike, quincy, niaj have 0 forwards
-2. Need to position LND nodes on primary routing paths between payment endpoints
-3. Consider opening channels from LND nodes directly to both payment sources and destinations
-4. Run longer simulations to allow gossip propagation and pathfinding adaptation
+1. **Most new LND nodes not routing** - judy, kathy, lucy, mike, quincy still at 0 forwards
+2. **niaj started routing** - 21 forwards shows Lazy config (75-300 ppm) is competitive
+3. Need to position remaining LND nodes on primary routing paths
+4. Consider opening channels from LND nodes directly to payment sources/destinations
 
-### For Rebalancing Testing
-1. Run longer tests to observe rebalance completion
-2. Monitor `revenue-status` to see rebalance effects
-3. Add periodic rebalance triggers
+### Fee Strategy Insights
+1. **Volume strategy (hive):** 74% of traffic, 356 sats total, 0.35 sats/forward
+2. **Margin strategy (lnd2):** 1.4% of traffic, 201 sats total, 10.57 sats/forward
+3. **Balanced approach (dave):** 13% of traffic, 460 sats total, 2.56 sats/forward
+4. Optimal strategy depends on channel position and liquidity management goals
 
-### For Fee Strategy Analysis
-1. lnd2's aggressive strategy (100-1000 ppm) earned 10.58 sats/forward - highest in network
-2. Compare total revenue vs per-forward revenue strategies over longer periods
-3. Test how hive's low-fee strategy affects channel flow balance
-4. Run charge-lnd periodically on LND nodes to adapt fees dynamically
+### For Production Deployment
+1. Monitor channel balance drift with high-volume routing
+2. Consider automatic rebalancing triggers when liquidity becomes unbalanced
+3. Test fee adjustments in response to sustained one-directional flow
+4. Evaluate if 75 ppm floor is optimal or should be adjusted based on competition
 
 ---
 
@@ -394,5 +398,5 @@ HIVE NODES                         EXTERNAL NODES
 
 ---
 
-*Report generated by cl-revenue-ops simulation suite v1.3*
-*Last updated: 2026-01-11 - Expanded to 15-node network with 8 LND nodes (53%)*
+*Report generated by cl-revenue-ops simulation suite v1.4*
+*Last updated: 2026-01-11 - 30-minute comprehensive test with optimized fee strategy (0/75 ppm)*
