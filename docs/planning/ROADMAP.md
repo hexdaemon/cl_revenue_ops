@@ -292,5 +292,57 @@ Six security-hardened improvements for policy management:
     - Added `fee_multiplier_min REAL`, `fee_multiplier_max REAL`, `expires_at INTEGER` columns.
     - Backwards-compatible with existing policies.
 
+## Phase 11: Accounting v2.0 (Channel Closure Cost Tracking)
+*Status: COMPLETED (v1.8.0)*
+*Objective: Fix overstated P&L by tracking channel closure costs that were previously missing from financial reports.*
+
+### v1.8.0: Channel Closure Cost Tracking ✅ COMPLETED
+
+Channel closure costs were the missing piece in accurate P&L accounting. Previously, the formula was:
+```
+Net P&L = Revenue - (Opening Costs + Rebalance Costs)
+```
+
+Now the complete formula is:
+```
+Net P&L = Revenue - (Opening Costs + Closure Costs + Rebalance Costs)
+```
+
+- [x] **Channel State Change Subscription**:
+    - Subscribe to `channel_state_changed` CLN notification.
+    - Detect closure states: `ONCHAIN`, `CLOSED`, `FUNDING_SPEND_SEEN`, `CLOSINGD_COMPLETE`.
+    - Classify close type: `mutual`, `local_unilateral`, `remote_unilateral`.
+
+- [x] **Bookkeeper Integration for On-Chain Fees**:
+    - Query `bkpr-listaccountevents` for actual closure fees.
+    - Extract `onchain_fee` events from channel account.
+    - Separate base closure fees from HTLC sweep fees.
+    - Security: Fallback to `ChainCostDefaults.CHANNEL_CLOSE_COST_SATS` if unavailable.
+
+- [x] **Channel Closure Costs Table**:
+    - New `channel_closure_costs` table with: `channel_id`, `peer_id`, `close_type`,
+      `closure_fee_sats`, `htlc_sweep_fee_sats`, `penalty_fee_sats`, `total_closure_cost_sats`.
+    - Tracks `resolution_complete` flag for force close resolution progress.
+    - Methods: `record_channel_closure()`, `get_channel_closure_cost()`, `get_total_closure_costs()`.
+
+- [x] **Closed Channels History Table**:
+    - New `closed_channels` table preserves complete P&L for closed channels.
+    - Fields: `capacity_sats`, `opened_at`, `closed_at`, `open_cost_sats`, `closure_cost_sats`,
+      `total_revenue_sats`, `total_rebalance_cost_sats`, `forward_count`, `net_pnl_sats`, `days_open`.
+    - Methods: `record_closed_channel_history()`, `get_closed_channels_summary()`.
+
+- [x] **Updated Lifetime Stats**:
+    - `get_lifetime_stats()` now returns `total_closure_cost_sats`.
+    - P&L formula corrected across all reports.
+
+- [x] **Profitability Analyzer Updates**:
+    - `get_lifetime_report()` includes `lifetime_closure_costs_sats`.
+    - Returns `closed_channels_summary` with aggregate stats.
+
+- [x] **Archive on Channel Close**:
+    - `_archive_closed_channel()` captures complete P&L before data is orphaned.
+    - Queries `listclosedchannels` (CLN v23.11+) for capacity.
+    - Preserves historical data for accurate lifetime reporting.
+
 ---
 *Roadmap updated: January 11, 2026*

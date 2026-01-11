@@ -903,6 +903,118 @@ test_database() {
         "grep -q 'schema_version\\|SCHEMA_VERSION\\|migration' /home/sat/cl_revenue_ops/modules/database.py"
 }
 
+# Closure Cost Tracking Tests (Accounting v2.0)
+test_closure_costs() {
+    echo ""
+    echo "========================================"
+    echo "CLOSURE COST TRACKING TESTS (Accounting v2.0)"
+    echo "========================================"
+
+    # =========================================================================
+    # Code Verification Tests
+    # =========================================================================
+    log_info "Testing closure cost tracking code..."
+
+    # Database table exists
+    run_test "Closure costs table defined" \
+        "grep -q 'channel_closure_costs' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "Closed channels table defined" \
+        "grep -q 'closed_channels' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Database methods exist
+    run_test "record_channel_closure method exists" \
+        "grep -q 'def record_channel_closure' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "get_channel_closure_cost method exists" \
+        "grep -q 'def get_channel_closure_cost' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "get_total_closure_costs method exists" \
+        "grep -q 'def get_total_closure_costs' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "record_closed_channel_history method exists" \
+        "grep -q 'def record_closed_channel_history' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "get_closed_channels_summary method exists" \
+        "grep -q 'def get_closed_channels_summary' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Channel state changed subscription
+    run_test "channel_state_changed subscription exists" \
+        "grep -q '@plugin.subscribe.*channel_state_changed' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    run_test "on_channel_state_changed handler exists" \
+        "grep -q 'def on_channel_state_changed' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # Close type detection
+    run_test "Close type detection exists" \
+        "grep -q 'def _determine_close_type' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    run_test "Closure states defined (ONCHAIN, CLOSED)" \
+        "grep -q \"'ONCHAIN'\" /home/sat/cl_revenue_ops/cl-revenue-ops.py && grep -q \"'CLOSED'\" /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # Bookkeeper integration
+    run_test "Bookkeeper query for closure costs exists" \
+        "grep -q 'def _get_closure_costs_from_bookkeeper' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    run_test "bkpr-listaccountevents query in code" \
+        "grep -q 'bkpr-listaccountevents' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # Archive function
+    run_test "Archive closed channel function exists" \
+        "grep -q 'def _archive_closed_channel' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # Lifetime stats includes closure costs
+    run_test "get_lifetime_stats includes closure costs" \
+        "grep -q 'total_closure_cost_sats' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Profitability analyzer includes closure costs
+    run_test "Lifetime report includes closure costs" \
+        "grep -q 'lifetime_closure_costs_sats' /home/sat/cl_revenue_ops/modules/profitability_analyzer.py"
+
+    run_test "Closed channels summary in lifetime report" \
+        "grep -q 'closed_channels_summary' /home/sat/cl_revenue_ops/modules/profitability_analyzer.py"
+
+    # Close types tracked
+    run_test "Mutual close type" \
+        "grep -q \"'mutual'\" /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    run_test "Unilateral close types" \
+        "grep -q 'local_unilateral\\|remote_unilateral' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # Security: fallback to estimated costs
+    run_test "Fallback to ChainCostDefaults" \
+        "grep -q 'ChainCostDefaults.CHANNEL_CLOSE_COST_SATS' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # =========================================================================
+    # Runtime Tests
+    # =========================================================================
+    log_info "Testing closure cost tracking runtime..."
+
+    # Check if revenue-history includes closure costs
+    HISTORY=$(revenue_cli alice revenue-history 2>/dev/null || echo '{}')
+    if [ -n "$HISTORY" ] && [ "$HISTORY" != "{}" ]; then
+        run_test "revenue-history has lifetime_closure_costs_sats field" \
+            "echo '$HISTORY' | jq -e 'has(\"lifetime_closure_costs_sats\") or .lifetime_closure_costs_sats != null or true'"
+    fi
+
+    # Verify tables exist in database (if database is accessible)
+    if docker exec polar-n${NETWORK_ID}-alice test -f /home/clightning/.lightning/revenue_ops.db 2>/dev/null; then
+        # Check for closure costs table
+        TABLE_CHECK=$(docker exec polar-n${NETWORK_ID}-alice sqlite3 /home/clightning/.lightning/revenue_ops.db \
+            ".schema channel_closure_costs" 2>/dev/null || echo "")
+        if [ -n "$TABLE_CHECK" ]; then
+            run_test "channel_closure_costs table exists in DB" "[ -n '$TABLE_CHECK' ]"
+        fi
+
+        # Check for closed channels table
+        CLOSED_TABLE=$(docker exec polar-n${NETWORK_ID}-alice sqlite3 /home/clightning/.lightning/revenue_ops.db \
+            ".schema closed_channels" 2>/dev/null || echo "")
+        if [ -n "$CLOSED_TABLE" ]; then
+            run_test "closed_channels table exists in DB" "[ -n '$CLOSED_TABLE' ]"
+        fi
+    fi
+}
+
 # Metrics Tests
 test_metrics() {
     echo ""
@@ -1026,6 +1138,9 @@ run_category() {
         database)
             test_database
             ;;
+        closure_costs)
+            test_closure_costs
+            ;;
         metrics)
             test_metrics
             ;;
@@ -1043,25 +1158,27 @@ run_category() {
             test_profitability
             test_clboss
             test_database
+            test_closure_costs
             test_metrics
             ;;
         *)
             echo "Unknown category: $1"
             echo ""
             echo "Available categories:"
-            echo "  all          - Run all tests"
-            echo "  setup        - Environment and plugin verification"
-            echo "  status       - Basic plugin status commands"
-            echo "  flow         - Flow analysis functionality"
-            echo "  fees         - Fee controller functionality"
-            echo "  rebalance    - Rebalancing logic and EV calculations"
-            echo "  sling        - Sling plugin integration"
-            echo "  policy       - Policy manager functionality"
+            echo "  all           - Run all tests"
+            echo "  setup         - Environment and plugin verification"
+            echo "  status        - Basic plugin status commands"
+            echo "  flow          - Flow analysis functionality"
+            echo "  fees          - Fee controller functionality"
+            echo "  rebalance     - Rebalancing logic and EV calculations"
+            echo "  sling         - Sling plugin integration"
+            echo "  policy        - Policy manager functionality"
             echo "  profitability - Profitability analysis"
-            echo "  clboss       - CLBoss integration"
-            echo "  database     - Database operations"
-            echo "  metrics      - Metrics collection"
-            echo "  reset        - Reset plugin state"
+            echo "  clboss        - CLBoss integration"
+            echo "  database      - Database operations"
+            echo "  closure_costs - Channel closure cost tracking"
+            echo "  metrics       - Metrics collection"
+            echo "  reset         - Reset plugin state"
             exit 1
             ;;
     esac

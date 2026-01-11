@@ -2535,35 +2535,316 @@ def on_peer_connect(plugin: Plugin, **kwargs):
 def on_peer_disconnect(plugin: Plugin, **kwargs):
     """
     Notification when a peer disconnects.
-    
+
     Records the disconnection event for uptime tracking.
     """
     if database is None:
         return
-    
+
     # Log full structure for debugging
     plugin.log(f"Disconnect notification: {kwargs}", level='debug')
-    
+
     # Try multiple extraction methods for compatibility
     peer_id = None
-    
+
     # Method 1: Nested under 'disconnect' key
     if 'disconnect' in kwargs and isinstance(kwargs['disconnect'], dict):
         peer_id = kwargs['disconnect'].get('id')
-    
+
     # Method 2: Direct 'id' key
     if not peer_id and 'id' in kwargs:
         peer_id = kwargs['id']
-    
+
     # Method 3: Check for nested peer_id
     if not peer_id and 'disconnect' in kwargs and isinstance(kwargs['disconnect'], dict):
         peer_id = kwargs['disconnect'].get('peer_id')
-    
+
     if peer_id:
         database.record_connection_event(peer_id, "disconnected")
         plugin.log(f"Peer disconnected: {peer_id[:12]}...", level='debug')
     else:
         plugin.log(f"Disconnect event - could not extract peer_id from: {kwargs}", level='warn')
+
+
+@plugin.subscribe("channel_state_changed")
+def on_channel_state_changed(plugin: Plugin, **kwargs):
+    """
+    Notification when a channel changes state (Accounting v2.0).
+
+    This handler tracks channel closures to record on-chain costs for accurate P&L.
+    When a channel transitions to ONCHAIN or CLOSED state, we:
+    1. Query bookkeeper for actual on-chain fees
+    2. Record closure costs in the database
+    3. Archive the complete channel P&L history
+
+    States that indicate closure:
+    - ONCHAIN: Channel has gone to chain (unilateral close in progress)
+    - CLOSED: Channel is fully closed and resolved
+    - FUNDING_SPEND_SEEN: Funding output has been spent (close initiated)
+    """
+    if database is None:
+        return
+
+    # Extract event data - may be nested under 'channel_state_changed' key
+    event = kwargs.get('channel_state_changed', kwargs)
+
+    plugin.log(f"Channel state changed: {event}", level='debug')
+
+    # Extract channel information
+    peer_id = event.get('peer_id')
+    channel_id = event.get('channel_id')
+    new_state = event.get('new_state', '')
+    old_state = event.get('old_state', '')
+    cause = event.get('cause', 'unknown')
+
+    if not channel_id:
+        plugin.log(f"Channel state change - no channel_id in event: {event}", level='warn')
+        return
+
+    # Normalize channel_id format
+    channel_id = channel_id.replace(':', 'x')
+
+    # States indicating the channel is closing or closed
+    closure_states = {'ONCHAIN', 'CLOSED', 'FUNDING_SPEND_SEEN', 'CLOSINGD_COMPLETE'}
+
+    if new_state not in closure_states:
+        # Not a closure event, ignore
+        return
+
+    plugin.log(
+        f"Channel closure detected: {channel_id} state={new_state} cause={cause}",
+        level='info'
+    )
+
+    # Determine close type from state and cause
+    close_type = _determine_close_type(new_state, old_state, cause)
+
+    # Query bookkeeper for on-chain fees (if available)
+    closure_fee_sats = 0
+    htlc_sweep_fee_sats = 0
+    funding_txid = None
+    closing_txid = None
+
+    try:
+        # Try to get on-chain fee data from bookkeeper
+        closure_data = _get_closure_costs_from_bookkeeper(channel_id)
+        if closure_data:
+            closure_fee_sats = closure_data.get('closure_fee_sats', 0)
+            htlc_sweep_fee_sats = closure_data.get('htlc_sweep_fee_sats', 0)
+            funding_txid = closure_data.get('funding_txid')
+            closing_txid = closure_data.get('closing_txid')
+    except Exception as e:
+        plugin.log(f"Error querying bookkeeper for closure costs: {e}", level='warn')
+        # Fall back to estimated costs from config
+        from modules.config import ChainCostDefaults
+        closure_fee_sats = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+
+    # Record the closure cost
+    database.record_channel_closure(
+        channel_id=channel_id,
+        peer_id=peer_id or 'unknown',
+        close_type=close_type,
+        closure_fee_sats=closure_fee_sats,
+        htlc_sweep_fee_sats=htlc_sweep_fee_sats,
+        funding_txid=funding_txid,
+        closing_txid=closing_txid
+    )
+
+    # If the channel is fully closed, archive its P&L history
+    if new_state == 'CLOSED':
+        _archive_closed_channel(channel_id, peer_id, close_type, closing_txid)
+
+
+def _determine_close_type(new_state: str, old_state: str, cause: str) -> str:
+    """
+    Determine the type of channel closure from state transition.
+
+    Args:
+        new_state: The new channel state
+        old_state: The previous channel state
+        cause: The cause of the state change
+
+    Returns:
+        Close type: 'mutual', 'local_unilateral', 'remote_unilateral', or 'unknown'
+    """
+    cause_lower = cause.lower() if cause else ''
+
+    # Mutual close - both parties agreed
+    if 'mutual' in cause_lower or old_state == 'CLOSINGD_SIGEXCHANGE':
+        return 'mutual'
+
+    # Local initiated unilateral
+    if cause_lower in ('local', 'user'):
+        return 'local_unilateral'
+
+    # Remote initiated unilateral
+    if cause_lower in ('remote', 'protocol', 'onchain'):
+        return 'remote_unilateral'
+
+    # Check state transitions
+    if 'CLOSINGD' in old_state:
+        return 'mutual'
+
+    if new_state == 'ONCHAIN':
+        # Unilateral close - determine who initiated
+        if cause_lower == 'local':
+            return 'local_unilateral'
+        elif cause_lower == 'remote':
+            return 'remote_unilateral'
+
+    return 'unknown'
+
+
+def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Query bookkeeper for on-chain fees related to channel closure.
+
+    Uses bkpr-listaccountevents to find onchain_fee events for the channel.
+
+    Args:
+        channel_id: The channel short ID
+
+    Returns:
+        Dict with closure_fee_sats, htlc_sweep_fee_sats, funding_txid, closing_txid
+        or None if bookkeeper unavailable
+    """
+    global safe_plugin
+
+    if safe_plugin is None:
+        return None
+
+    try:
+        # Query bookkeeper for account events
+        # The account name for a channel is typically the channel_id
+        events = safe_plugin.rpc.call("bkpr-listaccountevents", {"account": channel_id})
+
+        if not events or 'events' not in events:
+            return None
+
+        closure_fee_sats = 0
+        htlc_sweep_fee_sats = 0
+        funding_txid = None
+        closing_txid = None
+
+        for event in events.get('events', []):
+            event_type = event.get('type', '')
+            tag = event.get('tag', '')
+
+            # Track funding transaction
+            if tag == 'channel_open':
+                funding_txid = event.get('txid')
+
+            # Track closing transaction and fees
+            if tag in ('channel_close', 'mutual_close', 'unilateral_close'):
+                closing_txid = event.get('txid')
+
+            # Accumulate on-chain fees
+            if event_type == 'onchain_fee':
+                # Fees are typically in msat, convert to sats
+                fee_msat = abs(event.get('credit_msat', 0) or event.get('debit_msat', 0))
+                fee_sats = fee_msat // 1000
+
+                # Categorize the fee
+                if 'htlc' in tag.lower() or 'sweep' in tag.lower():
+                    htlc_sweep_fee_sats += fee_sats
+                else:
+                    closure_fee_sats += fee_sats
+
+        return {
+            'closure_fee_sats': closure_fee_sats,
+            'htlc_sweep_fee_sats': htlc_sweep_fee_sats,
+            'funding_txid': funding_txid,
+            'closing_txid': closing_txid
+        }
+
+    except Exception as e:
+        # Bookkeeper might not be available or channel not found
+        plugin.log(f"Bookkeeper query failed for {channel_id}: {e}", level='debug')
+        return None
+
+
+def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type: str,
+                            closing_txid: Optional[str]) -> None:
+    """
+    Archive the complete P&L history for a closed channel.
+
+    This preserves all accounting data before the channel is forgotten,
+    ensuring accurate lifetime P&L calculations.
+
+    Args:
+        channel_id: The channel short ID
+        peer_id: The peer node ID
+        close_type: Type of closure
+        closing_txid: The closing transaction ID
+    """
+    global database, safe_plugin
+
+    if database is None:
+        return
+
+    try:
+        import time
+
+        # Get channel cost data (opening cost)
+        channel_cost = database.get_channel_cost(channel_id)
+        open_cost_sats = channel_cost.get('open_cost_sats', 0) if channel_cost else 0
+        opened_at = channel_cost.get('opened_at') if channel_cost else None
+        funding_txid = channel_cost.get('funding_txid') if channel_cost else None
+
+        # Get closure cost data
+        closure_cost = database.get_channel_closure_cost(channel_id)
+        closure_cost_sats = closure_cost.get('total_closure_cost_sats', 0) if closure_cost else 0
+
+        # Get channel P&L from current data
+        pnl = database.get_channel_pnl(channel_id, window_days=3650)  # 10 years = all time
+        total_revenue_sats = pnl.get('revenue_sats', 0)
+        total_rebalance_cost_sats = pnl.get('rebalance_cost_sats', 0)
+        forward_count = pnl.get('forward_count', 0)
+
+        # Try to get capacity from listpeers (may fail if already closed)
+        capacity_sats = 0
+        if safe_plugin:
+            try:
+                # Try listclosedchannels first (CLN v23.11+)
+                closed = safe_plugin.rpc.call("listclosedchannels")
+                for ch in closed.get('closedchannels', []):
+                    if ch.get('short_channel_id', '').replace(':', 'x') == channel_id:
+                        capacity_sats = ch.get('total_msat', 0) // 1000
+                        if not peer_id:
+                            peer_id = ch.get('peer_id')
+                        break
+            except Exception:
+                pass
+
+        now = int(time.time())
+
+        # Record the closed channel history
+        database.record_closed_channel_history(
+            channel_id=channel_id,
+            peer_id=peer_id or 'unknown',
+            capacity_sats=capacity_sats,
+            opened_at=opened_at,
+            closed_at=now,
+            close_type=close_type,
+            open_cost_sats=open_cost_sats,
+            closure_cost_sats=closure_cost_sats,
+            total_revenue_sats=total_revenue_sats,
+            total_rebalance_cost_sats=total_rebalance_cost_sats,
+            forward_count=forward_count,
+            funding_txid=funding_txid,
+            closing_txid=closing_txid
+        )
+
+        plugin.log(
+            f"Archived closed channel {channel_id}: "
+            f"revenue={total_revenue_sats}, costs={open_cost_sats + closure_cost_sats + total_rebalance_cost_sats}",
+            level='info'
+        )
+
+    except Exception as e:
+        plugin.log(f"Error archiving closed channel {channel_id}: {e}", level='error')
+        import traceback
+        plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
 
 
 # =============================================================================

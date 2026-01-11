@@ -688,35 +688,42 @@ class ChannelProfitabilityAnalyzer:
     def get_lifetime_report(self) -> Dict[str, Any]:
         """
         Get lifetime financial history report including closed channels.
-        
+
         Unlike get_summary() which only considers active channels,
         this method queries the database directly for ALL historical
         data to provide a true "Lifetime P&L" view.
-        
+
         Returns:
             Dictionary with lifetime financial metrics:
                 - lifetime_revenue_sats: Total routing fees earned
                 - lifetime_opening_costs_sats: Total channel opening fees
+                - lifetime_closure_costs_sats: Total channel closure fees (Accounting v2.0)
                 - lifetime_rebalance_costs_sats: Total rebalancing fees paid
-                - lifetime_total_costs_sats: Opening + Rebalance costs
+                - lifetime_total_costs_sats: Opening + Closure + Rebalance costs
                 - lifetime_net_profit_sats: Revenue - Total Costs
                 - lifetime_roi_percent: ROI percentage
                 - lifetime_forward_count: Total number of forwards
+                - closed_channels_summary: Summary of closed channel P&L
         """
         # Get aggregate stats from database (includes closed channels)
         stats = self.database.get_lifetime_stats()
-        
+
         # Convert revenue from msat to sats
         lifetime_revenue_sats = stats["total_revenue_msat"] // 1000
-        
-        # Get costs
+
+        # Get costs (including closure costs - Accounting v2.0)
         lifetime_opening_costs_sats = stats["total_opening_cost_sats"]
+        lifetime_closure_costs_sats = stats.get("total_closure_cost_sats", 0)
         lifetime_rebalance_costs_sats = stats["total_rebalance_cost_sats"]
-        
-        # Calculate totals
-        lifetime_total_costs_sats = lifetime_opening_costs_sats + lifetime_rebalance_costs_sats
+
+        # Calculate totals (now includes closure costs)
+        lifetime_total_costs_sats = (
+            lifetime_opening_costs_sats +
+            lifetime_closure_costs_sats +
+            lifetime_rebalance_costs_sats
+        )
         lifetime_net_profit_sats = lifetime_revenue_sats - lifetime_total_costs_sats
-        
+
         # Calculate ROI (avoid division by zero)
         if lifetime_total_costs_sats > 0:
             lifetime_roi_percent = round(
@@ -725,15 +732,20 @@ class ChannelProfitabilityAnalyzer:
         else:
             # No costs incurred - infinite ROI if any revenue, 0 otherwise
             lifetime_roi_percent = 100.0 if lifetime_revenue_sats > 0 else 0.0
-        
+
+        # Get closed channels summary (Accounting v2.0)
+        closed_summary = self.database.get_closed_channels_summary()
+
         return {
             "lifetime_revenue_sats": lifetime_revenue_sats,
             "lifetime_opening_costs_sats": lifetime_opening_costs_sats,
+            "lifetime_closure_costs_sats": lifetime_closure_costs_sats,
             "lifetime_rebalance_costs_sats": lifetime_rebalance_costs_sats,
             "lifetime_total_costs_sats": lifetime_total_costs_sats,
             "lifetime_net_profit_sats": lifetime_net_profit_sats,
             "lifetime_roi_percent": lifetime_roi_percent,
-            "lifetime_forward_count": stats["total_forwards"]
+            "lifetime_forward_count": stats["total_forwards"],
+            "closed_channels_summary": closed_summary
         }
 
     # =========================================================================

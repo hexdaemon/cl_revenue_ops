@@ -37,6 +37,7 @@ Automated test suite for the cl-revenue-ops plugin.
 | `profitability` | Profitability analysis |
 | `clboss` | CLBoss integration |
 | `database` | Database operations |
+| `closure_costs` | Channel closure cost tracking |
 | `metrics` | Metrics collection |
 | `reset` | Reset plugin state |
 | `all` | Run all tests |
@@ -127,10 +128,27 @@ Additional security features:
 
 All features are enabled by default and can be disabled via module constants in `policy_manager.py`.
 
+### Accounting v2.0: Channel Closure Cost Tracking
+Tracks channel closure costs for accurate P&L accounting:
+
+| Component | Description |
+|-----------|-------------|
+| **channel_state_changed subscription** | Detects when channels close |
+| **Bookkeeper integration** | Queries `bkpr-listaccountevents` for on-chain fees |
+| **Close type detection** | Classifies: mutual, local_unilateral, remote_unilateral |
+| **channel_closure_costs table** | Stores closure fees and HTLC sweep costs |
+| **closed_channels table** | Archives complete P&L for closed channels |
+| **Updated lifetime stats** | `get_lifetime_stats()` includes `total_closure_cost_sats` |
+
+Run closure cost tests:
+```bash
+./test.sh closure_costs 1
+```
+
 ### Profitability Analyzer
 - ROI calculation
 - Revenue tracking
-- Cost tracking
+- Cost tracking (including closure costs)
 
 ### CLBoss Integration
 - Status monitoring

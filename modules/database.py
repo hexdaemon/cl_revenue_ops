@@ -432,6 +432,52 @@ class Database:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_financial_snapshots_time ON financial_snapshots(timestamp)")
 
+        # Channel Closure Costs table (Accounting v2.0)
+        # Tracks on-chain fees paid when channels close (mutual or force close)
+        # This is the missing cost category that was causing overstated P&L
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_closure_costs (
+                channel_id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                close_type TEXT NOT NULL,  -- 'mutual', 'local_unilateral', 'remote_unilateral', 'unknown'
+                closure_fee_sats INTEGER NOT NULL DEFAULT 0,
+                htlc_sweep_fee_sats INTEGER NOT NULL DEFAULT 0,
+                penalty_fee_sats INTEGER NOT NULL DEFAULT 0,
+                total_closure_cost_sats INTEGER NOT NULL DEFAULT 0,
+                funding_txid TEXT,
+                closing_txid TEXT,
+                closed_at INTEGER NOT NULL,
+                resolution_complete INTEGER NOT NULL DEFAULT 0  -- 1 when all outputs resolved
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_closure_costs_peer ON channel_closure_costs(peer_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_closure_costs_time ON channel_closure_costs(closed_at)")
+
+        # Closed Channels History table (Accounting v2.0)
+        # Preserves complete P&L history for channels after they close
+        # Without this, closing a channel would orphan its accounting data
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS closed_channels (
+                channel_id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                capacity_sats INTEGER NOT NULL,
+                opened_at INTEGER,
+                closed_at INTEGER NOT NULL,
+                close_type TEXT NOT NULL,
+                open_cost_sats INTEGER NOT NULL DEFAULT 0,
+                closure_cost_sats INTEGER NOT NULL DEFAULT 0,
+                total_revenue_sats INTEGER NOT NULL DEFAULT 0,
+                total_rebalance_cost_sats INTEGER NOT NULL DEFAULT 0,
+                forward_count INTEGER NOT NULL DEFAULT 0,
+                net_pnl_sats INTEGER NOT NULL DEFAULT 0,
+                days_open INTEGER NOT NULL DEFAULT 0,
+                funding_txid TEXT,
+                closing_txid TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_channels_peer ON closed_channels(peer_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_channels_time ON closed_channels(closed_at)")
+
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
         try:
@@ -2200,7 +2246,13 @@ class Database:
             "SELECT COALESCE(SUM(open_cost_sats), 0) as total FROM channel_costs"
         ).fetchone()
         total_opening_cost_sats = opening_row["total"] if opening_row else 0
-        
+
+        # Total closure costs from channel_closure_costs table (Accounting v2.0)
+        closure_row = conn.execute(
+            "SELECT COALESCE(SUM(total_closure_cost_sats), 0) as total FROM channel_closure_costs"
+        ).fetchone()
+        total_closure_cost_sats = closure_row["total"] if closure_row else 0
+
         # Current forward count from forwards table
         count_row = conn.execute(
             "SELECT COUNT(*) as total FROM forwards"
@@ -2220,13 +2272,306 @@ class Database:
             "total_revenue_msat": total_revenue_msat,
             "total_rebalance_cost_sats": total_rebalance_cost_sats,
             "total_opening_cost_sats": total_opening_cost_sats,
+            "total_closure_cost_sats": total_closure_cost_sats,  # Accounting v2.0
             "total_forwards": total_forwards
         }
     
     # =========================================================================
+    # Channel Closure Cost Tracking (Accounting v2.0)
+    # =========================================================================
+
+    def record_channel_closure(
+        self,
+        channel_id: str,
+        peer_id: str,
+        close_type: str,
+        closure_fee_sats: int,
+        htlc_sweep_fee_sats: int = 0,
+        penalty_fee_sats: int = 0,
+        funding_txid: Optional[str] = None,
+        closing_txid: Optional[str] = None
+    ) -> bool:
+        """
+        Record channel closure costs for accurate P&L accounting.
+
+        This method is called when a channel transitions to ONCHAIN or CLOSED state.
+        It queries bookkeeper for actual on-chain fees and stores them.
+
+        Args:
+            channel_id: The channel short ID (SCID)
+            peer_id: The peer node ID
+            close_type: Type of closure ('mutual', 'local_unilateral', 'remote_unilateral', 'unknown')
+            closure_fee_sats: Base on-chain fee for the closing transaction
+            htlc_sweep_fee_sats: Additional fees for sweeping pending HTLCs
+            penalty_fee_sats: Penalty fees (if we were penalized - rare)
+            funding_txid: The original funding transaction ID
+            closing_txid: The closing transaction ID
+
+        Returns:
+            True if recorded successfully, False otherwise
+        """
+        try:
+            conn = self._get_connection()
+            now = int(time.time())
+
+            total_closure_cost = closure_fee_sats + htlc_sweep_fee_sats + penalty_fee_sats
+
+            conn.execute("""
+                INSERT OR REPLACE INTO channel_closure_costs
+                (channel_id, peer_id, close_type, closure_fee_sats, htlc_sweep_fee_sats,
+                 penalty_fee_sats, total_closure_cost_sats, funding_txid, closing_txid,
+                 closed_at, resolution_complete)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """, (channel_id, peer_id, close_type, closure_fee_sats, htlc_sweep_fee_sats,
+                  penalty_fee_sats, total_closure_cost, funding_txid, closing_txid, now))
+            conn.commit()
+
+            self.plugin.log(
+                f"Recorded closure cost for {channel_id}: {total_closure_cost} sats "
+                f"(type={close_type}, base={closure_fee_sats}, htlc_sweep={htlc_sweep_fee_sats})",
+                level='info'
+            )
+            return True
+
+        except Exception as e:
+            self.plugin.log(f"Error recording closure cost for {channel_id}: {e}", level='error')
+            return False
+
+    def update_closure_resolution(self, channel_id: str, additional_fees: int = 0) -> bool:
+        """
+        Update closure record when additional resolution occurs (HTLC sweeps, etc.).
+
+        Called when the bookkeeper reports additional on-chain activity for a closed channel.
+
+        Args:
+            channel_id: The channel short ID
+            additional_fees: Additional fees incurred during resolution
+
+        Returns:
+            True if updated successfully
+        """
+        try:
+            conn = self._get_connection()
+
+            if additional_fees > 0:
+                conn.execute("""
+                    UPDATE channel_closure_costs
+                    SET htlc_sweep_fee_sats = htlc_sweep_fee_sats + ?,
+                        total_closure_cost_sats = total_closure_cost_sats + ?
+                    WHERE channel_id = ?
+                """, (additional_fees, additional_fees, channel_id))
+
+            conn.commit()
+            return True
+
+        except Exception as e:
+            self.plugin.log(f"Error updating closure resolution for {channel_id}: {e}", level='error')
+            return False
+
+    def mark_closure_complete(self, channel_id: str) -> bool:
+        """
+        Mark a channel closure as fully resolved (all outputs swept).
+
+        Called when bookkeeper indicates all on-chain outputs are resolved.
+
+        Args:
+            channel_id: The channel short ID
+
+        Returns:
+            True if marked successfully
+        """
+        try:
+            conn = self._get_connection()
+            conn.execute("""
+                UPDATE channel_closure_costs
+                SET resolution_complete = 1
+                WHERE channel_id = ?
+            """, (channel_id,))
+            conn.commit()
+
+            self.plugin.log(f"Marked closure complete for {channel_id}", level='debug')
+            return True
+
+        except Exception as e:
+            self.plugin.log(f"Error marking closure complete for {channel_id}: {e}", level='error')
+            return False
+
+    def get_channel_closure_cost(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get closure cost details for a specific channel.
+
+        Args:
+            channel_id: The channel short ID
+
+        Returns:
+            Dict with closure cost details, or None if not found
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM channel_closure_costs WHERE channel_id = ?
+        """, (channel_id,)).fetchone()
+
+        return dict(row) if row else None
+
+    def get_total_closure_costs(self) -> int:
+        """
+        Get the total closure costs across all channels.
+
+        Returns:
+            Total closure costs in sats
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(total_closure_cost_sats), 0) as total
+            FROM channel_closure_costs
+        """).fetchone()
+
+        return row["total"] if row else 0
+
+    def record_closed_channel_history(
+        self,
+        channel_id: str,
+        peer_id: str,
+        capacity_sats: int,
+        opened_at: Optional[int],
+        closed_at: int,
+        close_type: str,
+        open_cost_sats: int,
+        closure_cost_sats: int,
+        total_revenue_sats: int,
+        total_rebalance_cost_sats: int,
+        forward_count: int,
+        funding_txid: Optional[str] = None,
+        closing_txid: Optional[str] = None
+    ) -> bool:
+        """
+        Record complete P&L history for a closed channel.
+
+        This preserves the accounting data for a channel after it closes,
+        ensuring accurate lifetime P&L calculations.
+
+        Args:
+            channel_id: The channel short ID
+            peer_id: The peer node ID
+            capacity_sats: Channel capacity
+            opened_at: Unix timestamp when channel opened (may be None)
+            closed_at: Unix timestamp when channel closed
+            close_type: Type of closure
+            open_cost_sats: On-chain fees paid to open
+            closure_cost_sats: On-chain fees paid to close
+            total_revenue_sats: Total routing fees earned
+            total_rebalance_cost_sats: Total rebalancing fees paid
+            forward_count: Number of successful forwards
+            funding_txid: Funding transaction ID
+            closing_txid: Closing transaction ID
+
+        Returns:
+            True if recorded successfully
+        """
+        try:
+            conn = self._get_connection()
+
+            # Calculate derived values
+            days_open = ((closed_at - opened_at) // 86400) if opened_at else 0
+            net_pnl = total_revenue_sats - (open_cost_sats + closure_cost_sats + total_rebalance_cost_sats)
+
+            conn.execute("""
+                INSERT OR REPLACE INTO closed_channels
+                (channel_id, peer_id, capacity_sats, opened_at, closed_at, close_type,
+                 open_cost_sats, closure_cost_sats, total_revenue_sats, total_rebalance_cost_sats,
+                 forward_count, net_pnl_sats, days_open, funding_txid, closing_txid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (channel_id, peer_id, capacity_sats, opened_at, closed_at, close_type,
+                  open_cost_sats, closure_cost_sats, total_revenue_sats, total_rebalance_cost_sats,
+                  forward_count, net_pnl, days_open, funding_txid, closing_txid))
+            conn.commit()
+
+            self.plugin.log(
+                f"Recorded closed channel history for {channel_id}: "
+                f"net_pnl={net_pnl} sats, days_open={days_open}",
+                level='info'
+            )
+            return True
+
+        except Exception as e:
+            self.plugin.log(f"Error recording closed channel history for {channel_id}: {e}", level='error')
+            return False
+
+    def get_closed_channel_history(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get P&L history for a closed channel.
+
+        Args:
+            channel_id: The channel short ID
+
+        Returns:
+            Dict with closed channel history, or None if not found
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM closed_channels WHERE channel_id = ?
+        """, (channel_id,)).fetchone()
+
+        return dict(row) if row else None
+
+    def get_all_closed_channels(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get history for all closed channels.
+
+        Args:
+            limit: Maximum number of records to return
+
+        Returns:
+            List of closed channel dicts, ordered by closure date (most recent first)
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM closed_channels
+            ORDER BY closed_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_closed_channels_summary(self) -> Dict[str, Any]:
+        """
+        Get summary statistics for all closed channels.
+
+        Returns:
+            Dict with aggregate statistics for closed channels
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT
+                COUNT(*) as channel_count,
+                COALESCE(SUM(capacity_sats), 0) as total_capacity,
+                COALESCE(SUM(open_cost_sats), 0) as total_open_costs,
+                COALESCE(SUM(closure_cost_sats), 0) as total_closure_costs,
+                COALESCE(SUM(total_revenue_sats), 0) as total_revenue,
+                COALESCE(SUM(total_rebalance_cost_sats), 0) as total_rebalance_costs,
+                COALESCE(SUM(forward_count), 0) as total_forwards,
+                COALESCE(SUM(net_pnl_sats), 0) as total_net_pnl,
+                COALESCE(AVG(days_open), 0) as avg_days_open
+            FROM closed_channels
+        """).fetchone()
+
+        return dict(row) if row else {
+            "channel_count": 0,
+            "total_capacity": 0,
+            "total_open_costs": 0,
+            "total_closure_costs": 0,
+            "total_revenue": 0,
+            "total_rebalance_costs": 0,
+            "total_forwards": 0,
+            "total_net_pnl": 0,
+            "avg_days_open": 0
+        }
+
+    # =========================================================================
     # Channel Failure Tracking Methods (Persistent Backoff)
     # =========================================================================
-    
+
     def get_failure_count(self, channel_id: str) -> Tuple[int, int]:
         """
         Get the failure count and last failure time for a channel.
