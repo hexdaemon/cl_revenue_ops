@@ -1,21 +1,21 @@
 # Hive Simulation Suite Test Report
 
-**Date:** 2026-01-11 (Updated)
-**Network:** Polar Network 1 (regtest)
+**Date:** 2026-01-11 (Expanded Network v2)
+**Network:** Polar Network 1 (regtest) - 15 nodes (53% LND)
 **Duration:** Extended natural simulation (multiple traffic phases)
 
 ---
 
 ## Executive Summary
 
-Extended simulation testing shows that **cl-hive and cl-revenue-ops are working correctly**:
+Extended simulation testing with **expanded 15-node network** shows:
 
 1. **Hive coordination active** - All 3 hive nodes (alice, bob, carol) coordinating
 2. **Zero inter-hive fees** - cl-revenue-ops sets 0 ppm between hive members
 3. **Natural fee management** - HIVE strategy applied automatically to hive peers
-4. **Profitability advantage** - Hive nodes routing 5x more payments than external nodes
-5. **CLBOSS integration** - Running on all CLN nodes (hive and non-hive)
-6. **LND competition** - charge-lnd installed on LND nodes for dynamic fee management
+4. **Hive dominance** - Hive nodes routed **77%** of all network forwards
+5. **Realistic LND ratio** - 8 LND nodes (53%) with diverse charge-lnd configs
+6. **Fee strategy comparison** - High-fee LND nodes earn more per forward but route less
 
 ---
 
@@ -26,34 +26,49 @@ Extended simulation testing shows that **cl-hive and cl-revenue-ops are working 
 | Node Type | Fee Manager | Inter-Hive | External Channels |
 |-----------|-------------|:----------:|------------------:|
 | Hive (alice, bob, carol) | cl-revenue-ops | 0 ppm | 10-60 ppm (DYNAMIC) |
-| CLN External (dave, erin) | CLBOSS | N/A | 500 ppm |
-| LND Competitive (lnd1) | charge-lnd | N/A | 10-150 ppm |
+| CLN External (dave, erin, pat, oscar) | CLBOSS | N/A | 500 ppm |
+| LND Competitive (lnd1) | charge-lnd | N/A | 10-350 ppm |
 | LND Aggressive (lnd2) | charge-lnd | N/A | 100-1000 ppm |
+| LND Conservative (judy) | charge-lnd | N/A | 200-400 ppm |
+| LND Balanced (kathy) | charge-lnd | N/A | 75-500 ppm |
+| LND Dynamic (lucy) | charge-lnd | N/A | 5-2000 ppm |
+| LND Whale (mike) | charge-lnd | N/A | 1-100 ppm |
+| LND Sniper (quincy) | charge-lnd | N/A | 1-1500 ppm |
+| LND Lazy (niaj) | charge-lnd | N/A | 75-300 ppm |
 
-### Profitability Comparison
+### Profitability Comparison (Expanded Network)
 
 | Node | Type | Implementation | Forwards | Total Fees | Fee/Forward |
 |------|------|----------------|----------|------------|-------------|
-| alice | Hive | CLN | 364 | 37.07 sats | 0.10 sats |
-| bob | Hive | CLN | 272 | 75.24 sats | 0.28 sats |
-| carol | Hive | CLN | 5 | 0 sats | 0 sats |
-| dave | External | CLN | 28 | 11.46 sats | 0.41 sats |
-| erin | External | CLN | 103 | 24.43 sats | 0.24 sats |
-| lnd1 | External | LND | 25 | 25.36 sats | 1.01 sats |
-| lnd2 | External | LND | 7 | 7.10 sats | 1.01 sats |
+| alice | Hive | CLN | 438 | 96 sats | 0.22 sats |
+| bob | Hive | CLN | 340 | 81 sats | 0.24 sats |
+| carol | Hive | CLN | 13 | 0.5 sats | 0.03 sats |
+| dave | External | CLN | 83 | 57 sats | 0.69 sats |
+| erin | External | CLN | 103 | 24 sats | 0.23 sats |
+| pat | External | CLN | 0 | 0 sats | - |
+| oscar | External | CLN | 0 | 0 sats | - |
+| lnd1 | External | LND | 30 | 28 sats | 0.93 sats |
+| lnd2 | External | LND | 19 | 201 sats | **10.58 sats** |
+| judy | External | LND | 0 | 0 sats | - |
+| kathy | External | LND | 0 | 0 sats | - |
+| lucy | External | LND | 0 | 0 sats | - |
+| mike | External | LND | 0 | 0 sats | - |
+| quincy | External | LND | 0 | 0 sats | - |
+| niaj | External | LND | 0 | 0 sats | - |
 
 **Summary by Node Type:**
 | Type | Nodes | Total Forwards | Total Fees | Avg Fee/Forward |
 |------|-------|----------------|------------|-----------------|
-| Hive (CLN) | 3 | 641 | 112.31 sats | 0.18 sats |
-| External (CLN) | 2 | 131 | 35.89 sats | 0.27 sats |
-| External (LND) | 2 | 32 | 32.46 sats | 1.01 sats |
+| Hive (CLN) | 3 | 791 | 178 sats | 0.22 sats |
+| External (CLN) | 4 | 186 | 81 sats | 0.44 sats |
+| External (LND) | 8 | 49 | 230 sats | **4.69 sats** |
 
 **Key Findings:**
-1. Hive nodes routed **5x more payments** than external CLN nodes and **20x more** than LND nodes
-2. Despite lower per-payment fees, hive nodes earned **3x more total fees** than external nodes combined
-3. LND nodes charge higher per-forward fees but route fewer payments
-4. Zero inter-hive fees enable efficient internal routing without fee loss
+1. Hive nodes routed **77%** of all forwards (791 of 1026 total)
+2. LND nodes earned **highest per-forward fees** (4.69 sats avg) but only 5% of volume
+3. lnd2's aggressive fee strategy (100-1000 ppm) earned 201 sats on only 19 forwards
+4. New LND nodes (judy, kathy, lucy, mike, quincy, niaj) not on primary routing paths yet
+5. Zero inter-hive fees enable efficient internal routing without fee loss
 
 ### Plugin/Tool Status
 
@@ -64,8 +79,16 @@ Extended simulation testing shows that **cl-hive and cl-revenue-ops are working 
 | carol | CLN v25.12 | v1.5.0 | v0.1.0-dev | CLBOSS v0.15.1 |
 | dave | CLN v25.12 | - | - | CLBOSS v0.15.1 |
 | erin | CLN v25.12 | - | - | CLBOSS v0.15.1 |
-| lnd1 | LND v0.20.0 | - | - | charge-lnd v0.3.1 |
-| lnd2 | LND v0.20.0 | - | - | charge-lnd v0.3.1 |
+| pat | CLN v25.12 | - | - | CLBOSS v0.15.1 |
+| oscar | CLN v25.12 | - | - | CLBOSS v0.15.1 |
+| lnd1 | LND v0.20.0 | - | - | charge-lnd (Competitive) |
+| lnd2 | LND v0.20.0 | - | - | charge-lnd (Aggressive) |
+| judy | LND v0.20.0 | - | - | charge-lnd (Conservative) |
+| kathy | LND v0.20.0 | - | - | charge-lnd (Balanced) |
+| lucy | LND v0.20.0 | - | - | charge-lnd (Dynamic) |
+| mike | LND v0.20.0 | - | - | charge-lnd (Whale) |
+| quincy | LND v0.20.0 | - | - | charge-lnd (Sniper) |
+| niaj | LND v0.20.0 | - | - | charge-lnd (Lazy) |
 
 ---
 
@@ -100,7 +123,7 @@ Extended simulation testing shows that **cl-hive and cl-revenue-ops are working 
 
 ### LND Fee Management (charge-lnd)
 
-LND nodes use charge-lnd for dynamic fee adjustment based on channel balance ratios.
+All 8 LND nodes use charge-lnd for dynamic fee adjustment based on channel balance ratios. Each node has a unique fee policy to simulate real-world variation.
 
 **lnd1 Configuration (Competitive):**
 | Policy | Balance Range | Base Fee | Fee PPM |
@@ -109,54 +132,94 @@ LND nodes use charge-lnd for dynamic fee adjustment based on channel balance rat
 | balanced | 15-85% local | 250 msat | 30-150 ppm |
 | saturated | > 85% local | 0 msat | 10 ppm |
 
-**lnd2 Configuration (Aggressive Profit-Maximizer):**
+**lnd2 Configuration (Aggressive):**
 | Policy | Balance Range | Base Fee | Fee PPM |
 |--------|---------------|----------|---------|
 | depleted | < 25% local | 5000 msat | 1000 ppm |
 | balanced | 25-75% local | 1000 msat | 200-600 ppm |
 | saturated | > 75% local | 500 msat | 100 ppm |
 
-**Current Fee Assignments:**
-| Node | Channel | Peer | Local % | Policy | Fee PPM |
-|------|---------|------|---------|--------|---------|
-| lnd1 | 493x1x0 | dave | 40% | balanced | 101 |
-| lnd1 | 314x1x0 | alice | 32% | balanced | 110 |
-| lnd1 | 457x2x0 | erin | 98% | saturated | 10 |
-| lnd1 | 457x5x0 | bob | 100% | saturated | 10 |
-| lnd1 | 517x1x0 | carol | 91% | saturated | 10 |
-| lnd2 | 445x1x0 | dave | 4% | depleted | 1000 |
-| lnd2 | 505x1x0 | alice | 69% | balanced | 324 |
-| lnd2 | 457x4x0 | alice | 99% | saturated | 100 |
-| lnd2 | 431x1x0 | carol | 95% | saturated | 100 |
+**judy Configuration (Conservative):**
+| Policy | Balance Range | Base Fee | Fee PPM |
+|--------|---------------|----------|---------|
+| depleted | < 20% local | 1000 msat | 400 ppm |
+| balanced | 20-80% local | 500 msat | 200-300 ppm |
+| saturated | > 80% local | 250 msat | 200 ppm |
 
-### Channel Topology After Simulation
+**kathy Configuration (Balanced):**
+| Policy | Balance Range | Base Fee | Fee PPM |
+|--------|---------------|----------|---------|
+| depleted | < 20% local | 1000 msat | 500 ppm |
+| balanced | 20-80% local | 500 msat | 75-300 ppm |
+| saturated | > 80% local | 100 msat | 75 ppm |
+
+**lucy Configuration (Dynamic):**
+| Policy | Balance Range | Base Fee | Fee PPM |
+|--------|---------------|----------|---------|
+| depleted | < 10% local | 10000 msat | 2000 ppm |
+| balanced | 10-90% local | 500 msat | 50-1000 ppm |
+| saturated | > 90% local | 0 msat | 5 ppm |
+
+**mike Configuration (Whale):**
+| Policy | Balance Range | Base Fee | Fee PPM |
+|--------|---------------|----------|---------|
+| depleted | < 30% local | 100 msat | 100 ppm |
+| balanced | 30-70% local | 50 msat | 25-50 ppm |
+| saturated | > 70% local | 0 msat | 1 ppm |
+
+**quincy Configuration (Sniper):**
+| Policy | Balance Range | Base Fee | Fee PPM |
+|--------|---------------|----------|---------|
+| depleted | < 5% local | 2000 msat | 1500 ppm |
+| low | 5-25% local | 1000 msat | 500-750 ppm |
+| balanced | 25-75% local | 500 msat | 100-300 ppm |
+| high | 75-95% local | 100 msat | 25-75 ppm |
+| saturated | > 95% local | 0 msat | 1 ppm |
+
+**niaj Configuration (Lazy):**
+| Policy | Balance Range | Base Fee | Fee PPM |
+|--------|---------------|----------|---------|
+| depleted | < 30% local | 1000 msat | 300 ppm |
+| balanced | 30-70% local | 500 msat | 150 ppm |
+| saturated | > 70% local | 250 msat | 75 ppm |
+
+### Channel Topology (Expanded 15-Node Network)
 
 ```
-HIVE NODES                         EXTERNAL NODES
-┌─────────────┐                   ┌──────────────┐
-│   alice     │                   │    dave      │
-│ ├─ 314x1x0 → lnd1 (10ppm)      │ ├─ 277x1x0 ← carol (500ppm)
-│ ├─ 243x1x0 ↔ bob (0ppm)        │ ├─ 406x1x0 → alice (500ppm)
-│ ├─ 414x1x0 ↔ carol (0ppm)      │ ├─ 406x2x0 → bob (500ppm)
-│ └─ 406x1x0 ← dave (10ppm)      │ └─ 289x1x0 ↔ erin (500ppm)
-└─────────────┘                   └──────────────┘
-
-┌─────────────┐                   ┌──────────────┐
-│    bob      │                   │    erin      │
-│ ├─ 243x1x0 ↔ alice (0ppm)      │ ├─ 289x1x0 ← dave (500ppm)
-│ ├─ 255x1x0 ↔ carol (0ppm)      │ └─ 406x3x0 → bob (500ppm)
-│ ├─ 406x2x0 ← dave (10ppm)      └──────────────┘
-│ └─ 406x3x0 ← erin (10ppm)
-└─────────────┘                   ┌──────────────┐
-                                  │    lnd2      │
-┌─────────────┐                   │ └─ 431x1x0 → carol (180ppm)
-│   carol     │                   └──────────────┘
-│ ├─ 255x1x0 ↔ bob (0ppm)
-│ ├─ 414x1x0 ↔ alice (0ppm)
-│ ├─ 431x1x0 ← lnd2 (180ppm)
-│ └─ 277x1x0 → dave (10ppm)
-└─────────────┘
+HIVE NODES (3)                     EXTERNAL CLN (4)              LND NODES (8)
+┌─────────────┐                   ┌─────────────┐              ┌─────────────┐
+│   alice     │                   │    dave     │              │    lnd1     │
+│  10 channels│◄─────────────────►│  11 channels│◄────────────►│  9 channels │
+│  (0ppm hive)│                   │  (500ppm)   │              │ (Competitive)│
+└─────────────┘                   └─────────────┘              └─────────────┘
+       │                                │                             │
+       │                                │                             │
+┌─────────────┐                   ┌─────────────┐              ┌─────────────┐
+│    bob      │                   │    erin     │              │    lnd2     │
+│  8 channels │◄─────────────────►│  8 channels │◄────────────►│  7 channels │
+│  (0ppm hive)│                   │  (500ppm)   │              │ (Aggressive) │
+└─────────────┘                   └─────────────┘              └─────────────┘
+       │                                │                             │
+       │                                │                             │
+┌─────────────┐                   ┌─────────────┐              ┌─────────────┐
+│   carol     │                   │    pat      │              │judy/kathy   │
+│  7 channels │◄─────────────────►│  3 channels │◄────────────►│  4 channels │
+│  (0ppm hive)│                   │  (500ppm)   │              │(Conserv/Bal)│
+└─────────────┘                   └─────────────┘              └─────────────┘
+                                        │                             │
+                                  ┌─────────────┐              ┌─────────────┐
+                                  │   oscar     │              │lucy/mike    │
+                                  │  3 channels │              │quincy/niaj  │
+                                  │  (500ppm)   │              │  2-3 chans  │
+                                  └─────────────┘              └─────────────┘
 ```
+
+**Network Statistics:**
+- Total nodes: 15 (7 CLN, 8 LND = 53% LND)
+- Total active channels: ~75
+- Hive internal routing: 0 ppm
+- External CLN fees: 500 ppm (CLBOSS default)
+- LND fees: 1-2000 ppm (charge-lnd dynamic)
 
 ---
 
@@ -276,33 +339,28 @@ HIVE NODES                         EXTERNAL NODES
 
 ---
 
-## Recommendations for Improved Testing
+## Recommendations for Future Testing
 
-### For Realistic Network Simulation
-1. **Add more LND nodes** - Current network has 2 LND (29%), real network is ~55% LND
-2. Add 2-3 more LND nodes to reach 40-50% LND representation
-3. Vary charge-lnd configurations across LND nodes (conservative, aggressive, balanced)
+### Network Composition ✅ ACHIEVED
+- ~~Add more LND nodes~~ - Network now has 8 LND (53%), matching real-world ~55%
+- ~~Vary charge-lnd configs~~ - 8 unique fee strategies implemented
 
-### For Hive Competition Testing
-1. Add channels: `dave -> alice`, `erin -> carol` to create routing paths through hive
-2. Lower hive node fees to be competitive
-3. Increase external node fees to force routing through hive
+### Improving LND Routing Participation
+1. **New LND nodes not routing** - judy, kathy, lucy, mike, quincy, niaj have 0 forwards
+2. Need to position LND nodes on primary routing paths between payment endpoints
+3. Consider opening channels from LND nodes directly to both payment sources and destinations
+4. Run longer simulations to allow gossip propagation and pathfinding adaptation
 
 ### For Rebalancing Testing
 1. Run longer tests to observe rebalance completion
 2. Monitor `revenue-status` to see rebalance effects
 3. Add periodic rebalance triggers
 
-### For Fee Testing
-1. Generate sustained traffic to trigger fee adjustments
-2. Compare fee changes between hive and external nodes
-3. Test fee coordination between hive members
-4. Run charge-lnd periodically on LND nodes to update fees based on channel balance
-
-### For LND Integration
-1. Schedule charge-lnd to run every 10-15 minutes
-2. Compare routing success rates between CLN and LND nodes
-3. Test pathfinding behavior when LND nodes have high fees
+### For Fee Strategy Analysis
+1. lnd2's aggressive strategy (100-1000 ppm) earned 10.58 sats/forward - highest in network
+2. Compare total revenue vs per-forward revenue strategies over longer periods
+3. Test how hive's low-fee strategy affects channel flow balance
+4. Run charge-lnd periodically on LND nodes to adapt fees dynamically
 
 ---
 
@@ -336,5 +394,5 @@ HIVE NODES                         EXTERNAL NODES
 
 ---
 
-*Report generated by cl-revenue-ops simulation suite v1.2*
-*Last updated: 2026-01-11 - Added LND forwarding stats and charge-lnd integration*
+*Report generated by cl-revenue-ops simulation suite v1.3*
+*Last updated: 2026-01-11 - Expanded to 15-node network with 8 LND nodes (53%)*
