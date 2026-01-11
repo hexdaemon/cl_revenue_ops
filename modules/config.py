@@ -45,6 +45,12 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'max_concurrent_jobs': int,
     'sling_job_timeout_seconds': int,
     'sling_chunk_size_sats': int,
+    'sling_max_hops': int,
+    'sling_parallel_jobs': int,
+    'sling_target_sink': float,
+    'sling_target_source': float,
+    'sling_target_balanced': float,
+    'sling_outppm_fallback': int,
     'rebalance_min_profit': int,
     'rebalance_min_profit_ppm': int,
     'rebalance_max_amount': int,
@@ -82,6 +88,12 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hive_fee_ppm': (0, 100000),
     'hive_rebalance_tolerance': (0, 100000),
     'sling_chunk_size_sats': (1, 50000000),
+    'sling_max_hops': (2, 20),
+    'sling_parallel_jobs': (1, 10),
+    'sling_target_sink': (0.1, 0.9),
+    'sling_target_source': (0.1, 0.9),
+    'sling_target_balanced': (0.1, 0.9),
+    'sling_outppm_fallback': (0, 10000),
     'rebalance_min_profit_ppm': (0, 100000),
     'rpc_timeout_seconds': (1, 300),
     'rpc_circuit_breaker_seconds': (0, 3600),
@@ -173,7 +185,15 @@ class Config:
     max_concurrent_jobs: int = 5              # Max number of concurrent sling rebalance jobs
     sling_job_timeout_seconds: int = 7200     # Timeout for sling jobs (2 hours default)
     sling_chunk_size_sats: int = 500000       # Amount per sling rebalance attempt (500k sats)
-    
+
+    # Enhanced Sling Integration (Phase 6)
+    sling_max_hops: int = 5                   # Max route hops (shorter = faster, more reliable)
+    sling_parallel_jobs: int = 1              # Concurrent route attempts per job
+    sling_target_sink: float = 0.35           # Balance target for sink channels (want more inbound)
+    sling_target_source: float = 0.65         # Balance target for source channels (want more outbound)
+    sling_target_balanced: float = 0.50       # Balance target for balanced channels
+    sling_outppm_fallback: int = 500          # Max fee PPM for outppm fallback (0 = disabled)
+
     # Safety flags
     dry_run: bool = False          # If True, log but don't execute
     
@@ -374,7 +394,15 @@ class ConfigSnapshot:
     max_concurrent_jobs: int
     sling_job_timeout_seconds: int
     sling_chunk_size_sats: int
-    
+
+    # Enhanced Sling Integration (Phase 6)
+    sling_max_hops: int
+    sling_parallel_jobs: int
+    sling_target_sink: float
+    sling_target_source: float
+    sling_target_balanced: float
+    sling_outppm_fallback: int
+
     # Safety flags
     dry_run: bool
     
@@ -443,6 +471,12 @@ class ConfigSnapshot:
             max_concurrent_jobs=config.max_concurrent_jobs,
             sling_job_timeout_seconds=config.sling_job_timeout_seconds,
             sling_chunk_size_sats=config.sling_chunk_size_sats,
+            sling_max_hops=config.sling_max_hops,
+            sling_parallel_jobs=config.sling_parallel_jobs,
+            sling_target_sink=config.sling_target_sink,
+            sling_target_source=config.sling_target_source,
+            sling_target_balanced=config.sling_target_balanced,
+            sling_outppm_fallback=config.sling_outppm_fallback,
             dry_run=config.dry_run,
             sling_available=config.sling_available,
             enable_vegas_reflex=config.enable_vegas_reflex,

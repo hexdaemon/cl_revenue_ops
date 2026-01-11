@@ -285,23 +285,64 @@ class JobManager:
         
         try:
             primary_source = source_scids_sling[0] if source_scids_sling else "none"
+
+            # =================================================================
+            # PHASE 6: Flow-Aware Target Selection
+            # =================================================================
+            # Different channel types want different balance targets:
+            # - SINK channels: Want more inbound capacity (lower target)
+            # - SOURCE channels: Want more outbound capacity (higher target)
+            # - BALANCED: Neutral 50/50
+            # =================================================================
+            flow_state = candidate.dest_flow_state if hasattr(candidate, 'dest_flow_state') else "balanced"
+            if flow_state == "sink":
+                target = self.config.sling_target_sink
+            elif flow_state == "source":
+                target = self.config.sling_target_source
+            else:
+                target = self.config.sling_target_balanced
+
             self.plugin.log(
                 f"Starting sling-job: {to_scid} <- [{len(source_scids_sling)} candidates], "
                 f"primary={primary_source}, amount={chunk_size}, "
-                f"maxppm={maxppm}, budget_sats={candidate.max_budget_sats}, "
-                f"target_total={candidate.amount_sats}"
+                f"maxppm={maxppm}, maxhops={self.config.sling_max_hops}, "
+                f"target={target} (flow={flow_state}), budget_sats={candidate.max_budget_sats}"
             )
-            
-            # Start sling-job with keyword arguments
-            # sling-job -k scid=X direction=pull amount=Y maxppm=Z candidates='["A","B","C"]'
-            self.plugin.rpc.call("sling-job", {
+
+            # =================================================================
+            # PHASE 6: Enhanced Sling Parameters
+            # =================================================================
+            # - maxhops: Shorter routes are faster and more reliable
+            # - target: Flow-aware balance target
+            # - outppm: Fallback for source discovery when candidates list fails
+            # =================================================================
+            job_params = {
                 "scid": to_scid,
                 "direction": "pull",
                 "amount": chunk_size,
                 "maxppm": maxppm,
-                "candidates": source_scids_sling,
-                "target": 0.5  # Stop when 50% balance reached (we'll stop earlier ourselves)
-            })
+                "maxhops": self.config.sling_max_hops,
+                "target": target,
+            }
+
+            # Add candidates if we have them
+            if source_scids_sling:
+                job_params["candidates"] = source_scids_sling
+
+            # Add outppm as fallback source discovery (if configured and no candidates)
+            if self.config.sling_outppm_fallback > 0:
+                if not source_scids_sling:
+                    # No candidates - use outppm for discovery
+                    job_params["outppm"] = self.config.sling_outppm_fallback
+                    self.plugin.log(
+                        f"No candidates for {to_scid}, using outppm={self.config.sling_outppm_fallback} fallback",
+                        level='info'
+                    )
+                else:
+                    # Have candidates but also add outppm as backup
+                    job_params["outppm"] = self.config.sling_outppm_fallback
+
+            self.plugin.rpc.call("sling-job", job_params)
             
             # Start the job (sling-job only creates it, sling-go starts it)
             try:
@@ -753,6 +794,131 @@ class JobManager:
         except Exception as e:
             self.plugin.log(f"Startup Hygiene: Unexpected error: {e}", level='warn')
             return 0
+
+    def sync_peer_exclusions(self, policy_manager=None) -> int:
+        """
+        Sync peer exclusions with sling's global exclusion list.
+
+        PHASE 6: Global Exclusion Sync
+        When peers are disabled for rebalancing in our policy system,
+        tell sling to globally exclude them. This prevents sling from
+        considering them as sources or routing through them.
+
+        Args:
+            policy_manager: Optional PolicyManager to get disabled peers
+
+        Returns:
+            Number of peers added to sling exclusion list
+        """
+        excluded_count = 0
+
+        try:
+            # Get current sling exclusions
+            try:
+                result = self.plugin.rpc.call("sling-except-peer", {})
+                current_exclusions = set(result.get("peers", []))
+            except (RpcError, KeyError):
+                current_exclusions = set()
+
+            # Collect peers that should be excluded
+            peers_to_exclude = set()
+
+            # From policy manager (disabled rebalance mode)
+            if policy_manager:
+                try:
+                    from .policy_manager import RebalanceMode
+                    for peer_id, policy in policy_manager.get_all_policies().items():
+                        if policy.rebalance_mode == RebalanceMode.DISABLED:
+                            peers_to_exclude.add(peer_id)
+                except Exception as e:
+                    self.plugin.log(f"Could not get policies for exclusion sync: {e}", level='debug')
+
+            # From legacy ignored peers (if any remain)
+            try:
+                ignored = self.database.get_ignored_peers()
+                for entry in ignored:
+                    peers_to_exclude.add(entry['peer_id'])
+            except Exception:
+                pass
+
+            # Add new exclusions to sling
+            for peer_id in peers_to_exclude:
+                if peer_id not in current_exclusions:
+                    try:
+                        self.plugin.rpc.call("sling-except-peer", {
+                            "peer": peer_id,
+                            "add": True
+                        })
+                        excluded_count += 1
+                        self.plugin.log(
+                            f"Sling Exclusion: Added {peer_id[:16]}... to global exclusion list",
+                            level='debug'
+                        )
+                    except RpcError as e:
+                        self.plugin.log(f"Failed to add peer exclusion: {e}", level='warn')
+
+            if excluded_count > 0:
+                self.plugin.log(
+                    f"Sling Exclusion Sync: Added {excluded_count} peers to global exclusion list",
+                    level='info'
+                )
+
+        except Exception as e:
+            self.plugin.log(f"Peer exclusion sync error: {e}", level='warn')
+
+        return excluded_count
+
+    def add_peer_exclusion(self, peer_id: str) -> bool:
+        """
+        Add a single peer to sling's global exclusion list.
+
+        Called when a peer is dynamically disabled for rebalancing.
+
+        Args:
+            peer_id: The peer node ID to exclude
+
+        Returns:
+            True if successfully added, False otherwise
+        """
+        try:
+            self.plugin.rpc.call("sling-except-peer", {
+                "peer": peer_id,
+                "add": True
+            })
+            self.plugin.log(
+                f"Sling Exclusion: Added {peer_id[:16]}... to exclusion list",
+                level='info'
+            )
+            return True
+        except RpcError as e:
+            self.plugin.log(f"Failed to add sling peer exclusion: {e}", level='warn')
+            return False
+
+    def remove_peer_exclusion(self, peer_id: str) -> bool:
+        """
+        Remove a peer from sling's global exclusion list.
+
+        Called when a peer is re-enabled for rebalancing.
+
+        Args:
+            peer_id: The peer node ID to un-exclude
+
+        Returns:
+            True if successfully removed, False otherwise
+        """
+        try:
+            self.plugin.rpc.call("sling-except-peer", {
+                "peer": peer_id,
+                "remove": True
+            })
+            self.plugin.log(
+                f"Sling Exclusion: Removed {peer_id[:16]}... from exclusion list",
+                level='info'
+            )
+            return True
+        except RpcError as e:
+            self.plugin.log(f"Failed to remove sling peer exclusion: {e}", level='warn')
+            return False
 
     def get_job_status(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get status info for a specific job."""
@@ -1361,18 +1527,97 @@ class EVRebalancer:
             return 0.05
 
     def _estimate_inbound_fee(self, peer_id: str, amount_msat: int = 100000000) -> int:
+        """
+        Estimate the inbound routing fee to reach a peer.
+
+        ENHANCED (Phase 6): Prioritizes historical actual costs over heuristics.
+
+        Priority order:
+        1. Historical data (high confidence) - Use median, most accurate
+        2. Historical data (medium) - Blend with last-hop fee
+        3. Historical data (low) - Use with buffer
+        4. Last hop fee + buffer - Gossip-based estimate
+        5. Route estimation - Ask CLN for a route
+        6. Default fallback - 1000 PPM
+
+        Returns:
+            Estimated inbound fee in PPM
+        """
+        # =====================================================================
+        # PHASE 6: Historical-First Fee Estimation
+        # =====================================================================
+        # Real rebalance costs are the ground truth. Use them when available.
+        # Historical data accounts for actual multi-hop routes, not just last hop.
+        # =====================================================================
+
+        hist_data = self.database.get_historical_inbound_fee_ppm(peer_id)
         last_hop = self._get_last_hop_fee(peer_id)
+
+        if hist_data:
+            confidence = hist_data['confidence']
+            median_ppm = hist_data['median_fee_ppm']
+            avg_ppm = hist_data['avg_fee_ppm']
+            samples = hist_data['sample_count']
+
+            if confidence == 'high':
+                # 10+ samples: trust the data, use median (robust to outliers)
+                estimate = median_ppm
+                self.plugin.log(
+                    f"INBOUND FEE EST [{peer_id[:12]}...]: Using historical median "
+                    f"{estimate} PPM (n={samples}, conf=high)",
+                    level='debug'
+                )
+                return estimate
+
+            elif confidence == 'medium':
+                # 5-9 samples: blend historical with last-hop if available
+                if last_hop is not None:
+                    # Weighted average: 70% historical, 30% last-hop based
+                    last_hop_estimate = last_hop + self.config.inbound_fee_estimate_ppm
+                    estimate = int(median_ppm * 0.7 + last_hop_estimate * 0.3)
+                else:
+                    estimate = median_ppm
+                self.plugin.log(
+                    f"INBOUND FEE EST [{peer_id[:12]}...]: Blended estimate "
+                    f"{estimate} PPM (hist={median_ppm}, n={samples}, conf=medium)",
+                    level='debug'
+                )
+                return estimate
+
+            else:
+                # 3-4 samples: use with 10% buffer for uncertainty
+                estimate = int(avg_ppm * 1.1)
+                self.plugin.log(
+                    f"INBOUND FEE EST [{peer_id[:12]}...]: Historical with buffer "
+                    f"{estimate} PPM (avg={avg_ppm}, n={samples}, conf=low)",
+                    level='debug'
+                )
+                return estimate
+
+        # No historical data - fall back to heuristics
         if last_hop is not None:
-            return last_hop + self.config.inbound_fee_estimate_ppm
-        
-        hist_fee = self._get_historical_inbound_fee(peer_id)
-        if hist_fee: 
-            return hist_fee
-        
+            estimate = last_hop + self.config.inbound_fee_estimate_ppm
+            self.plugin.log(
+                f"INBOUND FEE EST [{peer_id[:12]}...]: Last-hop based "
+                f"{estimate} PPM (last_hop={last_hop})",
+                level='debug'
+            )
+            return estimate
+
         route_fee = self._get_route_fee_estimate(peer_id, amount_msat)
-        if route_fee: 
+        if route_fee:
+            self.plugin.log(
+                f"INBOUND FEE EST [{peer_id[:12]}...]: Route-based "
+                f"{route_fee} PPM",
+                level='debug'
+            )
             return route_fee
-        
+
+        # Ultimate fallback
+        self.plugin.log(
+            f"INBOUND FEE EST [{peer_id[:12]}...]: Default fallback 1000 PPM",
+            level='debug'
+        )
         return 1000
 
     def _get_last_hop_fee(self, peer_id: str) -> Optional[int]:
@@ -1464,40 +1709,62 @@ class EVRebalancer:
         candidates = []
         # Use provided peer_status or fetch if not provided (fallback for direct calls)
         peers = peer_status if peer_status is not None else self._get_peer_connection_status()
-        
+
         # Exclude sources with active jobs
         active_channels = set(self.job_manager.active_channels)
-        
+
+        # =================================================================
+        # PHASE 6: Rejection Diagnostics
+        # =================================================================
+        # Track why sources are rejected to help diagnose "0 candidates" cases
+        rejections = {
+            'active_job': 0,
+            'policy_blocked': 0,
+            'insufficient_balance': 0,
+            'disconnected': 0,
+            'unstable_uptime': 0,
+            'source_protected': 0,
+            'negative_spread': 0,
+            'below_profit_threshold': 0
+        }
+        best_rejected_spread = None  # Track closest-to-profitable rejection
+
         for cid, info, ratio in sources:
             # Skip if this source has an active job
             normalized = cid.replace(':', 'x')
             if normalized in active_channels:
+                rejections['active_job'] += 1
                 continue
-            
+
             # Check policy for draining this source (v1.4: Policy-Driven Architecture)
             pid = info.get("peer_id", "")
             if pid:
                 if self.policy_manager:
                     # Cannot drain if rebalance_mode is DISABLED or SINK_ONLY
                     if not self.policy_manager.should_rebalance(pid, as_destination=False):
+                        rejections['policy_blocked'] += 1
                         continue
                 elif self.database.is_peer_ignored(pid):
                     # Legacy fallback
+                    rejections['policy_blocked'] += 1
                     continue
-                
+
             # Skip if insufficient balance
-            if info.get("spendable_sats", 0) < amount_needed: 
+            if info.get("spendable_sats", 0) < amount_needed:
+                rejections['insufficient_balance'] += 1
                 continue
-            
+
             # Skip disconnected peers
-            if pid and pid in peers and not peers[pid].get("connected"): 
+            if pid and pid in peers and not peers[pid].get("connected"):
+                rejections['disconnected'] += 1
                 continue
-            
+
             # FLAP PROTECTION: Skip unstable source peers
             # Peers with low uptime (high disconnect rate) are unreliable rebalance sources
             if pid:
                 uptime_pct = self.database.get_peer_uptime_percent(pid, 86400)  # 24h window
                 if uptime_pct < 90.0:
+                    rejections['unstable_uptime'] += 1
                     self.plugin.log(
                         f"Skipping source candidate {pid}: unstable connection "
                         f"({uptime_pct:.1f}% uptime in 24h).",
@@ -1513,6 +1780,7 @@ class EVRebalancer:
             state = self.database.get_channel_state(cid)
             if state and state.get("state") == "source":
                 if ratio < 0.80:
+                    rejections['source_protected'] += 1
                     self.plugin.log(
                         f"Skipping source candidate {cid}: Protected Source "
                         f"(ratio={ratio:.2f} < 0.80)",
@@ -1524,30 +1792,71 @@ class EVRebalancer:
             source_fee_ppm = info.get("fee_ppm", 1000)
             source_capacity = info.get("capacity", 1)
             source_turnover_rate = self._calculate_turnover_rate(cid, source_capacity)
-            
-            # BUFFER-AWARE OPPORTUNITY COST (Phase 5 fix)
-            # If turnover is low (<10% of cap/day), assume the rest is "Slack Inventory" (idle buffer).
-            # Slack inventory has lower opportunity cost because it's not being used actively.
-            # 
-            # Logic: If source_turnover_rate is low, reduce the turnover_weight.
-            # This makes idle liquidity cheaper to use for rebalancing.
+
+            # Get flow state FIRST - needed for flow-aware opportunity cost
+            state = self.database.get_channel_state(cid)
+            flow_state = state.get("state", "balanced") if state else "balanced"
+
+            # =================================================================
+            # FLOW-AWARE OPPORTUNITY COST (Phase 6 Enhancement)
+            # =================================================================
+            # The cost of using liquidity from a channel depends on its flow:
+            #
+            # SINK channels: Naturally receiving inbound liquidity, so draining
+            #   them has LOWER opportunity cost - they will replenish passively.
+            #   Factor: 0.3x (70% discount)
+            #
+            # SOURCE channels: Actively forwarding outbound. Draining them
+            #   destroys revenue-generating capacity. HIGHER opportunity cost.
+            #   Factor: 1.5x (50% premium) - but already filtered by SOURCE PROTECTION
+            #
+            # BALANCED channels: Neutral flow. Standard calculation applies.
+            #   Factor: 1.0x
+            #
+            # Combined with BUFFER-AWARE logic (idle channels cheaper to use)
+            # =================================================================
+
+            # Base turnover weight (buffer-aware)
             if source_turnover_rate < 0.10:
                 # Channel is mostly idle. Effective weight should be very low.
-                # turnover_weight = 0.1 * 7 = 0.7 (standard) -> reduce to 0.1
-                turnover_weight = max(0.01, source_turnover_rate) # Linear down to 1%
+                base_turnover_weight = max(0.01, source_turnover_rate)
             else:
                 # Channel is active. Standard penalty applies.
-                turnover_weight = min(1.0, source_turnover_rate * 7)
+                base_turnover_weight = min(1.0, source_turnover_rate * 7)
 
+            # Apply flow-aware multiplier
+            if flow_state == "sink":
+                # Sink channel: receiving liquidity naturally, lower opp cost
+                flow_multiplier = 0.3
+            elif flow_state == "source":
+                # Source channel: losing liquidity, higher opp cost
+                # Note: SOURCE PROTECTION already filters ratio < 0.80
+                flow_multiplier = 1.5
+            else:
+                # Balanced: neutral
+                flow_multiplier = 1.0
+
+            turnover_weight = base_turnover_weight * flow_multiplier
             weighted_opp_cost = int(source_fee_ppm * turnover_weight)
-            
+
             # Calculate spread: what we earn minus what it costs
             spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
-            
+
             # Only include profitable sources (positive spread)
             if spread_ppm <= 0:
+                rejections['negative_spread'] += 1
+                # Track the best rejected spread for diagnostics
+                if best_rejected_spread is None or spread_ppm > best_rejected_spread['spread']:
+                    best_rejected_spread = {
+                        'channel': cid,
+                        'spread': spread_ppm,
+                        'dest_fee': dest_outbound_fee_ppm,
+                        'inbound_fee': dest_inbound_fee_ppm,
+                        'opp_cost': weighted_opp_cost,
+                        'flow_state': flow_state
+                    }
                 continue
-            
+
             # Check minimum profit threshold
             # PPM-BASED PROFIT GATE: Scale threshold with amount to decouple from chunk size
             expected_profit_estimate = (spread_ppm * amount_needed) // 1_000_000
@@ -1556,16 +1865,14 @@ class EVRebalancer:
             else:
                 min_profit_threshold = self.config.rebalance_min_profit
             if expected_profit_estimate < min_profit_threshold:
+                rejections['below_profit_threshold'] += 1
                 continue
-            
+
             # Calculate score for sorting (higher is better)
             score = (ratio * 50) - (source_fee_ppm / 10)
-            
+
             # Bonus for sink/balanced channels (they have excess outbound we want to use)
-            state = self.database.get_channel_state(cid)
-            flow_state = state.get("state", "balanced") if state else "balanced"
-            
-            if flow_state == "sink": 
+            if flow_state == "sink":
                 score += 100
             elif flow_state == "balanced":
                 # Apply Stagnant Inventory Bonus
@@ -1586,10 +1893,34 @@ class EVRebalancer:
                 )
             
             candidates.append((cid, info, score, weighted_opp_cost))
-        
+
         # Sort by score (highest first) so Sling tries most profitable sources first
         candidates.sort(key=lambda x: x[2], reverse=True)
-        
+
+        # =================================================================
+        # PHASE 6: Log Rejection Summary for Diagnostics
+        # =================================================================
+        total_rejected = sum(rejections.values())
+        if total_rejected > 0 and not candidates:
+            # No candidates found - log detailed breakdown
+            non_zero = {k: v for k, v in rejections.items() if v > 0}
+            self.plugin.log(
+                f"SOURCE REJECTION BREAKDOWN for {dest_channel[:12]}...: "
+                f"Evaluated {len(sources)} sources, {total_rejected} rejected: {non_zero}",
+                level='info'
+            )
+
+            # Log the "near miss" - closest to profitable
+            if best_rejected_spread:
+                b = best_rejected_spread
+                self.plugin.log(
+                    f"NEAR MISS: {b['channel'][:12]}... had spread={b['spread']} PPM "
+                    f"(need >0). Components: dest_fee={b['dest_fee']}, "
+                    f"inbound_cost={b['inbound_fee']}, opp_cost={b['opp_cost']} "
+                    f"(flow={b['flow_state']})",
+                    level='info'
+                )
+
         return candidates
 
     def _get_peer_connection_status(self) -> Dict:

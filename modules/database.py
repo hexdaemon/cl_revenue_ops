@@ -1386,11 +1386,103 @@ class Database:
         """, (*channel_ids, limit)).fetchall()
         
         return [dict(row) for row in rows]
-    
+
+    def get_historical_inbound_fee_ppm(self, peer_id: str, window_days: int = 30,
+                                        min_samples: int = 3) -> Optional[Dict[str, Any]]:
+        """
+        Get historical average fee PPM paid to rebalance TO a peer.
+
+        Uses actual fees from successful rebalances to estimate inbound routing
+        costs more accurately than heuristics. Returns None if insufficient data.
+
+        Args:
+            peer_id: The destination peer node ID
+            window_days: Lookback window in days (default 30)
+            min_samples: Minimum successful rebalances required (default 3)
+
+        Returns:
+            Dict with:
+                - avg_fee_ppm: Weighted average fee in PPM
+                - median_fee_ppm: Median fee in PPM (more robust to outliers)
+                - sample_count: Number of successful rebalances
+                - total_volume_sats: Total sats rebalanced
+                - confidence: 'high' (10+ samples), 'medium' (5-9), 'low' (3-4)
+            Or None if insufficient data.
+        """
+        conn = self._get_connection()
+        since = int(time.time()) - (window_days * 86400)
+
+        # Get channels for this peer
+        peer_channels = conn.execute("""
+            SELECT channel_id FROM channel_states WHERE peer_id = ?
+        """, (peer_id,)).fetchall()
+
+        if not peer_channels:
+            return None
+
+        channel_ids = [row['channel_id'] for row in peer_channels]
+        placeholders = ','.join('?' * len(channel_ids))
+
+        # Get successful rebalances with fee data
+        rows = conn.execute(f"""
+            SELECT
+                amount_sats,
+                actual_fee_sats,
+                (actual_fee_sats * 1000000) / NULLIF(amount_sats, 0) as fee_ppm
+            FROM rebalance_history
+            WHERE to_channel IN ({placeholders})
+              AND status = 'success'
+              AND actual_fee_sats IS NOT NULL
+              AND actual_fee_sats > 0
+              AND amount_sats > 0
+              AND timestamp >= ?
+            ORDER BY timestamp DESC
+        """, (*channel_ids, since)).fetchall()
+
+        if len(rows) < min_samples:
+            return None
+
+        # Calculate weighted average (by volume)
+        total_fees = sum(row['actual_fee_sats'] for row in rows)
+        total_volume = sum(row['amount_sats'] for row in rows)
+
+        if total_volume == 0:
+            return None
+
+        avg_fee_ppm = (total_fees * 1_000_000) // total_volume
+
+        # Calculate median (more robust to outliers)
+        fee_ppms = sorted([row['fee_ppm'] for row in rows if row['fee_ppm'] is not None])
+        if fee_ppms:
+            mid = len(fee_ppms) // 2
+            if len(fee_ppms) % 2 == 0:
+                median_fee_ppm = (fee_ppms[mid - 1] + fee_ppms[mid]) // 2
+            else:
+                median_fee_ppm = fee_ppms[mid]
+        else:
+            median_fee_ppm = avg_fee_ppm
+
+        # Confidence based on sample size
+        sample_count = len(rows)
+        if sample_count >= 10:
+            confidence = 'high'
+        elif sample_count >= 5:
+            confidence = 'medium'
+        else:
+            confidence = 'low'
+
+        return {
+            'avg_fee_ppm': int(avg_fee_ppm),
+            'median_fee_ppm': int(median_fee_ppm),
+            'sample_count': sample_count,
+            'total_volume_sats': total_volume,
+            'confidence': confidence
+        }
+
     # =========================================================================
     # Forward Tracking Methods
     # =========================================================================
-    
+
     def get_latest_forward_timestamp(self) -> Optional[int]:
         """
         Get the timestamp of the most recent forward in the database.

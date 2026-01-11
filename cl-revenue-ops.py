@@ -1242,6 +1242,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             rebalancer.job_manager.cleanup_orphans()
         except Exception as e:
             plugin.log(f"Warning: Could not clean up orphan jobs: {e}", level='warn')
+
+        # PHASE 6: Sync peer exclusions with sling on startup
+        try:
+            rebalancer.job_manager.sync_peer_exclusions(policy_manager)
+        except Exception as e:
+            plugin.log(f"Warning: Could not sync peer exclusions: {e}", level='warn')
     
     # Start background threads (daemon=True so they don't block shutdown)
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
