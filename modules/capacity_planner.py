@@ -8,6 +8,7 @@ and "Loser" channels for capital redeployment (Splice-Out/Close).
 import time
 from typing import Dict, List, Any, Optional, Tuple
 from pyln.client import Plugin
+from .config import ChainCostDefaults
 
 class CapacityPlanner:
     """
@@ -170,6 +171,9 @@ class CapacityPlanner:
             if is_fire_sale or is_stagnant:
                 # PROTECTION: A channel cannot be recommended for "Close" or "Splice-out"
                 # until the diagnostic_rebalance has been attempted at least twice in the last 14 days.
+                # Accounting v2.0: Include estimated closure cost
+                estimated_closure_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+
                 if attempt_count < 2:
                     losers.append({
                         "scid": scid_display,
@@ -179,6 +183,7 @@ class CapacityPlanner:
                         "marginal_roi": round(prof.marginal_roi_percent, 2),
                         "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
                         "capacity": prof.capacity_sats,
+                        "estimated_closure_cost_sats": estimated_closure_cost,
                         "action": "DEFIBRILLATE"
                     })
                 else:
@@ -190,6 +195,7 @@ class CapacityPlanner:
                         "marginal_roi": round(prof.marginal_roi_percent, 2),
                         "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
                         "capacity": prof.capacity_sats,
+                        "estimated_closure_cost_sats": estimated_closure_cost,
                         "action": "CLOSE"
                     })
                 

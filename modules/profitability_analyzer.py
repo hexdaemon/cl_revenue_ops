@@ -762,7 +762,7 @@ class ChannelProfitabilityAnalyzer:
 
         Calculates key financial metrics for the Sovereign Dashboard:
         - Gross Revenue: Total routing fees earned
-        - Operating Expense (OpEx): Total rebalance costs
+        - Operating Expense (OpEx): Total costs (rebalance + closure + splice)
         - Net Profit: Revenue - OpEx
         - Operating Margin: (Net Profit / Gross Revenue) * 100
 
@@ -770,15 +770,20 @@ class ChannelProfitabilityAnalyzer:
             window_days: Time window for calculations (default 30 days)
 
         Returns:
-            Dict with revenue, opex, net_profit, margin, and forward_count
+            Dict with revenue, opex breakdown, net_profit, margin
         """
         since_timestamp = int(time.time()) - (window_days * 86400)
 
         # Get revenue (routing fees earned)
         gross_revenue_sats = self.database.get_total_routing_revenue(since_timestamp)
 
-        # Get OpEx (rebalance costs)
-        opex_sats = self.database.get_total_rebalance_fees(since_timestamp)
+        # Get OpEx components (Accounting v2.0: includes closure and splice costs)
+        rebalance_cost_sats = self.database.get_total_rebalance_fees(since_timestamp)
+        closure_cost_sats = self.database.get_closure_costs_since(since_timestamp)
+        splice_cost_sats = self.database.get_splice_costs_since(since_timestamp)
+
+        # Total OpEx
+        opex_sats = rebalance_cost_sats + closure_cost_sats + splice_cost_sats
 
         # Calculate net profit
         net_profit_sats = gross_revenue_sats - opex_sats
@@ -794,6 +799,9 @@ class ChannelProfitabilityAnalyzer:
             'window_days': window_days,
             'gross_revenue_sats': gross_revenue_sats,
             'opex_sats': opex_sats,
+            'rebalance_cost_sats': rebalance_cost_sats,
+            'closure_cost_sats': closure_cost_sats,
+            'splice_cost_sats': splice_cost_sats,
             'net_profit_sats': net_profit_sats,
             'operating_margin_pct': operating_margin_pct
         }

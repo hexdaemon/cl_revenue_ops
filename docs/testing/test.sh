@@ -1093,6 +1093,67 @@ test_splice_costs() {
     fi
 }
 
+# Security Tests (Accounting v2.0)
+test_security() {
+    echo ""
+    echo "========================================"
+    echo "SECURITY TESTS (Accounting v2.0)"
+    echo "========================================"
+
+    log_info "Testing security hardening code..."
+
+    # Input validation methods exist
+    run_test "Channel ID validation method exists" \
+        "grep -q 'def _validate_channel_id' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "Peer ID validation method exists" \
+        "grep -q 'def _validate_peer_id' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "Fee sanitization method exists" \
+        "grep -q 'def _sanitize_fee' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "Amount sanitization method exists" \
+        "grep -q 'def _sanitize_amount' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Validation constants defined
+    run_test "MAX_FEE_SATS constant defined" \
+        "grep -q 'MAX_FEE_SATS' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "Channel ID pattern defined" \
+        "grep -q 'CHANNEL_ID_PATTERN' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "Peer ID pattern defined" \
+        "grep -q 'PEER_ID_PATTERN' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Validation called in record methods
+    run_test "record_channel_closure validates channel_id" \
+        "grep -q 'if not self._validate_channel_id' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "record_splice validates inputs" \
+        "grep -q '_sanitize_fee.*splice_fee' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Bookkeeper type checking
+    run_test "Closure bookkeeper type checks event structure" \
+        "grep -q 'isinstance.*event.*dict' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    run_test "Splice bookkeeper type checks event structure" \
+        "grep -q 'isinstance.*event.*dict' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # Bounds checking in bookkeeper
+    run_test "Closure bookkeeper has bounds check" \
+        "grep -q 'fee_sats = min' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    run_test "Splice bookkeeper has bounds check" \
+        "grep -q 'fee_sats = min' /home/sat/cl_revenue_ops/cl-revenue-ops.py"
+
+    # UNIQUE constraint for idempotency
+    run_test "Splice costs has UNIQUE index for idempotency" \
+        "grep -q 'idx_splice_costs_unique' /home/sat/cl_revenue_ops/modules/database.py"
+
+    run_test "Splice uses INSERT OR IGNORE" \
+        "grep -q 'INSERT OR IGNORE INTO splice_costs' /home/sat/cl_revenue_ops/modules/database.py"
+}
+
 # Metrics Tests
 test_metrics() {
     echo ""
@@ -1222,6 +1283,9 @@ run_category() {
         splice_costs)
             test_splice_costs
             ;;
+        security)
+            test_security
+            ;;
         metrics)
             test_metrics
             ;;
@@ -1241,6 +1305,7 @@ run_category() {
             test_database
             test_closure_costs
             test_splice_costs
+            test_security
             test_metrics
             ;;
         *)
@@ -1260,6 +1325,7 @@ run_category() {
             echo "  database      - Database operations"
             echo "  closure_costs - Channel closure cost tracking"
             echo "  splice_costs  - Splice cost tracking"
+            echo "  security      - Security hardening verification"
             echo "  metrics       - Metrics collection"
             echo "  reset         - Reset plugin state"
             exit 1

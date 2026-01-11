@@ -2742,7 +2742,17 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
         funding_txid = None
         closing_txid = None
 
-        for event in events.get('events', []):
+        # Security: Validate events structure
+        event_list = events.get('events', [])
+        if not isinstance(event_list, list):
+            plugin.log(f"Security: Invalid events structure from bookkeeper for {channel_id}", level='warn')
+            return None
+
+        for event in event_list:
+            # Security: Type check each event is a dict
+            if not isinstance(event, dict):
+                continue
+
             event_type = event.get('type', '')
             tag = event.get('tag', '')
 
@@ -2756,9 +2766,21 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
 
             # Accumulate on-chain fees
             if event_type == 'onchain_fee':
-                # Fees are typically in msat, convert to sats
-                fee_msat = abs(event.get('credit_msat', 0) or event.get('debit_msat', 0))
+                # Security: Type check fee values before arithmetic
+                credit_msat = event.get('credit_msat', 0)
+                debit_msat = event.get('debit_msat', 0)
+
+                # Ensure values are numeric
+                if not isinstance(credit_msat, (int, float)):
+                    credit_msat = 0
+                if not isinstance(debit_msat, (int, float)):
+                    debit_msat = 0
+
+                fee_msat = abs(int(credit_msat) or int(debit_msat))
                 fee_sats = fee_msat // 1000
+
+                # Security: Bounds check (max 50,000 sats per fee event)
+                fee_sats = min(fee_sats, 50000)
 
                 # Categorize the fee
                 if 'htlc' in tag.lower() or 'sweep' in tag.lower():
@@ -2965,27 +2987,54 @@ def _get_splice_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any
         splice_txid = None
         splice_amount = 0
 
-        # Get events sorted by timestamp (most recent first)
+        # Security: Validate events structure
         all_events = events.get('events', [])
+        if not isinstance(all_events, list):
+            plugin.log(f"Security: Invalid events structure from bookkeeper for splice {channel_id}", level='warn')
+            return None
 
         for event in reversed(all_events):  # Process oldest to newest
+            # Security: Type check each event is a dict
+            if not isinstance(event, dict):
+                continue
+
             event_type = event.get('type', '')
-            tag = event.get('tag', '').lower()
+            tag = str(event.get('tag', '')).lower()  # Ensure tag is string
 
             # Look for splice-related tags
             # Note: CLN bookkeeper may use tags like 'splice', 'splice_in', 'splice_out'
             if 'splice' in tag:
                 splice_txid = event.get('txid')
 
-                # Get amount from credit/debit
-                credit = event.get('credit_msat', 0) or 0
-                debit = event.get('debit_msat', 0) or 0
-                splice_amount = (credit - debit) // 1000  # Convert to sats
+                # Security: Type check credit/debit values before arithmetic
+                credit = event.get('credit_msat', 0)
+                debit = event.get('debit_msat', 0)
+
+                # Ensure values are numeric
+                if not isinstance(credit, (int, float)):
+                    credit = 0
+                if not isinstance(debit, (int, float)):
+                    debit = 0
+
+                splice_amount = (int(credit) - int(debit)) // 1000  # Convert to sats
 
             # Accumulate on-chain fees for splice
             if event_type == 'onchain_fee' and 'splice' in tag:
-                fee_msat = abs(event.get('credit_msat', 0) or event.get('debit_msat', 0))
-                splice_fee_sats += fee_msat // 1000
+                # Security: Type check fee values
+                credit_msat = event.get('credit_msat', 0)
+                debit_msat = event.get('debit_msat', 0)
+
+                if not isinstance(credit_msat, (int, float)):
+                    credit_msat = 0
+                if not isinstance(debit_msat, (int, float)):
+                    debit_msat = 0
+
+                fee_msat = abs(int(credit_msat) or int(debit_msat))
+                fee_sats = fee_msat // 1000
+
+                # Security: Bounds check (max 50,000 sats per fee event)
+                fee_sats = min(fee_sats, 50000)
+                splice_fee_sats += fee_sats
 
         # If we found splice data, return it
         if splice_txid or splice_fee_sats > 0:

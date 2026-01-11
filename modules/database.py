@@ -127,6 +127,109 @@ class Database:
             finally:
                 self._local.conn = None
 
+    # =========================================================================
+    # Security: Input Validation Constants and Methods (Accounting v2.0)
+    # =========================================================================
+
+    # Maximum reasonable fee for a single on-chain operation (50,000 sats ~ $50)
+    MAX_FEE_SATS: int = 50000
+    # Maximum reasonable splice/capacity amount (100 BTC in sats)
+    MAX_AMOUNT_SATS: int = 10_000_000_000
+    # Channel ID format: short_channel_id like "123x456x789" or "123456x789x0"
+    CHANNEL_ID_PATTERN = r'^\d+x\d+x\d+$'
+    # Peer ID format: 66 hex characters (33 bytes public key)
+    PEER_ID_PATTERN = r'^[0-9a-fA-F]{66}$'
+
+    def _validate_channel_id(self, channel_id: str) -> bool:
+        """
+        Validate channel ID format (Security: input validation).
+
+        Args:
+            channel_id: The channel short ID to validate
+
+        Returns:
+            True if valid format, False otherwise
+        """
+        import re
+        if not channel_id or not isinstance(channel_id, str):
+            return False
+        return bool(re.match(self.CHANNEL_ID_PATTERN, channel_id))
+
+    def _validate_peer_id(self, peer_id: str) -> bool:
+        """
+        Validate peer ID format (Security: input validation).
+
+        Args:
+            peer_id: The peer node ID to validate
+
+        Returns:
+            True if valid format, False otherwise
+        """
+        import re
+        if not peer_id or not isinstance(peer_id, str):
+            return False
+        return bool(re.match(self.PEER_ID_PATTERN, peer_id))
+
+    def _sanitize_fee(self, fee_sats: int, field_name: str = "fee") -> int:
+        """
+        Sanitize fee value with bounds checking (Security: input validation).
+
+        Args:
+            fee_sats: The fee value in satoshis
+            field_name: Name of the field for logging
+
+        Returns:
+            Sanitized fee value (clamped to valid range)
+        """
+        if not isinstance(fee_sats, (int, float)):
+            self.plugin.log(
+                f"Security: Invalid {field_name} type {type(fee_sats)}, defaulting to 0",
+                level='warn'
+            )
+            return 0
+        fee_sats = int(fee_sats)
+        if fee_sats < 0:
+            self.plugin.log(
+                f"Security: Negative {field_name} {fee_sats}, clamping to 0",
+                level='warn'
+            )
+            return 0
+        if fee_sats > self.MAX_FEE_SATS:
+            self.plugin.log(
+                f"Security: Excessive {field_name} {fee_sats}, clamping to {self.MAX_FEE_SATS}",
+                level='warn'
+            )
+            return self.MAX_FEE_SATS
+        return fee_sats
+
+    def _sanitize_amount(self, amount_sats: int, field_name: str = "amount") -> int:
+        """
+        Sanitize amount value with bounds checking (Security: input validation).
+
+        Args:
+            amount_sats: The amount value in satoshis
+            field_name: Name of the field for logging
+
+        Returns:
+            Sanitized amount value (clamped to valid range)
+        """
+        if not isinstance(amount_sats, (int, float)):
+            self.plugin.log(
+                f"Security: Invalid {field_name} type {type(amount_sats)}, defaulting to 0",
+                level='warn'
+            )
+            return 0
+        amount_sats = int(amount_sats)
+        # Allow negative for splice_out, but clamp magnitude
+        if abs(amount_sats) > self.MAX_AMOUNT_SATS:
+            sign = 1 if amount_sats >= 0 else -1
+            self.plugin.log(
+                f"Security: Excessive {field_name} {amount_sats}, clamping to {sign * self.MAX_AMOUNT_SATS}",
+                level='warn'
+            )
+            return sign * self.MAX_AMOUNT_SATS
+        return amount_sats
+
     def initialize(self):
         """Create database tables if they don't exist."""
         conn = self._get_connection()
@@ -497,6 +600,8 @@ class Database:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_splice_costs_channel ON splice_costs(channel_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_splice_costs_time ON splice_costs(timestamp)")
+        # Prevent duplicate splice records when txid is known (Security: idempotency)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_splice_costs_unique ON splice_costs(channel_id, txid) WHERE txid IS NOT NULL")
 
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
@@ -2338,6 +2443,35 @@ class Database:
             True if recorded successfully, False otherwise
         """
         try:
+            # Security: Input validation
+            if not self._validate_channel_id(channel_id):
+                self.plugin.log(
+                    f"Security: Invalid channel_id format '{channel_id}', skipping closure record",
+                    level='warn'
+                )
+                return False
+
+            if not self._validate_peer_id(peer_id):
+                self.plugin.log(
+                    f"Security: Invalid peer_id format for {channel_id}, using sanitized value",
+                    level='warn'
+                )
+                peer_id = "invalid_peer_id"
+
+            # Security: Sanitize fee values
+            closure_fee_sats = self._sanitize_fee(closure_fee_sats, "closure_fee")
+            htlc_sweep_fee_sats = self._sanitize_fee(htlc_sweep_fee_sats, "htlc_sweep_fee")
+            penalty_fee_sats = self._sanitize_fee(penalty_fee_sats, "penalty_fee")
+
+            # Validate close_type
+            valid_close_types = {'mutual', 'local_unilateral', 'remote_unilateral', 'unknown'}
+            if close_type not in valid_close_types:
+                self.plugin.log(
+                    f"Security: Invalid close_type '{close_type}', defaulting to 'unknown'",
+                    level='warn'
+                )
+                close_type = 'unknown'
+
             conn = self._get_connection()
             now = int(time.time())
 
@@ -2452,6 +2586,25 @@ class Database:
             SELECT COALESCE(SUM(total_closure_cost_sats), 0) as total
             FROM channel_closure_costs
         """).fetchone()
+
+        return row["total"] if row else 0
+
+    def get_closure_costs_since(self, since_timestamp: int) -> int:
+        """
+        Get closure costs since a specific timestamp (for windowed P&L).
+
+        Args:
+            since_timestamp: Unix timestamp to query from
+
+        Returns:
+            Total closure costs in sats since the timestamp
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(total_closure_cost_sats), 0) as total
+            FROM channel_closure_costs
+            WHERE closed_at >= ?
+        """, (since_timestamp,)).fetchone()
 
         return row["total"] if row else 0
 
@@ -2630,23 +2783,64 @@ class Database:
             True if recorded successfully, False otherwise
         """
         try:
+            # Security: Input validation
+            if not self._validate_channel_id(channel_id):
+                self.plugin.log(
+                    f"Security: Invalid channel_id format '{channel_id}', skipping splice record",
+                    level='warn'
+                )
+                return False
+
+            if not self._validate_peer_id(peer_id):
+                self.plugin.log(
+                    f"Security: Invalid peer_id format for {channel_id}, using sanitized value",
+                    level='warn'
+                )
+                peer_id = "invalid_peer_id"
+
+            # Security: Sanitize fee and amount values
+            fee_sats = self._sanitize_fee(fee_sats, "splice_fee")
+            amount_sats = self._sanitize_amount(amount_sats, "splice_amount")
+            if old_capacity_sats is not None:
+                old_capacity_sats = self._sanitize_amount(old_capacity_sats, "old_capacity")
+            if new_capacity_sats is not None:
+                new_capacity_sats = self._sanitize_amount(new_capacity_sats, "new_capacity")
+
+            # Validate splice_type
+            valid_splice_types = {'splice_in', 'splice_out'}
+            if splice_type not in valid_splice_types:
+                self.plugin.log(
+                    f"Security: Invalid splice_type '{splice_type}', defaulting to 'splice_in'",
+                    level='warn'
+                )
+                splice_type = 'splice_in'
+
             conn = self._get_connection()
             now = int(time.time())
 
+            # Use INSERT OR IGNORE to prevent duplicate records when txid is known
+            # The UNIQUE index on (channel_id, txid) WHERE txid IS NOT NULL handles idempotency
             conn.execute("""
-                INSERT INTO splice_costs
+                INSERT OR IGNORE INTO splice_costs
                 (channel_id, peer_id, splice_type, amount_sats, fee_sats,
                  old_capacity_sats, new_capacity_sats, txid, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (channel_id, peer_id, splice_type, amount_sats, fee_sats,
                   old_capacity_sats, new_capacity_sats, txid, now))
-            conn.commit()
 
-            self.plugin.log(
-                f"Recorded splice for {channel_id}: type={splice_type}, "
-                f"amount={amount_sats} sats, fee={fee_sats} sats",
-                level='info'
-            )
+            # Check if insert was actually performed (rowcount > 0) or ignored (duplicate)
+            if conn.total_changes > 0:
+                conn.commit()
+                self.plugin.log(
+                    f"Recorded splice for {channel_id}: type={splice_type}, "
+                    f"amount={amount_sats} sats, fee={fee_sats} sats",
+                    level='info'
+                )
+            else:
+                self.plugin.log(
+                    f"Duplicate splice ignored for {channel_id} txid={txid}",
+                    level='debug'
+                )
             return True
 
         except Exception as e:
@@ -2684,6 +2878,25 @@ class Database:
             SELECT COALESCE(SUM(fee_sats), 0) as total
             FROM splice_costs
         """).fetchone()
+
+        return row["total"] if row else 0
+
+    def get_splice_costs_since(self, since_timestamp: int) -> int:
+        """
+        Get splice costs since a specific timestamp (for windowed P&L).
+
+        Args:
+            since_timestamp: Unix timestamp to query from
+
+        Returns:
+            Total splice costs in sats since the timestamp
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(fee_sats), 0) as total
+            FROM splice_costs
+            WHERE timestamp >= ?
+        """, (since_timestamp,)).fetchone()
 
         return row["total"] if row else 0
 
