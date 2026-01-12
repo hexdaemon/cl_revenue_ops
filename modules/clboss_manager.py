@@ -23,6 +23,7 @@ The pattern:
 4. Track what we've unmanaged so we can re-enable if needed
 """
 
+import time
 from typing import Dict, Any, Optional, List
 from pyln.client import Plugin, RpcError
 
@@ -70,39 +71,68 @@ class ClbossManager:
         self.plugin = plugin
         self.config = config
         self._clboss_available: Optional[bool] = None
-    
+        self._clboss_check_time: float = 0
+        # Retry checking for clboss every 5 minutes if previously unavailable
+        self._clboss_retry_interval: float = 300
+
     def is_clboss_available(self) -> bool:
         """
         Check if clboss is available and running.
-        
+
         Returns:
             True if clboss commands are available
+
+        Note: If clboss was not available on first check, will retry
+        after _clboss_retry_interval seconds to handle startup race conditions.
         """
         if not self.config.clboss_enabled:
             return False
-        
+
+        # If we have a cached result and it's True, use it
+        # If cached result is False, retry after the interval
         if self._clboss_available is not None:
-            return self._clboss_available
+            if self._clboss_available:
+                return True
+            # Previously unavailable - check if we should retry
+            if time.time() - self._clboss_check_time < self._clboss_retry_interval:
+                return False
+            # Time to retry
+            self.plugin.log("Retrying clboss availability check...")
         
         try:
             # Try to call a clboss command to see if it's available
             result = self.plugin.rpc.call("clboss-status")
             self._clboss_available = True
+            self._clboss_check_time = time.time()
             self.plugin.log("clboss detected and available")
             return True
         except RpcError as e:
             if "Unknown command" in str(e) or "not found" in str(e).lower():
                 self._clboss_available = False
-                self.plugin.log("clboss not available - commands will be skipped")
+                self._clboss_check_time = time.time()
+                self.plugin.log("clboss not available - commands will be skipped (will retry in 5 min)")
                 return False
             # Other RPC errors might mean clboss is there but had an issue
             self._clboss_available = True
+            self._clboss_check_time = time.time()
             return True
         except Exception as e:
             self.plugin.log(f"Error checking clboss availability: {e}", level='warn')
             self._clboss_available = False
+            self._clboss_check_time = time.time()
             return False
     
+    def reset_availability_cache(self) -> bool:
+        """
+        Reset the clboss availability cache to force a fresh check.
+
+        Returns:
+            The result of the fresh availability check
+        """
+        self._clboss_available = None
+        self._clboss_check_time = 0
+        return self.is_clboss_available()
+
     def unmanage_for_fee(self, peer_id: str) -> Dict[str, Any]:
         """
         Unmanage a peer from clboss fee management.
