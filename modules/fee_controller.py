@@ -1818,26 +1818,39 @@ class HillClimbingFeeController:
         
         return None
     
-    def set_channel_fee(self, channel_id: str, fee_ppm: int, 
+    def set_channel_fee(self, channel_id: str, fee_ppm: int,
                        reason: str = "manual", manual: bool = False) -> Dict[str, Any]:
         """
         Set the fee for a channel, handling clboss override.
-        
+
         MANAGER-OVERRIDE PATTERN:
-        1. Get peer ID for the channel
-        2. Call clboss-unmanage to prevent conflicts
-        3. Set the fee using setchannelfee
-        4. Record the change
-        
+        1. Validate fee is within configured limits
+        2. Get peer ID for the channel
+        3. Call clboss-unmanage to prevent conflicts
+        4. Set the fee using setchannelfee
+        5. Record the change
+
         Args:
             channel_id: Channel to update
             fee_ppm: New fee in parts per million
             reason: Explanation for the change
             manual: True if manually triggered (vs automatic)
-            
+
         Returns:
             Result dict with success status and details
         """
+        # CRITICAL FIX: Enforce fee limits at the execution layer
+        # This is the last line of defense against runaway fees
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+        original_fee_ppm = fee_ppm
+        fee_ppm = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, fee_ppm))
+        if fee_ppm != original_fee_ppm:
+            self.plugin.log(
+                f"FEE_LIMIT: Clamped fee for {channel_id[:16]}... from {original_fee_ppm} "
+                f"to {fee_ppm} (limits: {cfg.min_fee_ppm}-{cfg.max_fee_ppm} PPM)",
+                level='warn'
+            )
+
         result = {
             "success": False,
             "channel_id": channel_id,

@@ -551,7 +551,11 @@ class JobManager:
     def _check_job_error(self, job: ActiveJob, stats: Dict[str, Any]) -> bool:
         """Check if sling reports an error state for this job."""
         # Check for explicit error status
-        status = stats.get("status", "").lower()
+        # Handle case where status might be a list (sling plugin inconsistency)
+        status = stats.get("status", "")
+        if isinstance(status, list):
+            status = status[0] if status else ""
+        status = str(status).lower()
         if status in ("error", "failed", "stopped"):
             return True
         
