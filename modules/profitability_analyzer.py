@@ -63,17 +63,34 @@ class ChannelCosts:
 class ChannelRevenue:
     """
     Revenue tracking for a channel.
-    
+
     Attributes:
         channel_id: Channel short ID
-        fees_earned_sats: Total routing fees earned
-        volume_routed_sats: Total sats forwarded through channel
-        forward_count: Number of successful forwards
+        fees_earned_sats: Total routing fees earned (as exit channel)
+        volume_routed_sats: Total sats forwarded through channel (as exit)
+        forward_count: Number of successful forwards (as exit)
+        sourced_volume_sats: Volume that entered through this channel (as entry)
+        sourced_fee_contribution_sats: Fees earned on exits for forwards sourced here
+        sourced_forward_count: Number of forwards where this was entry channel
     """
     channel_id: str
     fees_earned_sats: int
     volume_routed_sats: int
     forward_count: int
+    # Inbound contribution metrics (channel as entry point)
+    sourced_volume_sats: int = 0
+    sourced_fee_contribution_sats: int = 0
+    sourced_forward_count: int = 0
+
+    @property
+    def total_contribution_sats(self) -> int:
+        """Total value: direct fees + fees enabled by sourcing volume."""
+        return self.fees_earned_sats + self.sourced_fee_contribution_sats
+
+    @property
+    def total_forward_count(self) -> int:
+        """Total forwards: as exit + as entry."""
+        return self.forward_count + self.sourced_forward_count
 
 
 @dataclass 
@@ -120,28 +137,33 @@ class ChannelProfitability:
     def marginal_roi(self) -> float:
         """
         Calculate Marginal ROI (Operational profitability).
-        
+
         This metric EXCLUDES open_cost_sats (sunk cost) and focuses only on
         operational profitability: are we covering our rebalancing costs?
-        
-        Formula: (fees_earned - rebalance_costs) / max(1, rebalance_costs)
-        
+
+        Uses total_contribution_sats which includes:
+        - Direct fees earned (as exit channel)
+        - Sourced fee contribution (fees enabled by sourcing inbound volume)
+
+        Formula: (total_contribution - rebalance_costs) / max(1, rebalance_costs)
+
         Returns:
             Marginal ROI as a decimal (e.g., 0.5 = 50% marginal return)
-            Returns 1.0 if no rebalance costs and earning fees (infinitely profitable operationally)
-            Returns 0.0 if no rebalance costs and no fees (neutral)
+            Returns 1.0 if no rebalance costs and earning/contributing
+            Returns 0.0 if no rebalance costs and no contribution
         """
-        fees_earned = self.revenue.fees_earned_sats
+        # Use total contribution (direct fees + sourced fee contribution)
+        total_contribution = self.revenue.total_contribution_sats
         rebalance_costs = self.costs.rebalance_cost_sats
-        
-        # If no rebalancing has occurred, check if channel is earning
+
+        # If no rebalancing has occurred, check if channel is contributing value
         if rebalance_costs == 0:
-            # No operational costs - if earning anything, it's pure profit
-            return 1.0 if fees_earned > 0 else 0.0
-        
-        # Marginal profit = fees earned minus rebalancing costs (NO open cost!)
-        marginal_profit = fees_earned - rebalance_costs
-        
+            # No operational costs - if contributing anything, it's pure profit
+            return 1.0 if total_contribution > 0 else 0.0
+
+        # Marginal profit = total contribution minus rebalancing costs (NO open cost!)
+        marginal_profit = total_contribution - rebalance_costs
+
         # ROI relative to rebalancing investment
         return marginal_profit / max(1, rebalance_costs)
     
@@ -331,22 +353,25 @@ class ChannelProfitabilityAnalyzer:
                 revenue = precalculated_revenue
             else:
                 revenue = self._get_channel_revenue(channel_id)
-            
-            # Calculate metrics
-            net_profit = revenue.fees_earned_sats - costs.total_cost_sats
-            
+
+            # Calculate metrics using total contribution (direct + sourced)
+            # This properly values channels that source inbound volume
+            total_contribution = revenue.total_contribution_sats
+            net_profit = total_contribution - costs.total_cost_sats
+
             # ROI based on total investment (costs)
             if costs.total_cost_sats > 0:
                 roi = net_profit / costs.total_cost_sats
             else:
                 # No costs recorded (e.g. remote open, no rebalancing)
-                # Infinite ROI if earning, 0 otherwise
-                roi = 1.0 if revenue.fees_earned_sats > 0 else 0.0
-            
-            # Cost/fee per sat routed
-            if revenue.volume_routed_sats > 0:
-                cost_per_sat = costs.total_cost_sats / revenue.volume_routed_sats
-                fee_per_sat = revenue.fees_earned_sats / revenue.volume_routed_sats
+                # Infinite ROI if contributing value, 0 otherwise
+                roi = 1.0 if total_contribution > 0 else 0.0
+
+            # Cost/fee per sat routed (using total volume: exit + sourced)
+            total_volume = revenue.volume_routed_sats + revenue.sourced_volume_sats
+            if total_volume > 0:
+                cost_per_sat = costs.total_cost_sats / total_volume
+                fee_per_sat = total_contribution / total_volume
             else:
                 cost_per_sat = 0.0
                 fee_per_sat = 0.0
@@ -811,11 +836,15 @@ class ChannelProfitabilityAnalyzer:
         Identify "Bleeder" channels that are losing money.
 
         A Bleeder is a channel where:
-        - Net P&L < 0 (rebalance costs exceed revenue)
-        - Volume > 0 (channel is active, not just stagnant)
+        - Net P&L < 0 (rebalance costs exceed total contribution value)
+        - Has activity (either as exit or entry channel)
 
-        These channels actively drain sats through rebalancing without
-        generating sufficient revenue to cover costs.
+        Total contribution includes:
+        - Direct fees (earned as exit channel)
+        - Sourced fee contribution (fees enabled by sourcing inbound volume)
+
+        This prevents misclassifying channels that source valuable inbound
+        volume but don't earn direct exit fees.
 
         Args:
             window_days: Time window for analysis (default 30 days)
@@ -830,20 +859,35 @@ class ChannelProfitabilityAnalyzer:
             channels = self._get_all_channels()
 
             for channel_id, info in channels.items():
-                # Get P&L for this channel
-                pnl = self.database.get_channel_pnl(channel_id, window_days)
+                # Get FULL P&L including inbound contribution
+                pnl = self.database.get_channel_full_pnl(channel_id, window_days)
+
+                # Total activity = exit forwards + sourced forwards
+                total_activity = pnl['direct_forward_count'] + pnl['sourced_forward_count']
 
                 # Check for bleeder condition: net < 0 AND has activity
-                if pnl['net_pnl_sats'] < 0 and pnl['forward_count'] > 0:
+                # Now uses total_contribution which includes sourced fee value
+                if pnl['net_pnl_sats'] < 0 and total_activity > 0:
                     bleeders.append({
                         'channel_id': channel_id,
                         'peer_id': info.get('peer_id', ''),
                         'capacity_sats': info.get('capacity', 0),
-                        'revenue_sats': pnl['revenue_sats'],
+                        # Direct revenue (as exit channel)
+                        'direct_revenue_sats': pnl['direct_revenue_sats'],
+                        # Inbound contribution (fees enabled by sourcing volume)
+                        'sourced_fee_contribution_sats': pnl['sourced_fee_contribution_sats'],
+                        'sourced_volume_sats': pnl['sourced_volume_sats'],
+                        # Combined metrics
+                        'total_contribution_sats': pnl['total_contribution_sats'],
                         'rebalance_cost_sats': pnl['rebalance_cost_sats'],
                         'net_pnl_sats': pnl['net_pnl_sats'],
-                        'forward_count': pnl['forward_count'],
-                        'loss_per_forward': abs(pnl['net_pnl_sats']) // max(pnl['forward_count'], 1)
+                        'direct_forward_count': pnl['direct_forward_count'],
+                        'sourced_forward_count': pnl['sourced_forward_count'],
+                        'total_forward_count': total_activity,
+                        'loss_per_forward': abs(pnl['net_pnl_sats']) // max(total_activity, 1),
+                        # Legacy fields for backward compatibility
+                        'revenue_sats': pnl['direct_revenue_sats'],
+                        'forward_count': pnl['direct_forward_count']
                     })
 
             # Sort by loss (most negative first)
@@ -1549,51 +1593,63 @@ class ChannelProfitabilityAnalyzer:
     def _get_all_revenue_data(self) -> Dict[str, ChannelRevenue]:
         """
         Batch fetch revenue data for all channels with a single RPC call.
-        
-        This method calls listforwards(status="settled") once and aggregates
-        fees_earned and volume_routed by out_channel (SCID).
-        
-        This is a performance optimization that reduces RPC calls from N
-        (number of channels) to 1 when analyzing all channels.
-        
+
+        This method calls listforwards(status="settled") once and aggregates:
+        - Exit metrics: fees_earned and volume_routed by out_channel
+        - Entry metrics: sourced_volume and sourced_fee_contribution by in_channel
+
+        This provides a complete picture of channel value, including channels
+        that primarily source inbound volume rather than earn exit fees.
+
         Returns:
-            Dict mapping channel_id (out_channel SCID) to ChannelRevenue
+            Dict mapping channel_id to ChannelRevenue with both exit and entry metrics
         """
         revenue_map: Dict[str, Dict[str, int]] = {}
-        
+
+        def init_channel(channel_id: str) -> None:
+            """Initialize channel entry with all metrics."""
+            if channel_id not in revenue_map:
+                revenue_map[channel_id] = {
+                    "fees_earned": 0,
+                    "volume_routed": 0,
+                    "forward_count": 0,
+                    "sourced_volume": 0,
+                    "sourced_fee_contribution": 0,
+                    "sourced_forward_count": 0
+                }
+
         try:
             # Single RPC call to fetch ALL settled forwards
             result = self.plugin.rpc.listforwards(status="settled")
-            
+
             for forward in result.get("forwards", []):
                 out_channel = forward.get("out_channel")
-                if not out_channel:
-                    continue
-                
-                # Initialize channel entry if not exists
-                if out_channel not in revenue_map:
-                    revenue_map[out_channel] = {
-                        "fees_earned": 0,
-                        "volume_routed": 0,
-                        "forward_count": 0
-                    }
-                
-                # Aggregate fee
+                in_channel = forward.get("in_channel")
                 fee_msat = self._parse_msat(forward.get("fee_msat", 0))
-                revenue_map[out_channel]["fees_earned"] += fee_msat // 1000
-                
-                # Aggregate volume
                 out_msat = self._parse_msat(forward.get("out_msat", 0))
-                revenue_map[out_channel]["volume_routed"] += out_msat // 1000
-                
-                revenue_map[out_channel]["forward_count"] += 1
-                
+                in_msat = self._parse_msat(forward.get("in_msat", 0))
+
+                # Track EXIT metrics (out_channel earns the fee)
+                if out_channel:
+                    init_channel(out_channel)
+                    revenue_map[out_channel]["fees_earned"] += fee_msat // 1000
+                    revenue_map[out_channel]["volume_routed"] += out_msat // 1000
+                    revenue_map[out_channel]["forward_count"] += 1
+
+                # Track ENTRY metrics (in_channel sourced the volume)
+                # The fee was enabled by the in_channel providing the route
+                if in_channel:
+                    init_channel(in_channel)
+                    revenue_map[in_channel]["sourced_volume"] += in_msat // 1000
+                    revenue_map[in_channel]["sourced_fee_contribution"] += fee_msat // 1000
+                    revenue_map[in_channel]["sourced_forward_count"] += 1
+
         except Exception as e:
             self.plugin.log(
-                f"Error batch fetching revenue data: {e}", 
+                f"Error batch fetching revenue data: {e}",
                 level='warn'
             )
-        
+
         # Convert to ChannelRevenue objects
         result_map: Dict[str, ChannelRevenue] = {}
         for channel_id, data in revenue_map.items():
@@ -1601,71 +1657,131 @@ class ChannelProfitabilityAnalyzer:
                 channel_id=channel_id,
                 fees_earned_sats=data["fees_earned"],
                 volume_routed_sats=data["volume_routed"],
-                forward_count=data["forward_count"]
+                forward_count=data["forward_count"],
+                sourced_volume_sats=data["sourced_volume"],
+                sourced_fee_contribution_sats=data["sourced_fee_contribution"],
+                sourced_forward_count=data["sourced_forward_count"]
             )
-        
+
         return result_map
     
     def _get_channel_revenue(self, channel_id: str) -> ChannelRevenue:
         """
         Get revenue for a single channel from routing history.
-        
+
+        This fetches both:
+        - Exit metrics: fees earned when channel is out_channel
+        - Entry metrics: volume sourced when channel is in_channel
+
         Note: For batch operations, use _get_all_revenue_data() instead to
         avoid N+1 query overhead. This method is retained for single-channel
         lookups where batch fetching would be wasteful.
         """
-        # Query listforwards for this channel's earnings
+        # Exit metrics (channel as out_channel)
         fees_earned = 0
         volume_routed = 0
         forward_count = 0
-        
+        # Entry metrics (channel as in_channel)
+        sourced_volume = 0
+        sourced_fee_contribution = 0
+        sourced_forward_count = 0
+
         try:
             # Get forwards where we earned fees (out_channel = this channel)
             result = self.plugin.rpc.listforwards(
                 out_channel=channel_id,
                 status="settled"
             )
-            
+
             for forward in result.get("forwards", []):
                 fee_msat = self._parse_msat(forward.get("fee_msat", 0))
                 fees_earned += fee_msat // 1000
-                
+
                 out_msat = self._parse_msat(forward.get("out_msat", 0))
                 volume_routed += out_msat // 1000
-                
+
                 forward_count += 1
-                
+
         except Exception as e:
             self.plugin.log(
-                f"Error getting revenue for {channel_id}: {e}", 
+                f"Error getting exit revenue for {channel_id}: {e}",
                 level='warn'
             )
-        
+
+        try:
+            # Get forwards where we sourced volume (in_channel = this channel)
+            result = self.plugin.rpc.listforwards(
+                in_channel=channel_id,
+                status="settled"
+            )
+
+            for forward in result.get("forwards", []):
+                in_msat = self._parse_msat(forward.get("in_msat", 0))
+                sourced_volume += in_msat // 1000
+
+                # The fee was enabled by this channel sourcing the forward
+                fee_msat = self._parse_msat(forward.get("fee_msat", 0))
+                sourced_fee_contribution += fee_msat // 1000
+
+                sourced_forward_count += 1
+
+        except Exception as e:
+            self.plugin.log(
+                f"Error getting inbound contribution for {channel_id}: {e}",
+                level='warn'
+            )
+
         return ChannelRevenue(
             channel_id=channel_id,
             fees_earned_sats=fees_earned,
             volume_routed_sats=volume_routed,
-            forward_count=forward_count
+            forward_count=forward_count,
+            sourced_volume_sats=sourced_volume,
+            sourced_fee_contribution_sats=sourced_fee_contribution,
+            sourced_forward_count=sourced_forward_count
         )
     
     def _get_last_routing_time(self, channel_id: str) -> Optional[int]:
-        """Get timestamp of last routing activity on a channel."""
+        """
+        Get timestamp of last routing activity on a channel.
+
+        Checks BOTH directions:
+        - As out_channel (exit): when channel forwarded outbound
+        - As in_channel (entry): when channel sourced inbound volume
+
+        A channel is "active" if it's routing in either direction.
+        """
+        latest_time: Optional[int] = None
+
         try:
+            # Check outbound activity (as exit channel)
             result = self.plugin.rpc.listforwards(
                 out_channel=channel_id,
                 status="settled"
             )
-            
             forwards = result.get("forwards", [])
-            if not forwards:
-                return None
-            
-            # Get most recent
-            latest = max(forwards, key=lambda f: f.get("received_time", 0))
-            return int(latest.get("received_time", 0))
-            
+            if forwards:
+                out_latest = max(forwards, key=lambda f: f.get("received_time", 0))
+                latest_time = int(out_latest.get("received_time", 0))
         except Exception:
-            return None
+            pass
+
+        try:
+            # Check inbound activity (as entry channel)
+            result = self.plugin.rpc.listforwards(
+                in_channel=channel_id,
+                status="settled"
+            )
+            forwards = result.get("forwards", [])
+            if forwards:
+                in_latest = max(forwards, key=lambda f: f.get("received_time", 0))
+                in_time = int(in_latest.get("received_time", 0))
+                if latest_time is None or in_time > latest_time:
+                    latest_time = in_time
+        except Exception:
+            pass
+
+        return latest_time
     
     def _classify_channel(self, roi: float, net_profit: int,
                          last_routed: Optional[int], days_open: int,

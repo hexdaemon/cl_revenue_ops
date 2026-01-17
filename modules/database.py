@@ -1451,6 +1451,99 @@ class Database:
             'forward_count': forward_count
         }
 
+    def get_channel_inbound_contribution(self, channel_id: str, window_days: int = 30) -> Dict[str, Any]:
+        """
+        Get inbound contribution metrics for a channel.
+
+        This calculates the value a channel provides by SOURCING inbound volume,
+        even when it doesn't earn direct fees as the exit channel.
+
+        For each forward where this channel was the in_channel (entry point),
+        we track:
+        - sourced_volume_sats: Total sats that entered through this channel
+        - sourced_fee_contribution_sats: Fees earned on the exit channels
+        - sourced_forward_count: Number of forwards sourced
+
+        Args:
+            channel_id: The channel SCID
+            window_days: Time window for calculations (default 30 days)
+
+        Returns:
+            Dict with sourced_volume_sats, sourced_fee_contribution_sats,
+            sourced_forward_count
+        """
+        conn = self._get_connection()
+        since = int(time.time()) - (window_days * 86400)
+
+        # Get inbound contribution (where this channel was the entry point)
+        inbound_row = conn.execute("""
+            SELECT COALESCE(SUM(in_msat), 0) as sourced_volume_msat,
+                   COALESCE(SUM(fee_msat), 0) as sourced_fee_msat,
+                   COUNT(*) as sourced_forward_count
+            FROM forwards
+            WHERE in_channel = ? AND timestamp >= ?
+        """, (channel_id, since)).fetchone()
+
+        sourced_volume_sats = (inbound_row['sourced_volume_msat'] // 1000) if inbound_row else 0
+        sourced_fee_sats = (inbound_row['sourced_fee_msat'] // 1000) if inbound_row else 0
+        sourced_forward_count = inbound_row['sourced_forward_count'] if inbound_row else 0
+
+        return {
+            'channel_id': channel_id,
+            'window_days': window_days,
+            'sourced_volume_sats': sourced_volume_sats,
+            'sourced_fee_contribution_sats': sourced_fee_sats,
+            'sourced_forward_count': sourced_forward_count
+        }
+
+    def get_channel_full_pnl(self, channel_id: str, window_days: int = 30) -> Dict[str, Any]:
+        """
+        Get complete P&L breakdown including inbound contribution value.
+
+        This combines:
+        1. Direct revenue (fees earned as exit channel)
+        2. Inbound contribution (fees enabled by sourcing volume)
+        3. Costs (rebalancing)
+
+        The "contribution_value" metric provides a fuller picture of channel
+        profitability by crediting channels for the volume they source.
+
+        Args:
+            channel_id: The channel SCID
+            window_days: Time window for calculations (default 30 days)
+
+        Returns:
+            Dict with complete P&L including contribution metrics
+        """
+        # Get direct P&L (exit channel fees)
+        direct_pnl = self.get_channel_pnl(channel_id, window_days)
+
+        # Get inbound contribution
+        inbound = self.get_channel_inbound_contribution(channel_id, window_days)
+
+        # Calculate total contribution value
+        # Direct fees + sourced fee contribution (what we helped earn elsewhere)
+        total_contribution = direct_pnl['revenue_sats'] + inbound['sourced_fee_contribution_sats']
+
+        return {
+            'channel_id': channel_id,
+            'window_days': window_days,
+            # Direct metrics (as exit channel)
+            'direct_revenue_sats': direct_pnl['revenue_sats'],
+            'direct_forward_count': direct_pnl['forward_count'],
+            # Inbound contribution metrics (as entry channel)
+            'sourced_volume_sats': inbound['sourced_volume_sats'],
+            'sourced_fee_contribution_sats': inbound['sourced_fee_contribution_sats'],
+            'sourced_forward_count': inbound['sourced_forward_count'],
+            # Combined metrics
+            'total_contribution_sats': total_contribution,
+            'rebalance_cost_sats': direct_pnl['rebalance_cost_sats'],
+            'net_pnl_sats': total_contribution - direct_pnl['rebalance_cost_sats'],
+            # Legacy fields for backward compatibility
+            'revenue_sats': direct_pnl['revenue_sats'],
+            'forward_count': direct_pnl['forward_count']
+        }
+
     # =========================================================================
     # Atomic Budget Reservation System (CRITICAL-01 fix)
     # =========================================================================
