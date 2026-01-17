@@ -238,7 +238,51 @@ class JobManager:
         except Exception as e:
             self.plugin.log(f"Error getting channel balance: {e}", level='debug')
         return 0
-    
+
+    def _get_channel_age_days(self, channel_id: str, channel_info: Dict = None) -> int:
+        """
+        Get the age of a channel in days (Issue #30: Velocity Gate).
+
+        Uses SCID block height to estimate channel age. SCID format is
+        "blockheight x txindex x output".
+
+        Args:
+            channel_id: Short channel ID
+            channel_info: Optional channel info dict (for future use)
+
+        Returns:
+            Estimated channel age in days (0 if unknown)
+        """
+        import time
+
+        try:
+            # Parse block height from SCID
+            if 'x' in channel_id:
+                block_height = int(channel_id.split('x')[0])
+            elif ':' in channel_id:
+                block_height = int(channel_id.split(':')[0])
+            else:
+                return 0
+
+            # Get current block height
+            getinfo = self.plugin.rpc.getinfo()
+            current_height = getinfo.get("blockheight", 0)
+
+            if current_height <= 0 or block_height <= 0:
+                return 0
+
+            # Blocks since channel opened
+            blocks_since_open = current_height - block_height
+
+            # ~10 minutes per block = 144 blocks per day
+            days_open = blocks_since_open // 144
+
+            return max(0, days_open)
+
+        except Exception as e:
+            self.plugin.log(f"Error getting channel age: {e}", level='debug')
+            return 0
+
     def start_job(self, candidate: RebalanceCandidate, rebalance_id: int) -> Dict[str, Any]:
         """
         Start a new sling-job for the given candidate with multi-source support.
@@ -1288,7 +1332,46 @@ class EVRebalancer:
             daily_volume = (sats_in + sats_out) / max(self.config.flow_window_days, 1)
         else:
             daily_volume = 0
-        
+
+        # =====================================================================
+        # Issue #30: VELOCITY GATE - Prevent overfilling low-velocity channels
+        # =====================================================================
+        # Channels with little to no routing history shouldn't get aggressively
+        # rebalanced. We calculate velocity (daily turnover as fraction of
+        # capacity) and use conservative targets for low-velocity channels.
+        # =====================================================================
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        velocity = daily_volume / capacity if capacity > 0 else 0.0
+
+        # Get channel age for grace period
+        channel_age_days = self._get_channel_age_days(dest_channel, dest_info)
+
+        # Apply velocity gate
+        velocity_adjusted_target_ratio = target_ratio
+        velocity_gate_reason = None
+
+        if cfg.enable_velocity_gate:
+            # Grace period for new channels - they get normal targeting
+            if channel_age_days < cfg.new_channel_grace_days:
+                velocity_gate_reason = f"new_channel_grace (age={channel_age_days}d)"
+            elif velocity < cfg.min_velocity_threshold:
+                # Low velocity - use conservative target (15% of capacity)
+                # This is enough to test routing without wasting budget
+                velocity_adjusted_target_ratio = 0.15
+                velocity_gate_reason = f"low_velocity ({velocity:.4f} < {cfg.min_velocity_threshold})"
+                self.plugin.log(
+                    f"VELOCITY GATE: {dest_channel[:12]}... conservative target "
+                    f"(velocity={velocity:.4f}, age={channel_age_days}d, "
+                    f"target={velocity_adjusted_target_ratio:.0%} vs original {target_ratio:.0%})",
+                    level='debug'
+                )
+            else:
+                velocity_gate_reason = f"velocity_ok ({velocity:.4f})"
+
+        # Use velocity-adjusted target ratio
+        target_ratio = velocity_adjusted_target_ratio
+
         # =====================================================================
         # HOTFIX 0.1: Destination Sizing Guard
         # =====================================================================

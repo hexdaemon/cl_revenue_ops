@@ -72,6 +72,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'reservation_timeout_hours': int,
     # Issue #28: Revenue rate smoothing
     'ema_smoothing_alpha': float,
+    # Issue #30: Velocity gate for rebalancing
+    'enable_velocity_gate': bool,
+    'min_velocity_threshold': float,
+    'new_channel_grace_days': int,
 }
 
 # Range constraints for numeric fields
@@ -103,6 +107,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'reservation_timeout_hours': (1, 24),
     # Issue #28: Revenue rate smoothing
     'ema_smoothing_alpha': (0.1, 0.9),
+    # Issue #30: Velocity gate for rebalancing
+    'min_velocity_threshold': (0.0, 1.0),
+    'new_channel_grace_days': (0, 30),
 }
 
 
@@ -225,6 +232,12 @@ class Config:
     # EMA formula: new_ema = alpha * current + (1 - alpha) * old_ema
     # Lower alpha = slower response (more smoothing), higher = faster response
     ema_smoothing_alpha: float = 0.3       # Default 0.3 balances responsiveness and stability
+
+    # Issue #30: Velocity gate for rebalancing
+    # Prevents overfilling channels with no routing history
+    enable_velocity_gate: bool = True      # Require minimum velocity before full rebalancing
+    min_velocity_threshold: float = 0.01   # Min daily_volume/capacity ratio (1% daily turnover)
+    new_channel_grace_days: int = 7        # Days before velocity gate applies to new channels
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -443,6 +456,11 @@ class ConfigSnapshot:
     # Issue #28: Revenue rate EMA smoothing
     ema_smoothing_alpha: float
 
+    # Issue #30: Velocity gate for rebalancing
+    enable_velocity_gate: bool
+    min_velocity_threshold: float
+    new_channel_grace_days: int
+
     # Version tracking
     version: int = 0
     
@@ -507,6 +525,9 @@ class ConfigSnapshot:
             hive_fee_ppm=config.hive_fee_ppm,
             hive_rebalance_tolerance=config.hive_rebalance_tolerance,
             ema_smoothing_alpha=config.ema_smoothing_alpha,
+            enable_velocity_gate=config.enable_velocity_gate,
+            min_velocity_threshold=config.min_velocity_threshold,
+            new_channel_grace_days=config.new_channel_grace_days,
             version=config._version,
         )
 
