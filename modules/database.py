@@ -2161,6 +2161,29 @@ class Database:
 
         return row['forward_count'] if row else 0
 
+    def get_last_forward_time(self, channel_id: str) -> Optional[int]:
+        """
+        Get the timestamp of the most recent forward through a channel.
+
+        Used by flow-based ceiling reduction (Issue #20) to determine
+        how long a channel has been without routing activity.
+
+        Args:
+            channel_id: Channel to check
+
+        Returns:
+            Unix timestamp of last forward, or None if no forwards found
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT MAX(timestamp) as last_ts
+            FROM forwards
+            WHERE out_channel = ?
+        """, (channel_id,)).fetchone()
+
+        return row['last_ts'] if row and row['last_ts'] else None
+
     def get_weighted_volume_since(self, channel_id: str, timestamp: int) -> int:
         """
         Get reputation-weighted outbound volume for a channel since a timestamp.

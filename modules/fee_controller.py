@@ -815,7 +815,30 @@ class HillClimbingFeeController:
     # Security mitigations: See ThompsonSamplingState class
     ENABLE_THOMPSON_SAMPLING = True   # Feature flag
     THOMPSON_WEIGHT = 0.2             # Probability of using Thompson suggestion
-    
+
+    # ==========================================================================
+    # Issue #19: Balance-Based Minimum Fee Floor
+    # ==========================================================================
+    # Channels with critically low local balance need higher minimum fees to
+    # protect scarce liquidity and ensure any routing is adequately compensated.
+    ENABLE_BALANCE_FLOOR = True       # Feature flag
+    CRITICAL_BALANCE_THRESHOLD = 10   # Percent - below this is "critical"
+    CRITICAL_BALANCE_MIN_FEE = 500    # PPM floor for critically drained channels
+    LOW_BALANCE_THRESHOLD = 25        # Percent - below this is "low"
+    LOW_BALANCE_MIN_FEE = 200         # PPM floor for low balance channels
+
+    # ==========================================================================
+    # Issue #20: Flow-Based Ceiling Reduction
+    # ==========================================================================
+    # Channels with high fees but zero flow for extended periods should have
+    # their ceiling reduced to enable price discovery.
+    ENABLE_FLOW_CEILING = True        # Feature flag
+    ZERO_FLOW_DAYS_MODERATE = 3       # Days of zero flow for moderate reduction
+    ZERO_FLOW_DAYS_SEVERE = 7         # Days of zero flow for severe reduction
+    ZERO_FLOW_FEE_THRESHOLD = 500     # Only apply if current fee > this PPM
+    ZERO_FLOW_REDUCTION_MODERATE = 0.75  # 25% ceiling reduction after 3 days
+    ZERO_FLOW_REDUCTION_SEVERE = 0.50    # 50% ceiling reduction after 7 days
+
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
                  clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
@@ -846,7 +869,99 @@ class HillClimbingFeeController:
         
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
-    
+
+    def _get_balance_based_floor(self, local_balance_pct: float, global_min: int) -> int:
+        """
+        Calculate minimum fee floor based on local balance ratio (Issue #19).
+
+        Critically drained channels need higher minimum fees to:
+        1. Discourage further drain of scarce liquidity
+        2. Ensure any routing through drained channel is compensated
+        3. Signal to routing nodes that capacity is limited
+
+        Args:
+            local_balance_pct: Local balance as percentage (0-100)
+            global_min: Global minimum fee from config
+
+        Returns:
+            Minimum fee floor in PPM
+        """
+        if not self.ENABLE_BALANCE_FLOOR:
+            return global_min
+
+        if local_balance_pct < self.CRITICAL_BALANCE_THRESHOLD:
+            return max(global_min, self.CRITICAL_BALANCE_MIN_FEE)
+        elif local_balance_pct < self.LOW_BALANCE_THRESHOLD:
+            return max(global_min, self.LOW_BALANCE_MIN_FEE)
+        else:
+            return global_min
+
+    def _get_flow_adjusted_ceiling(
+        self,
+        channel_id: str,
+        current_fee: int,
+        base_ceiling: int
+    ) -> int:
+        """
+        Calculate fee ceiling based on flow activity (Issue #20).
+
+        High-fee channels with no flow should have fees reduced to
+        discover a price point that attracts routing.
+
+        Args:
+            channel_id: The channel ID
+            current_fee: Current fee in PPM
+            base_ceiling: Base ceiling before flow adjustment
+
+        Returns:
+            Adjusted ceiling in PPM
+        """
+        if not self.ENABLE_FLOW_CEILING:
+            return base_ceiling
+
+        # Only apply to high-fee channels
+        if current_fee < self.ZERO_FLOW_FEE_THRESHOLD:
+            return base_ceiling
+
+        # Get days since last forward
+        try:
+            last_forward_ts = self.database.get_last_forward_time(channel_id)
+            if last_forward_ts is None or last_forward_ts == 0:
+                # No forwards recorded - check channel age
+                # Be conservative: don't penalize new channels
+                return base_ceiling
+
+            now = int(time.time())
+            days_since_forward = (now - last_forward_ts) / 86400
+
+            if days_since_forward >= self.ZERO_FLOW_DAYS_SEVERE:
+                # Severe reduction after 7+ days of zero flow
+                new_ceiling = int(base_ceiling * self.ZERO_FLOW_REDUCTION_SEVERE)
+                self.plugin.log(
+                    f"FLOW_CEILING: {channel_id[:12]}... {days_since_forward:.1f} days "
+                    f"no flow, ceiling reduced to {new_ceiling} ppm (50%)",
+                    level='debug'
+                )
+                return new_ceiling
+            elif days_since_forward >= self.ZERO_FLOW_DAYS_MODERATE:
+                # Moderate reduction after 3+ days of zero flow
+                new_ceiling = int(base_ceiling * self.ZERO_FLOW_REDUCTION_MODERATE)
+                self.plugin.log(
+                    f"FLOW_CEILING: {channel_id[:12]}... {days_since_forward:.1f} days "
+                    f"no flow, ceiling reduced to {new_ceiling} ppm (75%)",
+                    level='debug'
+                )
+                return new_ceiling
+            else:
+                return base_ceiling
+
+        except Exception as e:
+            self.plugin.log(
+                f"FLOW_CEILING: Error getting last forward time for {channel_id[:12]}...: {e}",
+                level='warn'
+            )
+            return base_ceiling
+
     def _prune_stale_states(self, active_channel_ids: set) -> int:
         """
         Remove in-memory state for channels that no longer exist.
@@ -1367,7 +1482,31 @@ class HillClimbingFeeController:
         base_floor_ppm = int(base_floor_ppm * flow_state_multiplier)
         base_floor_ppm = max(base_floor_ppm, 1)  # Never go below 1 ppm
 
+        # =====================================================================
+        # Issue #19: Balance-Based Minimum Fee Floor
+        # =====================================================================
+        # Critically drained channels need higher minimum fees to protect
+        # scarce liquidity. This floor is applied AFTER other floor adjustments.
+        local_balance_pct = outbound_ratio * 100  # Convert to percentage
+        balance_floor_ppm = self._get_balance_based_floor(local_balance_pct, cfg.min_fee_ppm)
+        if balance_floor_ppm > base_floor_ppm:
+            self.plugin.log(
+                f"BALANCE_FLOOR: {channel_id[:12]}... local={local_balance_pct:.1f}%, "
+                f"floor raised from {base_floor_ppm} to {balance_floor_ppm} ppm",
+                level='debug'
+            )
+            base_floor_ppm = balance_floor_ppm
+
         base_ceiling_ppm = cfg.max_fee_ppm
+
+        # =====================================================================
+        # Issue #20: Flow-Based Ceiling Reduction
+        # =====================================================================
+        # High-fee channels with no flow for extended periods should have their
+        # ceiling reduced to enable price discovery.
+        base_ceiling_ppm = self._get_flow_adjusted_ceiling(
+            channel_id, current_fee_ppm, base_ceiling_ppm
+        )
 
         # =====================================================================
         # IMPROVEMENT #1: Apply Multipliers to Bounds (Not Fee Directly)
