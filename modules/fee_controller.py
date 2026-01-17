@@ -1509,6 +1509,24 @@ class HillClimbingFeeController:
         )
 
         # =====================================================================
+        # Issue #18 Fix: Balance Floor Priority
+        # =====================================================================
+        # Scarcity protection for drained channels takes priority over normal
+        # ceiling limits. If balance floor is active, ensure ceiling accommodates
+        # it. This prevents the floor/ceiling sanity check from clamping down
+        # the protective floor.
+        if balance_floor_ppm > cfg.min_fee_ppm:  # Balance floor is active
+            min_ceiling_for_balance = balance_floor_ppm + 100  # Allow room for hill climbing
+            if base_ceiling_ppm < min_ceiling_for_balance:
+                self.plugin.log(
+                    f"SCARCITY_PRIORITY: {channel_id[:12]}... raising ceiling from "
+                    f"{base_ceiling_ppm} to {min_ceiling_for_balance} ppm to accommodate "
+                    f"balance floor of {balance_floor_ppm} ppm",
+                    level='info'
+                )
+                base_ceiling_ppm = min_ceiling_for_balance
+
+        # =====================================================================
         # IMPROVEMENT #1: Apply Multipliers to Bounds (Not Fee Directly)
         # =====================================================================
         # Instead of: new_fee = base_fee * liquidity_mult * prof_mult
@@ -1531,8 +1549,19 @@ class HillClimbingFeeController:
             ceiling_ppm = int(base_ceiling_ppm * ceiling_multiplier)
 
             # Security: Ensure floor never exceeds ceiling
+            # Issue #18: When balance floor is active, raise ceiling instead of lowering floor
             if floor_ppm >= ceiling_ppm:
-                floor_ppm = max(1, ceiling_ppm - 10)
+                if balance_floor_ppm > cfg.min_fee_ppm:
+                    # Balance floor is active - raise ceiling to protect scarce liquidity
+                    ceiling_ppm = floor_ppm + 10
+                    self.plugin.log(
+                        f"SCARCITY_GUARD: {channel_id[:12]}... ceiling raised to {ceiling_ppm} "
+                        f"to preserve balance floor of {balance_floor_ppm}",
+                        level='info'
+                    )
+                else:
+                    # Normal case - lower floor to fit ceiling
+                    floor_ppm = max(1, ceiling_ppm - 10)
 
             self.plugin.log(
                 f"BOUNDS_MULT: {channel_id[:12]}... floor={base_floor_ppm}->{floor_ppm} "
