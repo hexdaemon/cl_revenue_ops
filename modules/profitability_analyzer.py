@@ -37,6 +37,22 @@ class ProfitabilityClass(Enum):
     ZOMBIE = "zombie"              # Underwater + failed diagnostic recovery
 
 
+class ChannelRole(Enum):
+    """
+    Channel flow role classification based on directional activity.
+
+    Helps identify what purpose a channel serves in the routing topology:
+    - INBOUND_GATEWAY: Primarily sources volume from the network (>70% inbound)
+    - OUTBOUND_GATEWAY: Primarily exits payments to the network (>70% outbound)
+    - BALANCED: Roughly equal flow in both directions (within 70/30)
+    - DORMANT: Little to no flow in either direction
+    """
+    INBOUND_GATEWAY = "inbound_gateway"    # >70% of activity is sourcing inbound
+    OUTBOUND_GATEWAY = "outbound_gateway"  # >70% of activity is exit outbound
+    BALANCED = "balanced"                   # Flow in both directions
+    DORMANT = "dormant"                     # No significant activity
+
+
 @dataclass
 class ChannelCosts:
     """
@@ -176,12 +192,43 @@ class ChannelProfitability:
     def is_operationally_profitable(self) -> bool:
         """
         Check if channel is operationally profitable (covering rebalance costs).
-        
+
         This is the key metric for fee decisions - we should NOT penalize channels
         just because they haven't paid back their opening cost.
         """
         return self.marginal_roi >= 0
-    
+
+    @property
+    def channel_role(self) -> ChannelRole:
+        """
+        Classify channel's primary flow role based on directional activity.
+
+        Uses forward counts (not volume) to classify:
+        - >70% as entry channel → INBOUND_GATEWAY
+        - >70% as exit channel → OUTBOUND_GATEWAY
+        - Otherwise → BALANCED or DORMANT
+
+        Returns:
+            ChannelRole enum value
+        """
+        total_forwards = self.revenue.total_forward_count
+
+        # Dormant if less than 10 forwards total
+        if total_forwards < 10:
+            return ChannelRole.DORMANT
+
+        # Calculate ratios
+        inbound_ratio = self.revenue.sourced_forward_count / total_forwards
+        outbound_ratio = self.revenue.forward_count / total_forwards
+
+        # >70% in one direction = gateway
+        if inbound_ratio > 0.70:
+            return ChannelRole.INBOUND_GATEWAY
+        elif outbound_ratio > 0.70:
+            return ChannelRole.OUTBOUND_GATEWAY
+        else:
+            return ChannelRole.BALANCED
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "channel_id": self.channel_id,
@@ -201,7 +248,19 @@ class ChannelProfitability:
             "cost_per_sat_routed": round(self.cost_per_sat_routed, 6),
             "fee_per_sat_routed": round(self.fee_per_sat_routed, 6),
             "days_open": self.days_open,
-            "last_routed": self.last_routed
+            "last_routed": self.last_routed,
+            # Issue #21: Inbound vs outbound revenue attribution
+            "channel_role": self.channel_role.value,
+            "inbound_flow": {
+                "payment_count": self.revenue.sourced_forward_count,
+                "volume_sats": self.revenue.sourced_volume_sats,
+                "contribution_to_other_channels_sats": self.revenue.sourced_fee_contribution_sats
+            },
+            "outbound_flow": {
+                "payment_count": self.revenue.forward_count,
+                "volume_sats": self.revenue.volume_routed_sats,
+                "revenue_earned_sats": self.revenue.fees_earned_sats
+            }
         }
 
 
@@ -675,29 +734,38 @@ class ChannelProfitabilityAnalyzer:
     def get_summary(self) -> Dict[str, Any]:
         """
         Get summary statistics for all channels.
-        
+
         Returns:
-            Summary dict with totals and breakdowns
+            Summary dict with totals and breakdowns including flow role distribution
         """
         if (int(time.time()) - self._cache_timestamp) > self._cache_ttl:
             self.analyze_all_channels()
-        
+
         total_costs = 0
         total_revenue = 0
         total_volume = 0
+        total_sourced_volume = 0
+        total_sourced_contribution = 0
         classifications = {}
-        
+        role_distribution = {}
+
         for p in self._profitability_cache.values():
             total_costs += p.costs.total_cost_sats
             total_revenue += p.revenue.fees_earned_sats
             total_volume += p.revenue.volume_routed_sats
-            
+            total_sourced_volume += p.revenue.sourced_volume_sats
+            total_sourced_contribution += p.revenue.sourced_fee_contribution_sats
+
             cls = p.classification.value
             classifications[cls] = classifications.get(cls, 0) + 1
-        
+
+            # Track role distribution (Issue #21)
+            role = p.channel_role.value
+            role_distribution[role] = role_distribution.get(role, 0) + 1
+
         net_profit = total_revenue - total_costs
         overall_roi = (net_profit / total_costs * 100) if total_costs > 0 else 0
-        
+
         return {
             "total_channels": len(self._profitability_cache),
             "total_cost_sats": total_costs,
@@ -707,8 +775,63 @@ class ChannelProfitabilityAnalyzer:
             "total_volume_routed_sats": total_volume,
             "classifications": classifications,
             "zombie_channels": len(self.get_zombie_channels()),
-            "cache_age_seconds": int(time.time()) - self._cache_timestamp
+            "cache_age_seconds": int(time.time()) - self._cache_timestamp,
+            # Issue #21: Flow direction metrics
+            "total_sourced_volume_sats": total_sourced_volume,
+            "total_sourced_contribution_sats": total_sourced_contribution,
+            "role_distribution": role_distribution
         }
+
+    def get_channels_by_role(self, role: ChannelRole) -> List[ChannelProfitability]:
+        """
+        Get all channels with a specific flow role.
+
+        Args:
+            role: ChannelRole to filter by
+
+        Returns:
+            List of ChannelProfitability objects with the specified role
+        """
+        if (int(time.time()) - self._cache_timestamp) > self._cache_ttl:
+            self.analyze_all_channels()
+
+        return [
+            p for p in self._profitability_cache.values()
+            if p.channel_role == role
+        ]
+
+    def get_inbound_gateways(self) -> List[ChannelProfitability]:
+        """
+        Get channels that primarily source inbound volume.
+
+        These channels are valuable because they bring payments into the node,
+        enabling routing revenue on outbound channels.
+
+        Returns:
+            List sorted by sourced fee contribution (highest first)
+        """
+        gateways = self.get_channels_by_role(ChannelRole.INBOUND_GATEWAY)
+        return sorted(
+            gateways,
+            key=lambda p: p.revenue.sourced_fee_contribution_sats,
+            reverse=True
+        )
+
+    def get_outbound_gateways(self) -> List[ChannelProfitability]:
+        """
+        Get channels that primarily exit payments to the network.
+
+        These channels earn direct routing fees.
+
+        Returns:
+            List sorted by fees earned (highest first)
+        """
+        gateways = self.get_channels_by_role(ChannelRole.OUTBOUND_GATEWAY)
+        return sorted(
+            gateways,
+            key=lambda p: p.revenue.fees_earned_sats,
+            reverse=True
+        )
     
     def get_lifetime_report(self) -> Dict[str, Any]:
         """
