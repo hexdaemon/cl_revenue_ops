@@ -1582,8 +1582,8 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             "onchain_sats": onchain_sats,
             "channel_sats": channel_sats,
             "total_liquid_sats": total_liquid,
-            "wallet_reserve_sats": cfg.wallet_reserve_sats,
-            "reserve_ok": total_liquid >= cfg.wallet_reserve_sats,
+            "wallet_reserve_sats": cfg.min_wallet_reserve,
+            "reserve_ok": total_liquid >= cfg.min_wallet_reserve,
             "daily_budget_sats": daily_budget,
             "daily_spent_sats": daily_spent,
             "daily_reserved_sats": daily_reserved,
@@ -1595,9 +1595,9 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             "success_rate": spend_info.get('success_rate', 0.0)
         }
 
-        if total_liquid < cfg.wallet_reserve_sats:
+        if total_liquid < cfg.min_wallet_reserve:
             result["rejection_reasons"].append(
-                f"Wallet reserve violated: {total_liquid} < {cfg.wallet_reserve_sats}"
+                f"Wallet reserve violated: {total_liquid} < {cfg.min_wallet_reserve}"
             )
         if budget_remaining <= 0:
             result["rejection_reasons"].append(
