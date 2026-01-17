@@ -1075,10 +1075,6 @@ class EVRebalancer:
             self.plugin.log(f"Cleaned {cleaned} stale budget reservations before rebalance cycle")
 
         try:
-            # CRITICAL-01 FIX: Clean up stale budget reservations periodically
-            # Reservations older than 4 hours are likely from crashed jobs
-            self.database.cleanup_stale_reservations(max_age_seconds=14400)
-
             # First, monitor existing jobs and clean up finished ones
             if self.job_manager.active_job_count > 0:
                 monitor_result = self.job_manager.monitor_jobs()
