@@ -699,20 +699,66 @@ class ChannelProfitabilityAnalyzer:
             timestamp=int(time.time())
         )
     
-    def get_zombie_channels(self) -> List[ChannelProfitability]:
+    def get_zombie_channels(self, validate_exists: bool = True) -> List[ChannelProfitability]:
         """
         Get list of zombie channels that should be considered for closure.
-        
+
+        Issue #29: Now validates that channels still exist before reporting them
+        as zombies. This prevents false positives from closed channels lingering
+        in the profitability cache.
+
+        Args:
+            validate_exists: If True (default), cross-reference with active
+                           channel list to filter out closed channels.
+
         Returns:
             List of ChannelProfitability for zombie channels
         """
         if (int(time.time()) - self._cache_timestamp) > self._cache_ttl:
             self.analyze_all_channels()
-        
-        return [
+
+        zombies = [
             p for p in self._profitability_cache.values()
             if p.classification == ProfitabilityClass.ZOMBIE
         ]
+
+        if validate_exists:
+            # Get current active channel IDs
+            active_channel_ids = set(self._get_all_channels().keys())
+            # Filter to only include channels that still exist
+            zombies = [z for z in zombies if z.channel_id in active_channel_ids]
+
+        return zombies
+
+    def prune_closed_channels(self) -> int:
+        """
+        Remove closed channels from profitability cache (Issue #29).
+
+        This prevents stale data from closed channels from accumulating
+        in the cache and causing false positive zombie reports.
+
+        Returns:
+            Number of entries removed from cache
+        """
+        # Get current active channel IDs
+        active_channel_ids = set(self._get_all_channels().keys())
+
+        # Find closed channels in cache
+        cached_ids = set(self._profitability_cache.keys())
+        closed_ids = cached_ids - active_channel_ids
+
+        # Remove closed channels from cache
+        for channel_id in closed_ids:
+            del self._profitability_cache[channel_id]
+
+        if closed_ids:
+            self.plugin.log(
+                f"Pruned {len(closed_ids)} closed channels from profitability cache: "
+                f"{list(closed_ids)[:5]}{'...' if len(closed_ids) > 5 else ''}",
+                level='debug'
+            )
+
+        return len(closed_ids)
     
     def get_profitable_channels(self) -> List[ChannelProfitability]:
         """
