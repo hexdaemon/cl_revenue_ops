@@ -1678,15 +1678,22 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     if database is None or fee_controller is None:
         return {"error": "Plugin not fully initialized"}
 
+    # Import fee controller constants for accurate debug output
+    from .modules.fee_controller import HillClimbingFeeController
+    min_obs_hours = HillClimbingFeeController.MIN_OBSERVATION_HOURS
+    min_forwards = HillClimbingFeeController.MIN_FORWARDS_FOR_SIGNAL
+    max_obs_hours = HillClimbingFeeController.MAX_OBSERVATION_HOURS
+    enable_dyn_windows = HillClimbingFeeController.ENABLE_DYNAMIC_WINDOWS
+
     now = int(time.time())
     result = {
         "timestamp": now,
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
-            "min_observation_hours": 1.0,
-            "min_forwards_for_signal": 5,
-            "max_observation_hours": 24.0,
-            "enable_dynamic_windows": True
+            "min_observation_hours": min_obs_hours,
+            "min_forwards_for_signal": min_forwards,
+            "max_observation_hours": max_obs_hours,
+            "enable_dynamic_windows": enable_dyn_windows
         },
         "channels": [],
         "summary": {
@@ -1729,8 +1736,8 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             skip_reason = f"WAITING_TIME ({hours_since_update:.2f}h < 1h min)"
             status = "waiting_time"
             result["summary"]["waiting_time"] += 1
-        elif forward_count < 5:
-            skip_reason = f"WAITING_FORWARDS ({forward_count}/5 forwards)"
+        elif forward_count < min_forwards:
+            skip_reason = f"WAITING_FORWARDS ({forward_count}/{min_forwards} forwards)"
             status = "waiting_forwards"
             result["summary"]["waiting_forwards"] += 1
         else:
@@ -1764,7 +1771,7 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
     """
     if flow_analyzer is None:
         return {"error": "Plugin not fully initialized"}
-    
+
     if channel_id:
         result = flow_analyzer.analyze_channel(channel_id)
         return {"channel": channel_id, "analysis": result.to_dict() if result else None}
@@ -1772,6 +1779,26 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
         run_flow_analysis()
         return {"status": "Flow analysis triggered"}
 
+
+@plugin.method("revenue-wake-all")
+def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Wake all sleeping channels immediately.
+
+    Use this after changing fee_interval or when you need to force
+    all channels to re-evaluate their fees on the next cycle.
+
+    Usage: lightning-cli revenue-wake-all
+    """
+    if fee_controller is None:
+        return {"error": "Plugin not fully initialized"}
+
+    woken = fee_controller.wake_all_sleeping_channels()
+    return {
+        "status": "ok",
+        "channels_woken": woken,
+        "message": f"Woke {woken} sleeping channel(s). They will be evaluated on the next fee cycle."
+    }
 
 
 @plugin.method("revenue-capacity-report")

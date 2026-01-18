@@ -803,7 +803,7 @@ class HillClimbingFeeController:
     # These reduce gossip noise by suppressing fee updates when the market is stable
     STABILITY_THRESHOLD = 0.01   # 1% change - consider market stable if below this
     WAKE_UP_THRESHOLD = 0.20     # 20% revenue spike triggers immediate wake-up
-    SLEEP_CYCLES = 4             # Sleep for 4x the fee interval
+    SLEEP_CYCLES = 2             # Sleep for 2x the fee interval (faster adaptation)
     STABLE_CYCLES_REQUIRED = 3   # Number of flat cycles before entering sleep mode
 
     # ==========================================================================
@@ -1004,21 +1004,88 @@ class HillClimbingFeeController:
             Number of stale states pruned
         """
         pruned = 0
-        
-        # Prune Hill Climbing states
+
+        # Prune Hill Climbing states from memory
         stale_keys = [k for k in self._hill_climb_states.keys() if k not in active_channel_ids]
         for key in stale_keys:
             del self._hill_climb_states[key]
             pruned += 1
-        
+
+        # Also prune from database to prevent stale entries in debug output
+        # Get all fee states from database and remove those for closed channels
+        try:
+            db_states = self.database.get_all_fee_strategy_states()
+            db_pruned = 0
+            for state in db_states:
+                channel_id = state.get("channel_id", "")
+                if channel_id and channel_id not in active_channel_ids:
+                    self.database.reset_fee_strategy_state(channel_id)
+                    db_pruned += 1
+            if db_pruned > 0:
+                self.plugin.log(
+                    f"GC: Pruned {db_pruned} stale fee states from database (closed channels)",
+                    level='info'
+                )
+                pruned += db_pruned
+        except Exception as e:
+            self.plugin.log(f"GC: Error pruning database states: {e}", level='warning')
+
         if pruned > 0:
             self.plugin.log(
-                f"GC: Pruned {pruned} stale Hill Climbing states from closed channels",
+                f"GC: Pruned {pruned} total stale Hill Climbing states from closed channels",
                 level='debug'
             )
-        
+
         return pruned
-    
+
+    def wake_all_sleeping_channels(self) -> int:
+        """
+        Wake all sleeping channels immediately.
+
+        Call this when fee_interval changes or when you need to force
+        all channels to re-evaluate their fees immediately.
+
+        Returns:
+            Number of channels woken up
+        """
+        woken = 0
+        now = int(time.time())
+
+        # Wake in-memory states
+        for channel_id, state in self._hill_climb_states.items():
+            if state.is_sleeping:
+                state.is_sleeping = False
+                state.sleep_until = 0
+                state.stable_cycles = 0
+                self._save_hill_climb_state(channel_id, state)
+                woken += 1
+
+        # Also wake any sleeping channels in database not in memory
+        try:
+            db_states = self.database.get_all_fee_strategy_states()
+            for db_state in db_states:
+                channel_id = db_state.get("channel_id", "")
+                if channel_id and db_state.get("is_sleeping", 0):
+                    if channel_id not in self._hill_climb_states:
+                        # Load, wake, and save
+                        hc_state = self._get_hill_climb_state(channel_id)
+                        if hc_state.is_sleeping:
+                            hc_state.is_sleeping = False
+                            hc_state.sleep_until = 0
+                            hc_state.stable_cycles = 0
+                            self._save_hill_climb_state(channel_id, hc_state)
+                            woken += 1
+        except Exception as e:
+            self.plugin.log(f"Error waking database states: {e}", level='warning')
+
+        if woken > 0:
+            self.plugin.log(
+                f"WAKE_ALL: Woke {woken} sleeping channels",
+                level='info'
+            )
+
+        return woken
+
     def adjust_all_fees(self) -> List[FeeAdjustment]:
         """
         Adjust fees for all channels using Hill Climbing optimization.
@@ -1963,6 +2030,11 @@ class HillClimbingFeeController:
             hc_state.step_ppm = step_ppm
             hc_state.last_update = now  # Reset observation timer
             self._save_hill_climb_state(channel_id, hc_state)
+            self.plugin.log(
+                f"IDEMPOTENT: {channel_id[:12]}... target fee {new_fee_ppm} ppm already set on chain. "
+                f"Observation window reset, no RPC needed.",
+                level='debug'
+            )
             return None
         
         # Apply the fee change (Significant change -> Broadcast)
@@ -2066,7 +2138,21 @@ class HillClimbingFeeController:
             "fee_ppm": fee_ppm,
             "message": ""
         }
-        
+
+        # BUG FIX: Wake sleeping channel on manual fee change
+        # A manual override should reset the observation window
+        if manual and channel_id in self._hill_climb_states:
+            hc_state = self._hill_climb_states[channel_id]
+            if hc_state.is_sleeping:
+                hc_state.is_sleeping = False
+                hc_state.sleep_until = 0
+                hc_state.stable_cycles = 0
+                self._save_hill_climb_state(channel_id, hc_state)
+                self.plugin.log(
+                    f"MANUAL_WAKE: Channel {channel_id[:12]}... woken due to manual fee change",
+                    level='info'
+                )
+
         try:
             # Get channel info to find peer ID and current fee
             channels = self._get_channels_info()
