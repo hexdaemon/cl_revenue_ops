@@ -18,7 +18,12 @@ sling (Rebalancing Engine - required)
 Core Lightning
 ```
 
-`cl-revenue-ops` works standalone or alongside [cl-hive](https://github.com/santyr/cl-hive) for fleet coordination.
+`cl-revenue-ops` works in two modes:
+
+- **Standalone Mode:** Full functionality for individual node operators
+- **Hive Mode:** Enhanced features when connected to a [cl-hive](https://github.com/santyr/cl-hive) fleet
+
+Both modes use the same codebase. Hive features activate automatically when cl-hive is detected, or can be explicitly controlled via configuration.
 
 ## Key Features
 
@@ -74,6 +79,48 @@ Centralized control via `revenue-policy` command.
 - **Zero-Fee Routing:** Supports internal fleet whitelisting
 - **Inventory Load Balancing:** Supports "Push" rebalancing via Strategic Exemptions
 
+## Operating Modes
+
+cl-revenue-ops supports two operating modes:
+
+### Standalone Mode
+
+When running without cl-hive (or with `revenue-ops-hive-enabled=false`), you get:
+
+- Hill Climbing fee optimization
+- EV-based rebalancing
+- Per-channel profitability tracking
+- Financial dashboard and reporting
+- Policy-based peer management
+
+This is the full feature set for individual node operators who don't want to participate in a fleet.
+
+### Hive Mode
+
+When connected to a cl-hive fleet (detected automatically or via `revenue-ops-hive-enabled=true`), you unlock additional features:
+
+| Feature | Description |
+|---------|-------------|
+| **Coordinated Fees** | Fleet-wide fee recommendations to avoid internal competition |
+| **Fee Intelligence** | Shared competitor analysis across fleet members |
+| **Rebalance Coordination** | Conflict detection prevents competing for same routes |
+| **Collective Defense** | Mycelium-inspired defense against drain attacks |
+| **Anticipatory Liquidity** | Predictive rebalancing based on temporal patterns |
+| **Time-Based Fees** | Peak/low hour fee adjustments from pattern analysis |
+
+**Check your mode:**
+```bash
+lightning-cli revenue-hive-status
+```
+
+**Explicitly set mode:**
+```bash
+# In your CLN config:
+revenue-ops-hive-enabled=false  # Force standalone
+revenue-ops-hive-enabled=true   # Require hive
+revenue-ops-hive-enabled=auto   # Auto-detect (default)
+```
+
 ### Module 7: Accounting v2.0 (Closure & Splice Tracking)
 - **Complete P&L Formula:** `Net P&L = Revenue - (Opening + Closure + Splice + Rebalance)`
 - **Channel Closure Detection:** Subscribes to `channel_state_changed`
@@ -122,6 +169,7 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 | Command | Description |
 |---------|-------------|
 | `revenue-status` | Check plugin health and active background jobs |
+| `revenue-hive-status` | Check hive integration status and available features |
 | `revenue-config set <key> <value>` | Hot-swap configuration without restart |
 | `revenue-analyze` | Force immediate flow analysis |
 
@@ -237,8 +285,14 @@ All options can be set in your CLN config file or via `revenue-config set`.
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `revenue-ops-hive-enabled` | `auto` | Hive mode: `auto` (detect), `true` (require), `false` (standalone) |
 | `revenue-ops-hive-fee-ppm` | `0` | Fee for Hive fleet members |
 | `revenue-ops-hive-rebalance-tolerance` | `50` | Max loss when rebalancing to Hive |
+
+**Hive Mode Settings:**
+- `auto` (default): Automatically detect cl-hive. If found, enable hive features. Otherwise, run standalone.
+- `true`: Require hive features. Warns if cl-hive not detected but continues in degraded mode.
+- `false`: Explicitly disable hive features. Runs in standalone mode even if cl-hive is present.
 
 ### CLBoss Integration
 

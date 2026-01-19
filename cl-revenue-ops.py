@@ -740,6 +740,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-hive-enabled',
+    default='auto',
+    description='Hive mode: "auto" (detect cl-hive), "true" (require hive), "false" (standalone only)'
+)
+
+plugin.add_option(
     name='revenue-ops-hive-fee-ppm',
     default='0',
     description='Fee rate charged to Hive fleet members (default: 0)',
@@ -824,6 +830,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rpc_circuit_breaker_seconds=int(options['revenue-ops-rpc-circuit-breaker-seconds']),
         reservation_timeout_hours=int(options['revenue-ops-reservation-timeout-hours']),
         # Phase 9: Hive Integration (cl-hive fleet coordination)
+        hive_enabled=options['revenue-ops-hive-enabled'].lower(),
         hive_fee_ppm=int(options['revenue-ops-hive-fee-ppm']),
         hive_rebalance_tolerance=int(options['revenue-ops-hive-rebalance-tolerance'])
     )
@@ -1004,11 +1011,43 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     plugin.log("PolicyManager initialized for peer-level fee/rebalance policies")
 
     # Initialize hive bridge for competitor intelligence and NNLB health (v1.6)
-    hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database)
-    if hive_bridge.is_available():
-        plugin.log("HiveFeeIntelligenceBridge initialized (cl-hive detected)")
+    # Respect hive_enabled setting: "auto", "true", "false"
+    if config.hive_enabled == 'false':
+        # Standalone mode - no hive integration
+        hive_bridge = None
+        plugin.log("=" * 60)
+        plugin.log("STANDALONE MODE: Hive integration disabled (hive-enabled=false)")
+        plugin.log("All fee optimization and rebalancing will use local-only algorithms")
+        plugin.log("To join a hive, set revenue-ops-hive-enabled=auto or true")
+        plugin.log("=" * 60)
     else:
-        plugin.log("HiveFeeIntelligenceBridge initialized (cl-hive not detected, local-only mode)")
+        # Auto or required hive mode
+        hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database)
+        hive_available = hive_bridge.is_available()
+
+        if config.hive_enabled == 'true' and not hive_available:
+            # Required mode but hive not available - warn but continue
+            plugin.log("=" * 60, level='warn')
+            plugin.log("WARNING: hive-enabled=true but cl-hive plugin not detected!", level='warn')
+            plugin.log("Hive features will be unavailable until cl-hive is running", level='warn')
+            plugin.log("Plugin will continue in degraded mode", level='warn')
+            plugin.log("=" * 60, level='warn')
+        elif hive_available:
+            plugin.log("=" * 60)
+            plugin.log("HIVE MODE ACTIVE: Connected to cl-hive fleet coordination")
+            plugin.log("Hive features enabled:")
+            plugin.log("  - Coordinated fee recommendations")
+            plugin.log("  - Fleet-wide fee intelligence")
+            plugin.log("  - Rebalancing conflict detection")
+            plugin.log("  - Collective defense against drain attacks")
+            plugin.log("  - Anticipatory liquidity predictions")
+            plugin.log("=" * 60)
+        else:
+            plugin.log("=" * 60)
+            plugin.log("STANDALONE MODE: cl-hive not detected (hive-enabled=auto)")
+            plugin.log("All fee optimization and rebalancing will use local-only algorithms")
+            plugin.log("To enable hive features, install and start cl-hive plugin")
+            plugin.log("=" * 60)
 
     # Initialize profitability analyzer with hive bridge for NNLB health reporting
     profitability_analyzer = ChannelProfitabilityAnalyzer(
@@ -1403,6 +1442,84 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
         "recent_fee_changes": fee_history,
         "recent_rebalances": rebalance_history
     }
+
+
+@plugin.method("revenue-hive-status")
+def revenue_hive_status(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Get the current hive integration status.
+
+    Shows whether hive mode is enabled, active, and available features.
+
+    Usage: lightning-cli revenue-hive-status
+    """
+    result = {
+        "hive_enabled_setting": config.hive_enabled if config else "unknown",
+        "mode": "unknown",
+        "hive_bridge_initialized": hive_bridge is not None,
+        "cl_hive_available": False,
+        "features": {
+            "coordinated_fees": False,
+            "fleet_intelligence": False,
+            "rebalance_coordination": False,
+            "collective_defense": False,
+            "anticipatory_liquidity": False,
+            "time_based_fees": False
+        },
+        "bridge_status": None,
+        "recommendations": []
+    }
+
+    if config is None:
+        result["error"] = "Plugin not fully initialized"
+        return result
+
+    # Determine mode and availability
+    if config.hive_enabled == 'false':
+        result["mode"] = "standalone"
+        result["recommendations"].append(
+            "Hive integration is disabled. To enable, set revenue-ops-hive-enabled=auto or true"
+        )
+    elif hive_bridge is None:
+        result["mode"] = "standalone"
+        result["recommendations"].append(
+            "Hive bridge not initialized. Check plugin startup logs."
+        )
+    else:
+        # Check if cl-hive is available
+        result["cl_hive_available"] = hive_bridge.is_available()
+
+        if result["cl_hive_available"]:
+            result["mode"] = "hive"
+            result["features"] = {
+                "coordinated_fees": True,
+                "fleet_intelligence": True,
+                "rebalance_coordination": True,
+                "collective_defense": True,
+                "anticipatory_liquidity": True,
+                "time_based_fees": True
+            }
+        else:
+            result["mode"] = "standalone_degraded" if config.hive_enabled == 'true' else "standalone"
+            if config.hive_enabled == 'true':
+                result["recommendations"].append(
+                    "hive-enabled=true but cl-hive not detected. Install and start cl-hive plugin."
+                )
+            else:
+                result["recommendations"].append(
+                    "cl-hive plugin not detected. Operating in standalone mode."
+                )
+
+        # Get bridge status for diagnostics
+        result["bridge_status"] = hive_bridge.get_status()
+
+    # Add hive-specific config
+    result["hive_config"] = {
+        "hive_fee_ppm": config.hive_fee_ppm,
+        "hive_rebalance_tolerance": config.hive_rebalance_tolerance
+    }
+
+    return result
 
 
 @plugin.method("revenue-rebalance-debug")

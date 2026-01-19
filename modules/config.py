@@ -62,6 +62,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'enable_scarcity_pricing': bool,
     'scarcity_threshold': float,
     # Hive Parameters
+    'hive_enabled': str,  # "auto", "true", "false"
     'hive_fee_ppm': int,
     'hive_rebalance_tolerance': int,
     # Phase 1: Operational Hardening
@@ -215,6 +216,8 @@ class Config:
     scarcity_threshold: float = 0.35       # Start pricing at 35% utilization
     
     # Hive Parameters (v1.4.0 - Strategic Rebalance Exemption)
+    # v1.6.0 - Added hive_enabled for standalone/hive mode control
+    hive_enabled: str = 'auto'         # "auto" = detect cl-hive, "true" = require hive, "false" = standalone
     hive_fee_ppm: int = 0              # The fee we charge fleet members (default 0)
     hive_rebalance_tolerance: int = 50 # Max sats we are willing to LOSE to balance a friend
     
@@ -440,6 +443,8 @@ class ConfigSnapshot:
     reservation_timeout_hours: int
 
     # Hive Parameters (v1.4.0) - MAJOR-12 FIX: Added missing fields
+    # v1.6.0 - Added hive_enabled for standalone/hive mode control
+    hive_enabled: str
     hive_fee_ppm: int
     hive_rebalance_tolerance: int
 
@@ -510,6 +515,7 @@ class ConfigSnapshot:
             rpc_timeout_seconds=config.rpc_timeout_seconds,
             rpc_circuit_breaker_seconds=config.rpc_circuit_breaker_seconds,
             reservation_timeout_hours=config.reservation_timeout_hours,
+            hive_enabled=config.hive_enabled,
             hive_fee_ppm=config.hive_fee_ppm,
             hive_rebalance_tolerance=config.hive_rebalance_tolerance,
             ema_smoothing_alpha=config.ema_smoothing_alpha,
