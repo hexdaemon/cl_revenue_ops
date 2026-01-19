@@ -764,6 +764,152 @@ class HiveFeeIntelligenceBridge:
             return {"conflict": False, "reason": "exception"}
 
     # =========================================================================
+    # PHASE 3: SPLICE COORDINATION
+    # =========================================================================
+    # Safety checks for splice operations to maintain fleet connectivity.
+    # ADVISORY ONLY - each node manages its own funds.
+
+    def check_splice_safety(
+        self,
+        peer_id: str,
+        splice_type: str,
+        amount_sats: int,
+        channel_id: str = None
+    ) -> Dict[str, Any]:
+        """
+        Check if a splice operation is safe for fleet connectivity.
+
+        SAFETY CHECK ONLY - no fund movement.
+        We manage our own splice, just checking if timing is safe.
+
+        Args:
+            peer_id: External peer we're splicing from/to
+            splice_type: "splice_in" or "splice_out"
+            amount_sats: Amount to splice in/out
+            channel_id: Optional specific channel ID
+
+        Returns:
+            Safety assessment:
+            {
+                "safe": bool,
+                "safety_level": "safe" | "coordinate" | "blocked",
+                "reason": str,
+                "can_proceed": bool,
+                "recommendation": str (if not safe),
+                "fleet_share": float,
+                "new_share": float
+            }
+        """
+        if not self.is_available():
+            # Default to safe if hive unavailable (fail open)
+            return {
+                "safe": True,
+                "safety_level": "safe",
+                "reason": "Hive unavailable, local decision",
+                "can_proceed": True
+            }
+
+        if self._is_circuit_open():
+            return {
+                "safe": True,
+                "safety_level": "safe",
+                "reason": "Circuit breaker open, local decision",
+                "can_proceed": True
+            }
+
+        try:
+            params = {
+                "peer_id": peer_id,
+                "splice_type": splice_type,
+                "amount_sats": amount_sats
+            }
+            if channel_id:
+                params["channel_id"] = channel_id
+
+            result = self.plugin.rpc.call("hive-splice-check", params)
+
+            if result.get("error"):
+                self._log(f"Splice check error: {result.get('error')}", level="debug")
+                # Fail open - allow local decision
+                return {
+                    "safe": True,
+                    "safety_level": "safe",
+                    "reason": f"Check error: {result.get('error')}",
+                    "can_proceed": True
+                }
+
+            safety = result.get("safety", "safe")
+            self._record_success()
+
+            return {
+                "safe": safety == "safe",
+                "safety_level": safety,
+                "reason": result.get("reason", ""),
+                "can_proceed": safety != "blocked",
+                "recommendation": result.get("recommendation"),
+                "fleet_capacity": result.get("fleet_capacity"),
+                "new_fleet_capacity": result.get("new_fleet_capacity"),
+                "fleet_share": result.get("fleet_share"),
+                "new_share": result.get("new_share")
+            }
+
+        except Exception as e:
+            self._log(f"Splice safety check failed: {e}", level="debug")
+            self._record_failure()
+            # Fail open - allow local decision
+            return {
+                "safe": True,
+                "safety_level": "safe",
+                "reason": f"Check failed: {e}",
+                "can_proceed": True
+            }
+
+    def get_splice_recommendations(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get splice recommendations for a specific peer.
+
+        Returns info about fleet connectivity and safe splice amounts.
+        INFORMATION ONLY - helps make informed splice decisions.
+
+        Args:
+            peer_id: External peer to analyze
+
+        Returns:
+            Recommendations or None:
+            {
+                "peer_id": str,
+                "fleet_capacity": int,
+                "our_capacity": int,
+                "other_member_capacity": int,
+                "safe_splice_out_amount": int,
+                "has_fleet_coverage": bool,
+                "recommendations": [str]
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-splice-recommendations", {
+                "peer_id": peer_id
+            })
+
+            if result.get("error"):
+                self._log(
+                    f"Splice recommendations error: {result.get('error')}",
+                    level="debug"
+                )
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to get splice recommendations: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    # =========================================================================
     # DIAGNOSTIC METHODS
     # =========================================================================
 
