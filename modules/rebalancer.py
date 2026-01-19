@@ -33,6 +33,7 @@ from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
+    from .hive_bridge import HiveFeeIntelligenceBridge
 
 
 class JobStatus(Enum):
@@ -948,26 +949,58 @@ class JobManager:
         return self.source_failure_counts.get(channel_id, 0.0)
 
 
+# =============================================================================
+# NNLB Health-Aware Rebalancing Constants
+# =============================================================================
+# Each node adjusts its OWN rebalancing based on its health tier.
+# No sats transfer between nodes - purely local optimization.
+ENABLE_NNLB_BUDGET_SCALING = True
+DEFAULT_BUDGET_MULTIPLIER = 1.0
+
+# Tier multipliers for OWN operations
+NNLB_BUDGET_MULTIPLIERS = {
+    "struggling": 2.0,    # Accept higher costs to recover own channels
+    "vulnerable": 1.5,    # Elevated priority for own recovery
+    "stable": 1.0,        # Normal operation
+    "thriving": 0.75      # Be selective, save on routing fees
+}
+
+MIN_BUDGET_MULTIPLIER = 0.5
+MAX_BUDGET_MULTIPLIER = 2.5
+HEALTH_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
 class EVRebalancer:
     """
     Expected Value based rebalancer with async job queue support.
-    
+
     This class acts as the "Strategist" - it calculates EV and determines
     IF and HOW MUCH to rebalance. The actual execution is delegated to
     the JobManager which manages sling background jobs.
+
+    NNLB Integration:
+    When cl-hive is available, the rebalancer adjusts its EV threshold
+    based on our health tier. Struggling nodes accept lower EV to recover
+    faster; thriving nodes are more selective to conserve routing fees.
     """
-    
+
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
-                 policy_manager: Optional[PolicyManager] = None):
+                 policy_manager: Optional[PolicyManager] = None,
+                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
         self.plugin = plugin
         self.config = config
         self.database = database
         self.clboss = clboss_manager
         self.policy_manager = policy_manager
+        self.hive_bridge = hive_bridge
         self._pending: Dict[str, int] = {}
         self._our_node_id: Optional[str] = None
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
+
+        # NNLB health caching
+        self._cached_health: Optional[Dict] = None
+        self._health_cache_time: float = 0
 
         # Initialize job manager for async execution
         self.job_manager = JobManager(plugin, config, database)
@@ -1026,7 +1059,51 @@ class EVRebalancer:
 
     def set_profitability_analyzer(self, analyzer: 'ChannelProfitabilityAnalyzer') -> None:
         self._profitability_analyzer = analyzer
-    
+
+    def _calculate_nnlb_budget_multiplier(self) -> float:
+        """
+        Calculate OUR rebalance budget multiplier based on OUR health.
+
+        This adjusts how aggressively WE rebalance OUR OWN channels.
+        No sats transfer to other nodes - purely local optimization.
+
+        When struggling: accept lower EV (more willing to pay fees to recover)
+        When thriving: require higher EV (be selective, save on fees)
+
+        Returns:
+            Budget multiplier (0.5 - 2.5)
+        """
+        if not ENABLE_NNLB_BUDGET_SCALING or not self.hive_bridge:
+            return DEFAULT_BUDGET_MULTIPLIER
+
+        # Check cache
+        now = time.time()
+        if (self._cached_health is not None and
+                now - self._health_cache_time < HEALTH_CACHE_TTL_SECONDS):
+            return self._cached_health.get("budget_multiplier", DEFAULT_BUDGET_MULTIPLIER)
+
+        # Query hive for OUR health (None = self)
+        health = self.hive_bridge.query_member_health()
+        if not health:
+            return DEFAULT_BUDGET_MULTIPLIER
+
+        # Cache result
+        self._cached_health = health
+        self._health_cache_time = now
+
+        tier = health.get("health_tier", "stable")
+        multiplier = NNLB_BUDGET_MULTIPLIERS.get(tier, DEFAULT_BUDGET_MULTIPLIER)
+
+        # Clamp to bounds
+        multiplier = max(MIN_BUDGET_MULTIPLIER, min(MAX_BUDGET_MULTIPLIER, multiplier))
+
+        self.plugin.log(
+            f"NNLB: Our health tier={tier}, budget_multiplier={multiplier:.2f}",
+            level='debug'
+        )
+
+        return multiplier
+
     def find_rebalance_candidates(self) -> List[RebalanceCandidate]:
         """
         Find channels that would benefit from rebalancing.
@@ -1532,6 +1609,18 @@ class EVRebalancer:
             profit_threshold = (rebalance_amount * self.config.rebalance_min_profit_ppm) // 1_000_000
         else:
             profit_threshold = self.config.rebalance_min_profit
+
+        # NNLB Health-Aware Threshold Adjustment:
+        # When struggling: accept lower profit (threshold / multiplier)
+        # When thriving: require higher profit (threshold / multiplier)
+        # This adjusts OUR OWN rebalancing aggression - no fund transfers.
+        nnlb_multiplier = self._calculate_nnlb_budget_multiplier()
+        if nnlb_multiplier != 1.0 and profit_threshold > 0:
+            # Divide threshold by multiplier:
+            # - Struggling (2.0x): threshold becomes 50% -> accept lower profit
+            # - Thriving (0.75x): threshold becomes 133% -> require higher profit
+            profit_threshold = int(profit_threshold / nnlb_multiplier)
+
         is_hive_transfer = False
         
         if self.policy_manager:

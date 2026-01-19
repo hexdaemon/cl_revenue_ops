@@ -18,11 +18,14 @@ Classifications:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 import time
 
 from pyln.client import Plugin
+
+if TYPE_CHECKING:
+    from .hive_bridge import HiveFeeIntelligenceBridge
 
 
 class ProfitabilityClass(Enum):
@@ -278,7 +281,8 @@ class ChannelProfitabilityAnalyzer:
     ZOMBIE_DAYS_INACTIVE = 30          # No routing for 30 days
     ZOMBIE_MIN_LOSS_SATS = 1000        # Minimum loss to be zombie
     
-    def __init__(self, plugin: Plugin, config, database):
+    def __init__(self, plugin: Plugin, config, database,
+                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
         """
         Initialize the profitability analyzer.
 
@@ -286,15 +290,21 @@ class ChannelProfitabilityAnalyzer:
             plugin: Reference to the pyln Plugin
             config: Configuration object
             database: Database instance for persistence
+            hive_bridge: Optional bridge to cl-hive for NNLB health reporting
         """
         self.plugin = plugin
         self.config = config
         self.database = database
-        
+        self.hive_bridge = hive_bridge
+
         # Cache for profitability data (refreshed periodically)
         self._profitability_cache: Dict[str, ChannelProfitability] = {}
         self._cache_timestamp: int = 0
         self._cache_ttl: int = 300  # 5 minutes
+
+        # Track last health report to avoid spam
+        self._last_health_report: int = 0
+        self._health_report_interval: int = 300  # Report every 5 minutes max
         
     def _parse_msat(self, msat_val: Any) -> int:
         """
@@ -362,10 +372,13 @@ class ChannelProfitabilityAnalyzer:
                 f"Profitability analysis complete: {len(results)} channels - "
                 f"{classifications}"
             )
-            
+
+            # Report health to cl-hive for NNLB coordination (if available)
+            self._report_health_to_hive()
+
         except Exception as e:
             self.plugin.log(f"Error in profitability analysis: {e}", level='error')
-        
+
         return results
     
     def analyze_channel(self, channel_id: str, 
@@ -803,6 +816,118 @@ class ChannelProfitabilityAnalyzer:
             "total_sourced_contribution_sats": total_sourced_contribution,
             "role_distribution": role_distribution
         }
+
+    def _report_health_to_hive(self) -> bool:
+        """
+        Report our health status to cl-hive for NNLB coordination.
+
+        This shares INFORMATION only - no sats move between nodes.
+        The health data is used by cl-hive to calculate our NNLB health tier,
+        which affects how aggressively we rebalance our own channels.
+
+        Returns:
+            True if reported successfully, False otherwise
+        """
+        if not self.hive_bridge:
+            return False
+
+        # Rate limit health reports
+        now = int(time.time())
+        if (now - self._last_health_report) < self._health_report_interval:
+            return False
+
+        # Get current summary
+        summary = self.get_summary()
+        classifications = summary.get("classifications", {})
+        total_channels = summary.get("total_channels", 0)
+
+        # Extract classification counts
+        profitable = classifications.get("profitable", 0)
+        underwater = classifications.get("underwater", 0)
+        stagnant = classifications.get("stagnant_candidate", 0)
+        zombie = classifications.get("zombie", 0)
+
+        # Determine revenue trend from ROI
+        roi = summary.get("overall_roi_percent", 0)
+        if roi > 5:
+            revenue_trend = "improving"
+        elif roi < -5:
+            revenue_trend = "declining"
+        else:
+            revenue_trend = "stable"
+
+        # Calculate liquidity score from channel balance distribution
+        liquidity_score = self._calculate_liquidity_score()
+
+        # Report to hive
+        success = self.hive_bridge.report_health_update(
+            profitable_channels=profitable,
+            underwater_channels=underwater + zombie,  # Combine underwater + zombie
+            stagnant_channels=stagnant,
+            total_channels=total_channels,
+            revenue_trend=revenue_trend,
+            liquidity_score=liquidity_score
+        )
+
+        if success:
+            self._last_health_report = now
+            self.plugin.log(
+                f"NNLB: Reported health to hive - profitable={profitable}, "
+                f"underwater={underwater + zombie}, stagnant={stagnant}, "
+                f"trend={revenue_trend}",
+                level='debug'
+            )
+
+        return success
+
+    def _calculate_liquidity_score(self) -> int:
+        """
+        Calculate liquidity balance score from channel data.
+
+        A well-balanced node has channels near 50% local balance.
+        Depleted (<20%) or saturated (>80%) channels hurt the score.
+
+        Returns:
+            Liquidity score (0-100, higher is better)
+        """
+        if not self._profitability_cache:
+            return 50  # Default to neutral
+
+        total_penalty = 0
+        count = 0
+
+        for channel_id, prof in self._profitability_cache.items():
+            # Get channel state for balance info
+            state = self.database.get_channel_state(channel_id)
+            if not state:
+                continue
+
+            local = state.get("local_balance_sats", 0)
+            capacity = state.get("capacity_sats", 0)
+            if capacity <= 0:
+                continue
+
+            local_pct = local / capacity
+
+            # Calculate distance from ideal (50%)
+            distance = abs(local_pct - 0.5)
+
+            # Penalty increases with distance from 50%
+            # 0% or 100% local = 50 penalty points (worst)
+            # 50% local = 0 penalty points (ideal)
+            penalty = distance * 100
+            total_penalty += penalty
+            count += 1
+
+        if count == 0:
+            return 50
+
+        # Average penalty across channels
+        avg_penalty = total_penalty / count
+
+        # Convert to score (0-100, higher is better)
+        score = int(max(0, min(100, 100 - avg_penalty)))
+        return score
 
     def get_channels_by_role(self, role: ChannelRole) -> List[ChannelProfitability]:
         """

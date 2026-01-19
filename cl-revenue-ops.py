@@ -1002,22 +1002,27 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize policy manager (v1.4: Policy-Driven Architecture)
     policy_manager = PolicyManager(database, safe_plugin)
     plugin.log("PolicyManager initialized for peer-level fee/rebalance policies")
-    
-    # Initialize profitability analyzer
-    profitability_analyzer = ChannelProfitabilityAnalyzer(safe_plugin, config, database)
 
-    # Initialize hive bridge for competitor intelligence (v1.6)
+    # Initialize hive bridge for competitor intelligence and NNLB health (v1.6)
     hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database)
     if hive_bridge.is_available():
         plugin.log("HiveFeeIntelligenceBridge initialized (cl-hive detected)")
     else:
         plugin.log("HiveFeeIntelligenceBridge initialized (cl-hive not detected, local-only mode)")
 
+    # Initialize profitability analyzer with hive bridge for NNLB health reporting
+    profitability_analyzer = ChannelProfitabilityAnalyzer(
+        safe_plugin, config, database, hive_bridge=hive_bridge
+    )
+
     # Initialize analysis modules with profitability analyzer and hive bridge
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
     capacity_planner = CapacityPlanner(safe_plugin, config, profitability_analyzer, flow_analyzer)
     fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, policy_manager, profitability_analyzer, hive_bridge)
-    rebalancer = EVRebalancer(safe_plugin, config, database, clboss_manager, policy_manager)
+    rebalancer = EVRebalancer(
+        safe_plugin, config, database, clboss_manager, policy_manager,
+        hive_bridge=hive_bridge
+    )
     rebalancer.set_profitability_analyzer(profitability_analyzer)
     
     # Set up periodic background tasks using threading

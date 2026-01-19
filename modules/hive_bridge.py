@@ -461,6 +461,148 @@ class HiveFeeIntelligenceBridge:
             return False
 
     # =========================================================================
+    # NNLB HEALTH QUERIES (Phase 1 - NNLB-Aware Rebalancing)
+    # =========================================================================
+
+    def query_member_health(self, member_id: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Query NNLB health score for a member.
+
+        Information sharing only - used to adjust OWN rebalancing priorities.
+        No fund transfers between nodes.
+
+        Args:
+            member_id: Member to query (None for self)
+
+        Returns:
+            Health data dict or None if unavailable:
+            {
+                "member_id": "02abc...",
+                "health_score": 65,
+                "health_tier": "stable",
+                "budget_multiplier": 1.0,
+                "capacity_score": 70,
+                "revenue_score": 60,
+                ...
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {"action": "query"}
+            if member_id:
+                params["member_id"] = member_id
+
+            result = self.plugin.rpc.call("hive-member-health", params)
+
+            if result.get("error"):
+                self._log(f"Health query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query member health: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def query_fleet_health(self) -> Optional[Dict[str, Any]]:
+        """
+        Query aggregated fleet health for situational awareness.
+
+        Returns:
+            Fleet health summary or None if unavailable:
+            {
+                "fleet_health": 58,
+                "member_count": 5,
+                "struggling_count": 1,
+                "vulnerable_count": 2,
+                "stable_count": 2,
+                "thriving_count": 0,
+                "members": [...]
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-member-health", {
+                "member_id": "all",
+                "action": "aggregate"
+            })
+
+            if result.get("error"):
+                self._log(f"Fleet health query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query fleet health: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def report_health_update(
+        self,
+        profitable_channels: int,
+        underwater_channels: int,
+        stagnant_channels: int,
+        total_channels: int = None,
+        revenue_trend: str = "stable",
+        liquidity_score: int = 50
+    ) -> bool:
+        """
+        Report our health status to cl-hive.
+
+        Shares information so fleet knows our state.
+        No sats move - purely informational.
+
+        Args:
+            profitable_channels: Number of profitable channels
+            underwater_channels: Number of underwater channels
+            stagnant_channels: Number of stagnant channels
+            total_channels: Total channel count (optional)
+            revenue_trend: "improving", "stable", or "declining"
+            liquidity_score: Balance distribution score (0-100)
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        try:
+            params = {
+                "profitable_channels": profitable_channels,
+                "underwater_channels": underwater_channels,
+                "stagnant_channels": stagnant_channels,
+                "revenue_trend": revenue_trend,
+                "liquidity_score": liquidity_score
+            }
+            if total_channels is not None:
+                params["total_channels"] = total_channels
+
+            result = self.plugin.rpc.call("hive-report-health", params)
+
+            if result.get("error"):
+                self._log(f"Health report error: {result.get('error')}", level="debug")
+                return False
+
+            self._log(
+                f"Health reported: score={result.get('health_score')}, "
+                f"tier={result.get('health_tier')}, "
+                f"multiplier={result.get('budget_multiplier')}"
+            )
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to report health: {e}", level="debug")
+            return False
+
+    # =========================================================================
     # DIAGNOSTIC METHODS
     # =========================================================================
 
