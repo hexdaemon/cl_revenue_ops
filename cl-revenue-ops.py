@@ -52,6 +52,7 @@ from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
 from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
+from modules.hive_bridge import HiveFeeIntelligenceBridge
 
 
 # =============================================================================
@@ -576,6 +577,7 @@ capacity_planner: Optional[CapacityPlanner] = None
 rpc_broker: Optional['RpcBroker'] = None  # RPC broker subprocess
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
+hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligence
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
@@ -1004,10 +1006,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize profitability analyzer
     profitability_analyzer = ChannelProfitabilityAnalyzer(safe_plugin, config, database)
 
-    # Initialize analysis modules with profitability analyzer
+    # Initialize hive bridge for competitor intelligence (v1.6)
+    hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database)
+    if hive_bridge.is_available():
+        plugin.log("HiveFeeIntelligenceBridge initialized (cl-hive detected)")
+    else:
+        plugin.log("HiveFeeIntelligenceBridge initialized (cl-hive not detected, local-only mode)")
+
+    # Initialize analysis modules with profitability analyzer and hive bridge
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
     capacity_planner = CapacityPlanner(safe_plugin, config, profitability_analyzer, flow_analyzer)
-    fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, policy_manager, profitability_analyzer)
+    fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, policy_manager, profitability_analyzer, hive_bridge)
     rebalancer = EVRebalancer(safe_plugin, config, database, clboss_manager, policy_manager)
     rebalancer.set_profitability_analyzer(profitability_analyzer)
     

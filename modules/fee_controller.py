@@ -48,6 +48,7 @@ from .policy_manager import PolicyManager, FeeStrategy
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
+    from .hive_bridge import HiveFeeIntelligenceBridge
 
 
 # =============================================================================
@@ -878,10 +879,20 @@ class HillClimbingFeeController:
     COLD_START_STEP_PPM = 50          # Larger step for aggressive price discovery
     COLD_START_MAX_FEE_PPM = 100      # Force ceiling down during cold-start
 
+    # ==========================================================================
+    # Hive Fee Intelligence Integration (Phase 1)
+    # ==========================================================================
+    # Query cl-hive for competitor fee data to inform bounds calculation.
+    # Gracefully degrades to local-only mode if cl-hive unavailable.
+    ENABLE_HIVE_INTELLIGENCE = True   # Feature flag
+    HIVE_INTELLIGENCE_WEIGHT = 0.25   # How much to weight hive data (0-1)
+    HIVE_MIN_CONFIDENCE = 0.3         # Ignore data below this confidence
+
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
-                 profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None):
+                 profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
+                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
         """
         Initialize the fee controller.
 
@@ -892,6 +903,7 @@ class HillClimbingFeeController:
             clboss_manager: ClbossManager for handling overrides
             policy_manager: Optional PolicyManager for peer-level fee policies
             profitability_analyzer: Optional profitability analyzer for ROI-based adjustments
+            hive_bridge: Optional HiveFeeIntelligenceBridge for competitor intelligence
         """
         self.plugin = plugin
         self.config = config
@@ -899,10 +911,11 @@ class HillClimbingFeeController:
         self.clboss = clboss_manager
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
-        
+        self.hive_bridge = hive_bridge
+
         # In-memory cache of Hill Climbing states (also persisted to DB)
         self._hill_climb_states: Dict[str, HillClimbState] = {}
-        
+
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
 
@@ -997,6 +1010,103 @@ class HillClimbingFeeController:
                 level='warn'
             )
             return base_ceiling
+
+    def _get_competitor_adjusted_bounds(
+        self,
+        peer_id: str,
+        base_floor: int,
+        base_ceiling: int,
+        our_market_share: float = 0.0
+    ) -> Tuple[int, int]:
+        """
+        Adjust fee bounds based on competitor intelligence from cl-hive.
+
+        Strategy:
+        1. High competitor fees + low market share -> opportunity to undercut
+        2. Low competitor fees + elastic demand -> must stay competitive
+        3. Use optimal_fee_estimate to guide ceiling
+
+        All adjustments are weighted by confidence score to prevent
+        low-quality data from causing large swings.
+
+        Args:
+            peer_id: External peer we're setting fees toward
+            base_floor: Calculated floor from liquidity/balance
+            base_ceiling: Calculated ceiling from config
+            our_market_share: Our share of this peer's capacity (0-1)
+
+        Returns:
+            (adjusted_floor, adjusted_ceiling)
+        """
+        if not self.ENABLE_HIVE_INTELLIGENCE or not self.hive_bridge:
+            return base_floor, base_ceiling
+
+        intel = self.hive_bridge.query_fee_intelligence(peer_id)
+        if not intel:
+            return base_floor, base_ceiling
+
+        confidence = intel.get("confidence", 0)
+        if confidence < self.HIVE_MIN_CONFIDENCE:
+            return base_floor, base_ceiling
+
+        their_avg_fee = intel.get("avg_fee_charged", 0)
+        optimal_estimate = intel.get("optimal_fee_estimate", 0)
+        market_share = intel.get("market_share", our_market_share)
+        elasticity = intel.get("estimated_elasticity", -1.0)
+
+        # Weight = base weight * confidence
+        weight = self.HIVE_INTELLIGENCE_WEIGHT * confidence
+
+        adjusted_floor = base_floor
+        adjusted_ceiling = base_ceiling
+
+        # STRATEGY 1: Undercut opportunity
+        # If competitor charges high fees and we have low market share,
+        # we can capture flow by being slightly cheaper
+        if their_avg_fee > 0 and market_share < 0.20:
+            if their_avg_fee > base_ceiling * 0.8:
+                # Their fees are near our ceiling - undercut by 10%
+                undercut_ceiling = int(their_avg_fee * 0.90)
+                adjusted_ceiling = int(
+                    undercut_ceiling * weight + base_ceiling * (1 - weight)
+                )
+                self.plugin.log(
+                    f"HIVE_INTEL: {peer_id[:12]}... undercut opportunity "
+                    f"(their_avg={their_avg_fee}, ceiling={base_ceiling}->{adjusted_ceiling})",
+                    level='debug'
+                )
+
+        # STRATEGY 2: Competitive pressure
+        # If competitor charges low fees and demand is elastic,
+        # we need to lower our floor to stay competitive
+        if their_avg_fee > 0 and their_avg_fee < base_floor:
+            if elasticity < -0.5:  # Elastic demand (negative elasticity)
+                competitive_floor = int(their_avg_fee * 0.90)
+                adjusted_floor = int(
+                    competitive_floor * weight + base_floor * (1 - weight)
+                )
+                # Never go below global minimum
+                adjusted_floor = max(adjusted_floor, self.config.min_fee_ppm)
+                self.plugin.log(
+                    f"HIVE_INTEL: {peer_id[:12]}... competitive pressure "
+                    f"(their_avg={their_avg_fee}, floor={base_floor}->{adjusted_floor})",
+                    level='debug'
+                )
+
+        # STRATEGY 3: Use optimal estimate
+        # If we have high-confidence optimal fee estimate, use it to guide ceiling
+        if optimal_estimate > 0 and confidence > 0.5:
+            # Set ceiling at 120% of optimal (room for Hill Climbing)
+            suggested_ceiling = int(optimal_estimate * 1.20)
+            adjusted_ceiling = int(
+                suggested_ceiling * weight + adjusted_ceiling * (1 - weight)
+            )
+
+        # Ensure floor <= ceiling with 10ppm buffer
+        if adjusted_floor >= adjusted_ceiling:
+            adjusted_floor = max(1, adjusted_ceiling - 10)
+
+        return adjusted_floor, adjusted_ceiling
 
     def _prune_stale_states(self, active_channel_ids: set) -> int:
         """
@@ -1629,6 +1739,17 @@ class HillClimbingFeeController:
                 base_ceiling_ppm = min_ceiling_for_balance
 
         # =====================================================================
+        # HIVE FEE INTELLIGENCE INTEGRATION
+        # =====================================================================
+        # Query cl-hive for competitor fee data and adjust bounds accordingly.
+        # This allows network-aware fee optimization based on collective
+        # intelligence from the hive fleet.
+        if self.hive_bridge:
+            base_floor_ppm, base_ceiling_ppm = self._get_competitor_adjusted_bounds(
+                peer_id, base_floor_ppm, base_ceiling_ppm
+            )
+
+        # =====================================================================
         # IMPROVEMENT #1: Apply Multipliers to Bounds (Not Fee Directly)
         # =====================================================================
         # Instead of: new_fee = base_fee * liquidity_mult * prof_mult
@@ -2076,6 +2197,24 @@ class HillClimbingFeeController:
             hc_state.step_ppm = step_ppm
             hc_state.last_update = now
             self._save_hill_climb_state(channel_id, hc_state)
+
+            # Report observation to cl-hive for collective intelligence (Phase 2)
+            if self.hive_bridge:
+                try:
+                    self.hive_bridge.report_observation(
+                        peer_id=peer_id,
+                        our_fee_ppm=new_fee_ppm,
+                        their_fee_ppm=None,  # Could be fetched from listchannels
+                        volume_sats=volume_since_sats,
+                        forward_count=forward_count,
+                        period_hours=hours_elapsed
+                    )
+                except Exception as e:
+                    # Fire-and-forget - don't let reporting errors affect fee changes
+                    self.plugin.log(
+                        f"HIVE_INTEL: Failed to report observation for {peer_id[:12]}...: {e}",
+                        level='debug'
+                    )
 
             return FeeAdjustment(
                 channel_id=channel_id,
