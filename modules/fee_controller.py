@@ -841,7 +841,7 @@ class HillClimbingFeeController:
     # Improvement #5: Thompson Sampling
     # Security mitigations: See ThompsonSamplingState class
     ENABLE_THOMPSON_SAMPLING = True   # Feature flag
-    THOMPSON_WEIGHT = 0.2             # Probability of using Thompson suggestion
+    THOMPSON_WEIGHT = 0.35            # Probability of using Thompson suggestion (increased for better exploration)
 
     # ==========================================================================
     # Issue #19: Balance-Based Minimum Fee Floor
@@ -865,6 +865,18 @@ class HillClimbingFeeController:
     ZERO_FLOW_FEE_THRESHOLD = 500     # Only apply if current fee > this PPM
     ZERO_FLOW_REDUCTION_MODERATE = 0.75  # 25% ceiling reduction after 3 days
     ZERO_FLOW_REDUCTION_SEVERE = 0.50    # 50% ceiling reduction after 7 days
+
+    # ==========================================================================
+    # Cold-Start Mode for Stagnant Channels
+    # ==========================================================================
+    # Channels with very low forward counts need price discovery - force fees
+    # DOWN with larger steps to attract initial flow. Standard Hill Climbing
+    # increases fees on flat revenue, which is counterproductive for channels
+    # that need LOWER fees to attract any traffic at all.
+    ENABLE_COLD_START = True          # Feature flag
+    COLD_START_FORWARD_THRESHOLD = 5  # Forwards below this triggers cold-start
+    COLD_START_STEP_PPM = 50          # Larger step for aggressive price discovery
+    COLD_START_MAX_FEE_PPM = 100      # Force ceiling down during cold-start
 
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
@@ -1680,6 +1692,7 @@ class HillClimbingFeeController:
         base_new_fee = None  # For observability; set in Hill Climbing branch
         new_fee_ppm = 0
         target_found = False
+        is_cold_start = False  # Initialize here; may be set True in Hill Climbing branch
         
         # Priority 1: Congestion (Emergency High Fee)
         if is_congested:
@@ -1892,6 +1905,24 @@ class HillClimbingFeeController:
                             level='info'
                         )
 
+            # COLD-START MODE: Override direction for stagnant channels
+            # Channels with very few forwards need LOWER fees to attract traffic,
+            # not higher fees (which standard Hill Climbing would apply on flat revenue).
+            is_cold_start = False
+            total_forwards = state.get("forward_count", 0) if state else 0
+            if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
+                # Only apply if we're not already at minimum fees
+                if current_fee_ppm > cfg.min_fee_ppm:
+                    is_cold_start = True
+                    new_direction = -1  # Always decrease fees
+                    step_ppm = self.COLD_START_STEP_PPM  # Use larger step for discovery
+                    decision_reason = f"cold_start (fwds={total_forwards})"
+                    self.plugin.log(
+                        f"COLD-START MODE: {channel_id[:12]}... has only {total_forwards} forwards. "
+                        f"Forcing fee DOWN with {step_ppm}ppm step for price discovery.",
+                        level='info'
+                    )
+
             # Apply step constraints
             step_percent = max(current_fee_ppm * self.STEP_PERCENT, self.MIN_STEP_PPM)
             step_ppm = max(step_ppm, int(step_percent))
@@ -1942,8 +1973,19 @@ class HillClimbingFeeController:
                         f"({original_fee} -> {new_fee_ppm} PPM)",
                         level='info'
                     )
-            
-            new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
+
+            # Apply cold-start ceiling cap for stagnant channels
+            effective_ceiling = ceiling_ppm
+            if is_cold_start:
+                effective_ceiling = min(ceiling_ppm, self.COLD_START_MAX_FEE_PPM)
+                if effective_ceiling < ceiling_ppm:
+                    self.plugin.log(
+                        f"COLD-START CEILING: {channel_id[:12]}... capping fee at {effective_ceiling} ppm "
+                        f"(normal ceiling: {ceiling_ppm} ppm) for price discovery.",
+                        level='info'
+                    )
+
+            new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
 
 
         # Check if fee changed meaningfully (Alpha Guard)
