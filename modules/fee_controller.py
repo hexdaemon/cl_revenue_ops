@@ -2323,13 +2323,17 @@ class HillClimbingFeeController:
                     )
 
             # Apply cold-start ceiling cap for stagnant channels
+            # BUT: Cold-start ceiling must respect balance floor for depleted channels
+            # This prevents extremely low fees on channels with scarce liquidity
             effective_ceiling = ceiling_ppm
             if is_cold_start:
-                effective_ceiling = min(ceiling_ppm, self.COLD_START_MAX_FEE_PPM)
+                # Cold start ceiling, but never below the balance/scarcity floor
+                cold_start_ceiling = max(self.COLD_START_MAX_FEE_PPM, floor_ppm + 50)
+                effective_ceiling = min(ceiling_ppm, cold_start_ceiling)
                 if effective_ceiling < ceiling_ppm:
                     self.plugin.log(
                         f"COLD-START CEILING: {channel_id[:12]}... capping fee at {effective_ceiling} ppm "
-                        f"(normal ceiling: {ceiling_ppm} ppm) for price discovery.",
+                        f"(normal ceiling: {ceiling_ppm} ppm, floor: {floor_ppm} ppm) for price discovery.",
                         level='info'
                     )
 
