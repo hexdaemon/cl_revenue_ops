@@ -21,7 +21,7 @@ Core Lightning
 `cl-revenue-ops` works in two modes:
 
 - **Standalone Mode:** Full functionality for individual node operators
-- **Hive Mode:** Enhanced features when connected to a [cl-hive](https://github.com/santyr/cl-hive) fleet
+- **Hive Mode:** Enhanced features when connected to a [cl-hive](https://github.com/lightning-goats/cl-hive) fleet
 
 Both modes use the same codebase. Hive features activate automatically when cl-hive is detected, or can be explicitly controlled via configuration.
 
@@ -167,7 +167,7 @@ revenue-ops-hive-enabled=auto   # Auto-detect (default)
 
 ```bash
 cd ~/.lightning/plugins
-git clone https://github.com/LightningGoats/cl-revenue-ops.git
+git clone https://github.com/lightning-goats/cl_revenue_ops.git
 cd cl-revenue-ops
 pip install -r requirements.txt
 chmod +x cl-revenue-ops.py

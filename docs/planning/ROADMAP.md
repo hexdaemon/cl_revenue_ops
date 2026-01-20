@@ -231,7 +231,7 @@ The distributed fleet coordination logic has been decoupled into a standalone pl
 
 ### cl-hive Plugin (Standalone) ✅ COMPLETED
 
-*See [cl-hive repository](https://github.com/LightningGoats/cl-hive) for implementation details.*
+*See [cl-hive repository](https://github.com/lightning-goats/cl-hive) for implementation details.*
 
 - [x] **Phase 0:** Plugin skeleton, database schema, config.
 - [x] **Phase 1:** BOLT 8 protocol layer (custom messages, PKI handshake).
