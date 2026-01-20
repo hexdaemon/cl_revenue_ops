@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 import time
+import threading
 
 from pyln.client import Plugin
 
@@ -301,6 +302,7 @@ class ChannelProfitabilityAnalyzer:
         self._profitability_cache: Dict[str, ChannelProfitability] = {}
         self._cache_timestamp: int = 0
         self._cache_ttl: int = 300  # 5 minutes
+        self._analysis_lock = threading.Lock()  # Prevent concurrent analysis stampede
 
         # Track last health report to avoid spam
         self._last_health_report: int = 0
@@ -333,22 +335,33 @@ class ChannelProfitabilityAnalyzer:
     def analyze_all_channels(self) -> Dict[str, ChannelProfitability]:
         """
         Analyze profitability for all channels.
-        
+
         This method is optimized to batch fetch revenue data with a single
         RPC call to listforwards, avoiding N+1 query overhead.
-        
+
+        Uses a lock to prevent concurrent analysis stampede - if another thread
+        is already analyzing, returns the existing cache instead of duplicating work.
+
         Returns:
             Dict mapping channel_id to ChannelProfitability
         """
+        # Non-blocking lock acquisition - if another thread is analyzing, return cache
+        if not self._analysis_lock.acquire(blocking=False):
+            return self._profitability_cache
+
+        # Update timestamp immediately to prevent stampede from other callers
+        # checking TTL while we're working
+        old_timestamp = self._cache_timestamp
+        self._cache_timestamp = int(time.time())
+
         results = {}
-        
         try:
             # Get all channels
             channels = self._get_all_channels()
-            
+
             # Batch fetch all revenue data with a single RPC call
             all_revenue_data = self._get_all_revenue_data()
-            
+
             for channel_id, channel_info in channels.items():
                 # Pass precalculated revenue to avoid per-channel RPC calls
                 precalculated_revenue = all_revenue_data.get(channel_id)
@@ -357,17 +370,16 @@ class ChannelProfitabilityAnalyzer:
                 )
                 if profitability:
                     results[channel_id] = profitability
-            
-            # Update cache
+
+            # Update cache with new results
             self._profitability_cache = results
-            self._cache_timestamp = int(time.time())
-            
+
             # Log summary
             classifications = {}
             for p in results.values():
                 cls = p.classification.value
                 classifications[cls] = classifications.get(cls, 0) + 1
-            
+
             self.plugin.log(
                 f"Profitability analysis complete: {len(results)} channels - "
                 f"{classifications}"
@@ -380,6 +392,10 @@ class ChannelProfitabilityAnalyzer:
 
         except Exception as e:
             self.plugin.log(f"Error in profitability analysis: {e}", level='error')
+            # On error, restore old timestamp so next call retries
+            self._cache_timestamp = old_timestamp
+        finally:
+            self._analysis_lock.release()
 
         return results
     
