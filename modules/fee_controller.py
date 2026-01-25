@@ -1650,6 +1650,35 @@ class HillClimbingFeeController:
         # Ensure we have a ConfigSnapshot
         if cfg is None:
             cfg = self.config.snapshot()
+
+        # =====================================================================
+        # HIVE PEER SAFETY CHECK (Phase 7)
+        # =====================================================================
+        # Fleet members must ALWAYS have 0 PPM fees. This is a safety backup
+        # in case the policy wasn't set correctly. The hive covenant requires
+        # zero fees between fleet members for efficient internal routing.
+        # =====================================================================
+        if self.policy_manager and self.policy_manager.is_hive_peer(peer_id):
+            raw_chain_fee = channel_info.get("fee_proportional_millionths", 0)
+            hive_fee = cfg.hive_fee_ppm  # Should be 0
+
+            if raw_chain_fee != hive_fee:
+                self.plugin.log(
+                    f"HIVE_SAFETY: Channel {channel_id[:12]}... to fleet member "
+                    f"has fee {raw_chain_fee}, enforcing {hive_fee} PPM",
+                    level='info'
+                )
+                return FeeAdjustment(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    old_fee_ppm=raw_chain_fee,
+                    new_fee_ppm=hive_fee,
+                    reason="HIVE_SAFETY: Fleet member requires 0 fee",
+                    hill_climb_values={"policy": "hive_safety"}
+                )
+            # Fee is correct, no adjustment needed
+            return None
+
         # Detect critical state (Phase 5.5)
         is_congested = (state and state.get("state") == "congested")
         
