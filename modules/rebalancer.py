@@ -130,42 +130,89 @@ class ActiveJob:
 class JobManager:
     """
     Manages the lifecycle of Sling background rebalancing jobs.
-    
+
     Responsibilities:
     - Start new sling-job workers
     - Monitor job progress via sling-stats
     - Stop jobs on success, timeout, or error
     - Record results to database
-    
+    - Report outcomes to hive for fleet coordination (Phase 7)
+
     Key Design Decision:
     We use sling-job for TACTICAL rebalancing (one-off moves), not permanent
     pegging. As soon as any successful payment is detected or timeout is reached,
     we DELETE the job to prevent infinite spending.
     """
-    
+
     # Default timeout: 2 hours (configurable)
     DEFAULT_JOB_TIMEOUT_SECONDS = 7200
-    
-    def __init__(self, plugin: Plugin, config: Config, database: Database):
+
+    def __init__(self, plugin: Plugin, config: Config, database: Database,
+                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
         self.plugin = plugin
         self.config = config
         self.database = database
-        
+        self.hive_bridge = hive_bridge
+
         # Active jobs indexed by target channel SCID (normalized format)
         self._active_jobs: Dict[str, ActiveJob] = {}
-        
+
         # Configurable settings
-        self.job_timeout_seconds = getattr(config, 'sling_job_timeout_seconds', 
+        self.job_timeout_seconds = getattr(config, 'sling_job_timeout_seconds',
                                            self.DEFAULT_JOB_TIMEOUT_SECONDS)
         self.max_concurrent_jobs = getattr(config, 'max_concurrent_jobs', 5)
-        
+
         # Chunk size for sling rebalances (sats per attempt)
         self.chunk_size_sats = getattr(config, 'sling_chunk_size_sats', 500000)
 
         # Source reliability tracking
         self.source_failure_counts: Dict[str, float] = {}
         self.last_decay_time = time.time()
-    
+
+    def _report_outcome_to_hive(self, job: ActiveJob, success: bool, cost_sats: int,
+                                 amount_transferred: int = 0) -> None:
+        """
+        Report rebalance outcome to hive for fleet coordination.
+
+        This enables:
+        - Circular flow detection (A→B→C→A wastes fees)
+        - Better rebalance coordination across fleet members
+        - Learning from successful/failed routes
+
+        Args:
+            job: The completed job
+            success: Whether rebalance succeeded
+            cost_sats: Fee cost of the rebalance
+            amount_transferred: Amount successfully moved (0 if failed)
+        """
+        if not self.hive_bridge:
+            return
+
+        try:
+            # Determine if this was routed via fleet (check candidate metadata)
+            via_fleet = getattr(job.candidate, 'via_fleet', False) if job.candidate else False
+
+            self.hive_bridge.report_rebalance_outcome(
+                from_channel=job.from_scid,
+                to_channel=job.scid,
+                amount_sats=amount_transferred if success else job.target_amount_sats,
+                cost_sats=cost_sats,
+                success=success,
+                via_fleet=via_fleet
+            )
+
+            self.plugin.log(
+                f"Reported rebalance outcome to hive: {job.scid} "
+                f"success={success} cost={cost_sats}sats",
+                level='debug'
+            )
+        except Exception as e:
+            # Non-fatal - don't fail the job handling for hive reporting
+            self.plugin.log(
+                f"Failed to report rebalance outcome to hive: {e}",
+                level='debug'
+            )
+
     def prune_stale_source_failures(self, active_channel_ids: set) -> int:
         """
         Remove in-memory failure counts for channels that no longer exist.
@@ -624,9 +671,13 @@ class JobManager:
         # Mark budget reservation as spent (CRITICAL-01 fix)
         self.database.mark_budget_spent(job.rebalance_id, fee_sats)
 
+        # Report outcome to hive for fleet coordination (Phase 7)
+        self._report_outcome_to_hive(job, success=True, cost_sats=fee_sats,
+                                     amount_transferred=amount_transferred)
+
         # Stop the job
         self.stop_job(job.scid_normalized, reason="success")
-    
+
     def _handle_job_failure(self, job: ActiveJob, stats: Dict[str, Any]) -> None:
         """Handle a failed job."""
         error_msg = stats.get("last_error", "Unknown error from sling")
@@ -656,9 +707,12 @@ class JobManager:
         # Release budget reservation (CRITICAL-01 fix)
         self.database.release_budget_reservation(job.rebalance_id)
 
+        # Report outcome to hive for fleet coordination (Phase 7)
+        self._report_outcome_to_hive(job, success=False, cost_sats=0, amount_transferred=0)
+
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
-    
+
     def _handle_job_budget_exceeded(self, job: ActiveJob, fee_msat: int,
                                     stats: Dict[str, Any]) -> None:
         """Handle a job that exceeded its configured sats budget."""
@@ -690,9 +744,15 @@ class JobManager:
         # Release budget reservation - job failed (CRITICAL-01 fix)
         self.database.release_budget_reservation(job.rebalance_id)
 
+        # Report outcome to hive for fleet coordination (Phase 7)
+        # Report the actual cost incurred even though job failed
+        actual_cost_sats = (fee_msat + 999) // 1000
+        self._report_outcome_to_hive(job, success=False, cost_sats=actual_cost_sats,
+                                     amount_transferred=0)
+
         # Stop the job
         self.stop_job(job.scid_normalized, reason="exceeded_budget")
-    
+
     def _handle_job_timeout(self, job: ActiveJob) -> None:
         """Handle a timed-out job."""
         elapsed_hours = (int(time.time()) - job.start_time) / 3600
@@ -727,6 +787,15 @@ class JobManager:
 
         # Release budget reservation - job timed out (CRITICAL-01 fix)
         self.database.release_budget_reservation(job.rebalance_id)
+
+        # Report outcome to hive for fleet coordination (Phase 7)
+        # Partial success is still reported as success to help fleet learning
+        self._report_outcome_to_hive(
+            job,
+            success=(amount_transferred > 0),
+            cost_sats=0,  # Unknown actual fee on timeout
+            amount_transferred=amount_transferred
+        )
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="timeout")
@@ -1002,8 +1071,8 @@ class EVRebalancer:
         self._cached_health: Optional[Dict] = None
         self._health_cache_time: float = 0
 
-        # Initialize job manager for async execution
-        self.job_manager = JobManager(plugin, config, database)
+        # Initialize job manager for async execution (pass hive_bridge for outcome reporting)
+        self.job_manager = JobManager(plugin, config, database, hive_bridge=hive_bridge)
     
     def _get_our_node_id(self) -> str:
         if self._our_node_id is None:
@@ -1689,8 +1758,10 @@ class EVRebalancer:
         Estimate the inbound routing fee to reach a peer.
 
         ENHANCED (Phase 6): Prioritizes historical actual costs over heuristics.
+        ENHANCED (Phase 7): Zero fee for hive fleet members.
 
         Priority order:
+        0. HIVE peer - Zero fee (fleet members have 0 fee channels)
         1. Historical data (high confidence) - Use median, most accurate
         2. Historical data (medium) - Blend with last-hop fee
         3. Historical data (low) - Use with buffer
@@ -1701,6 +1772,21 @@ class EVRebalancer:
         Returns:
             Estimated inbound fee in PPM
         """
+        # =====================================================================
+        # PHASE 7: HIVE Fleet Zero-Fee Priority
+        # =====================================================================
+        # Hive fleet members have 0 fee channels between them. When routing
+        # through a hive peer, the cost is zero. This is the highest priority
+        # check to ensure we utilize fleet connectivity efficiently.
+        # =====================================================================
+
+        if self.policy_manager and self.policy_manager.is_hive_peer(peer_id):
+            self.plugin.log(
+                f"INBOUND FEE EST [{peer_id[:12]}...]: HIVE peer - 0 PPM (fleet zero-fee)",
+                level='debug'
+            )
+            return 0
+
         # =====================================================================
         # PHASE 6: Historical-First Fee Estimation
         # =====================================================================
@@ -2156,6 +2242,7 @@ class EVRebalancer:
         # Avoid competing for same routes as other hive members.
         # INFORMATION ONLY - no fund transfers between nodes.
         # =====================================================================
+        fleet_path_info = None
         if self.hive_bridge:
             conflict = self.hive_bridge.check_rebalance_conflict(candidate.to_peer_id)
             if conflict.get("conflict"):
@@ -2169,6 +2256,33 @@ class EVRebalancer:
                 result["fleet_conflict"] = True
                 del self._pending[candidate.to_channel]
                 return result
+
+            # =====================================================================
+            # PHASE 7: Query Fleet Rebalance Path
+            # Check if routing through fleet members is cheaper.
+            # Fleet channels have 0 fees, so internal paths may save significantly.
+            # =====================================================================
+            fleet_path_info = self.hive_bridge.query_fleet_rebalance_path(
+                from_channel=candidate.from_channel,
+                to_channel=candidate.to_channel,
+                amount_sats=candidate.amount_sats
+            )
+
+            if fleet_path_info and fleet_path_info.get("fleet_path_available"):
+                savings_pct = fleet_path_info.get("savings_pct", 0)
+                fleet_cost = fleet_path_info.get("estimated_fleet_cost_sats", 0)
+                external_cost = fleet_path_info.get("estimated_external_cost_sats", 0)
+
+                self.plugin.log(
+                    f"FLEET_PATH: Internal route available for {candidate.to_channel[:12]}... "
+                    f"Fleet cost: {fleet_cost} sats vs External: {external_cost} sats "
+                    f"(savings: {savings_pct:.0f}%)",
+                    level='info'
+                )
+
+                # Store fleet path info for outcome reporting
+                result["fleet_path_available"] = True
+                result["fleet_savings_pct"] = savings_pct
 
         try:
             # Ensure channels are unmanaged from clboss
