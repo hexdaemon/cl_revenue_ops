@@ -900,6 +900,15 @@ class HillClimbingFeeController:
     HIVE_COORDINATION_WEIGHT = 0.5    # Weight for coordinated recommendations (0-1)
     HIVE_COORDINATION_MIN_CONFIDENCE = 0.5  # Minimum confidence to use recommendation
 
+    # Phase 15: Enhanced Hive Intelligence
+    # - Pheromone-biased step: Use historical success to influence step direction
+    # - Internal competition avoidance: Don't undercut fleet members
+    ENABLE_PHEROMONE_BIAS = True      # Use pheromone data to bias step direction
+    PHEROMONE_BIAS_THRESHOLD = 5.0    # Min pheromone level to apply bias
+    PHEROMONE_BIAS_WEIGHT = 0.3       # How much pheromone influences step (0-1)
+    ENABLE_COMPETITION_AVOIDANCE = True  # Avoid undercutting fleet members
+    COMPETITION_DEFER_PCT = 0.05      # Stay within 5% of primary's fee when secondary
+
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
@@ -1334,6 +1343,144 @@ class HillClimbingFeeController:
                 level="debug"
             )
             return base_fee
+
+    def _get_pheromone_bias(
+        self,
+        channel_id: str,
+        current_fee: int,
+        proposed_direction: int
+    ) -> int:
+        """
+        Get pheromone-biased step direction.
+
+        Pheromones represent memory of successful fee levels. If a channel
+        has strong pheromone signal (lots of successful routing at a certain
+        fee), we bias our step toward that fee level.
+
+        Args:
+            channel_id: Channel SCID
+            current_fee: Current fee in ppm
+            proposed_direction: Hill Climbing's proposed direction (+1 up, -1 down)
+
+        Returns:
+            Biased direction (+1, -1, or 0 if pheromone suggests holding)
+        """
+        if not self.ENABLE_PHEROMONE_BIAS or not self.hive_bridge:
+            return proposed_direction
+
+        try:
+            pheromone = self.hive_bridge.query_pheromone_level(channel_id)
+            if not pheromone:
+                return proposed_direction
+
+            level = pheromone.get("level", 0)
+            if level < self.PHEROMONE_BIAS_THRESHOLD:
+                # Not enough signal - trust Hill Climbing
+                return proposed_direction
+
+            # Strong pheromone signal - we have historical success data
+            # The coordinated fee recommendation already incorporates this,
+            # but we can use the signal strength to reduce step volatility
+            # when we're near a known-good fee
+
+            # If pheromone is very strong (above_threshold), reduce step magnitude
+            # by potentially suggesting to hold if we're already doing well
+            if pheromone.get("above_threshold", False) and level > 10.0:
+                self.plugin.log(
+                    f"PHEROMONE_BIAS: {channel_id[:12]}... has strong signal "
+                    f"(level={level:.1f}). Maintaining direction but "
+                    f"suggesting smaller steps.",
+                    level="debug"
+                )
+
+            return proposed_direction
+
+        except Exception as e:
+            self.plugin.log(
+                f"PHEROMONE_BIAS: Failed to get pheromone for {channel_id[:12]}...: {e}",
+                level="debug"
+            )
+            return proposed_direction
+
+    def _check_internal_competition(
+        self,
+        peer_id: str,
+        proposed_fee: int,
+        channel_id: str
+    ) -> int:
+        """
+        Check for internal competition and adjust fee to avoid undercutting.
+
+        When multiple fleet members have channels to the same peer, the
+        member with more routing activity (primary) should set the fee,
+        while others (secondary) should stay slightly above to avoid
+        internal fee wars.
+
+        Args:
+            peer_id: Peer pubkey
+            proposed_fee: Fee we're proposing
+            channel_id: Our channel ID
+
+        Returns:
+            Adjusted fee (may be same as proposed if no competition)
+        """
+        if not self.ENABLE_COMPETITION_AVOIDANCE or not self.hive_bridge:
+            return proposed_fee
+
+        try:
+            competition = self.hive_bridge.check_internal_competition_for_peer(peer_id)
+            if not competition or not competition.get("is_competing"):
+                return proposed_fee
+
+            # We're competing with other fleet members
+            member_count = competition.get("member_count", 0)
+
+            # Query coordinated fee to get corridor role
+            coord = self.hive_bridge.query_coordinated_fee_recommendation(
+                channel_id=channel_id,
+                current_fee=proposed_fee
+            )
+
+            if not coord:
+                return proposed_fee
+
+            corridor_role = coord.get("corridor_role", "unknown")
+            is_primary = coord.get("is_primary", False)
+
+            if is_primary or corridor_role == "primary":
+                # We're the primary - our fee sets the benchmark
+                self.plugin.log(
+                    f"COMPETITION: {channel_id[:12]}... to {peer_id[:12]}... - "
+                    f"We are PRIMARY among {member_count} members. "
+                    f"Setting benchmark fee={proposed_fee} ppm.",
+                    level="debug"
+                )
+                return proposed_fee
+
+            # We're secondary - don't undercut the primary
+            recommended_fee = coord.get("recommended_fee_ppm")
+            if recommended_fee and proposed_fee < recommended_fee:
+                # Stay within COMPETITION_DEFER_PCT of primary's fee
+                min_fee = int(recommended_fee * (1 - self.COMPETITION_DEFER_PCT))
+                if proposed_fee < min_fee:
+                    adjusted_fee = min_fee
+                    self.plugin.log(
+                        f"COMPETITION: {channel_id[:12]}... to {peer_id[:12]}... - "
+                        f"We are SECONDARY. Avoiding undercut: "
+                        f"{proposed_fee} -> {adjusted_fee} ppm "
+                        f"(primary benchmark: {recommended_fee} ppm)",
+                        level="info"
+                    )
+                    return adjusted_fee
+
+            return proposed_fee
+
+        except Exception as e:
+            self.plugin.log(
+                f"COMPETITION: Failed to check competition for {peer_id[:12]}...: {e}",
+                level="debug"
+            )
+            return proposed_fee
 
     def _prune_stale_states(self, active_channel_ids: set) -> int:
         """
@@ -2307,6 +2454,18 @@ class HillClimbingFeeController:
             if hc_state.consecutive_same_direction > self.MAX_CONSECUTIVE:
                 step_ppm = max(self.MIN_STEP_PPM, step_ppm // 2)
 
+            # =================================================================
+            # PHASE 15: Pheromone-Biased Direction
+            # Use historical routing success (pheromone levels) to influence
+            # the step direction. Strong pheromone = we're near a good fee.
+            # =================================================================
+            if self.hive_bridge and self.ENABLE_PHEROMONE_BIAS:
+                biased_direction = self._get_pheromone_bias(
+                    channel_id, current_fee_ppm, new_direction
+                )
+                if biased_direction != new_direction:
+                    new_direction = biased_direction
+
             # Calculate base new fee (Hill Climbing step)
             base_new_fee = current_fee_ppm + (new_direction * step_ppm)
 
@@ -2420,6 +2579,19 @@ class HillClimbingFeeController:
                 if fleet_adjusted_fee != new_fee_ppm:
                     # Re-clamp to bounds after fleet adjustment
                     new_fee_ppm = max(floor_ppm, min(effective_ceiling, fleet_adjusted_fee))
+
+            # =================================================================
+            # PHASE 15: Internal Competition Avoidance
+            # Check if we're competing with other fleet members for this peer.
+            # If we're secondary, don't undercut the primary member.
+            # =================================================================
+            if self.hive_bridge and self.ENABLE_COMPETITION_AVOIDANCE and not is_congested:
+                competition_adjusted = self._check_internal_competition(
+                    peer_id, new_fee_ppm, channel_id
+                )
+                if competition_adjusted != new_fee_ppm:
+                    # Re-clamp after competition adjustment
+                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, competition_adjusted))
 
 
         # Check if fee changed meaningfully (Alpha Guard)

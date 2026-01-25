@@ -1635,6 +1635,105 @@ class HiveFeeIntelligenceBridge:
             self._record_failure()
             return None
 
+    def query_pheromone_level(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Query pheromone level for a specific channel.
+
+        Pheromones represent the "memory" of successful fee levels - higher
+        levels indicate more routing success at certain fees. Use this to
+        inform fee starting points.
+
+        Args:
+            channel_id: Channel SCID to query
+
+        Returns:
+            Pheromone data or None:
+            {
+                "channel_id": "123x456x0",
+                "level": 0.75,
+                "successful_fee_ppm": 350,  # Fee that worked well
+                "above_threshold": True      # High confidence signal
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-pheromone-levels", {
+                "channel_id": channel_id
+            })
+
+            if result.get("error"):
+                return None
+
+            # Extract relevant data for this channel
+            levels = result.get("pheromone_levels", [])
+            for level_data in levels:
+                if level_data.get("channel_id") == channel_id:
+                    self._record_success()
+                    return {
+                        "channel_id": channel_id,
+                        "level": level_data.get("level", 0),
+                        "above_threshold": level_data.get("above_threshold", False)
+                    }
+
+            # Channel exists but no pheromone data yet
+            self._record_success()
+            return {"channel_id": channel_id, "level": 0, "above_threshold": False}
+
+        except Exception as e:
+            self._log(f"Failed to query pheromone level: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def check_internal_competition_for_peer(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Check if we're competing with other fleet members for routes to/from this peer.
+
+        Use this before adjusting fees to avoid undercutting fleet members.
+
+        Args:
+            peer_id: Peer pubkey to check
+
+        Returns:
+            Competition info or None:
+            {
+                "is_competing": True,
+                "competing_members": ["hive-nexus-01", "hive-nexus-02"],
+                "our_role": "secondary",  # "primary", "secondary", or "none"
+                "recommended_action": "defer_to_primary",
+                "primary_fee_ppm": 300  # What the primary is charging
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-internal-competition", {})
+
+            if result.get("error"):
+                return None
+
+            # Check if this peer is in any competing routes
+            competing_routes = result.get("competing_routes", [])
+            for route in competing_routes:
+                if route.get("destination") == peer_id or route.get("source") == peer_id:
+                    self._record_success()
+                    return {
+                        "is_competing": True,
+                        "competing_members": route.get("competing_members", []),
+                        "member_count": route.get("member_count", 0),
+                        "recommendation": route.get("recommendation", "coordinate_fees")
+                    }
+
+            self._record_success()
+            return {"is_competing": False}
+
+        except Exception as e:
+            self._log(f"Failed to check internal competition: {e}", level="debug")
+            self._record_failure()
+            return None
+
     # =========================================================================
     # YIELD OPTIMIZATION: YIELD METRICS REPORTING
     # =========================================================================
