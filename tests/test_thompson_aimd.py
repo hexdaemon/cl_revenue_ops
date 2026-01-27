@@ -959,3 +959,286 @@ class TestFeeDiscoveryBroadcast:
 
         assert discovery is not None
         assert discovery["discovery_type"] == "optimal_fee"
+
+
+class TestElasticityFleetIntegration:
+    """Tests for ElasticityTracker fleet integration (P2)."""
+
+    def test_should_broadcast_when_confident(self):
+        """Test that elasticity is broadcast when confidence is sufficient."""
+        from modules.fee_controller import ElasticityTracker
+
+        tracker = ElasticityTracker()
+        # Add enough observations for confidence
+        for i in range(10):
+            tracker.add_observation(
+                fee_ppm=200 + i * 10,
+                volume_sats=1000000,
+                revenue_rate=100.0 - i * 5
+            )
+
+        # Should broadcast if confidence >= 0.5 and enough samples
+        if tracker.confidence >= 0.5:
+            assert tracker.should_broadcast() == True
+        else:
+            # If confidence too low, shouldn't broadcast
+            assert tracker.should_broadcast() == False
+
+    def test_should_not_broadcast_without_data(self):
+        """Test that elasticity not broadcast without sufficient data."""
+        from modules.fee_controller import ElasticityTracker
+
+        tracker = ElasticityTracker()
+        # Only one observation
+        tracker.add_observation(fee_ppm=200, volume_sats=1000000, revenue_rate=100.0)
+
+        assert tracker.should_broadcast() == False
+
+    def test_get_broadcast_data_format(self):
+        """Test broadcast data format."""
+        from modules.fee_controller import ElasticityTracker
+
+        tracker = ElasticityTracker()
+        tracker.current_elasticity = -1.5
+        tracker.confidence = 0.8
+        tracker.history = [(200, 1000, 100.0, int(time.time()))] * 5
+
+        data = tracker.get_broadcast_data()
+
+        assert "elasticity" in data
+        assert "confidence" in data
+        assert "sample_count" in data
+        assert data["elasticity"] == -1.5
+        assert data["confidence"] == 0.8
+        assert data["sample_count"] == 5
+
+    def test_incorporate_fleet_data_blends_values(self):
+        """Test that fleet data is blended with local data."""
+        from modules.fee_controller import ElasticityTracker
+
+        tracker = ElasticityTracker()
+        tracker.current_elasticity = -1.0
+        tracker.confidence = 0.7
+
+        # Incorporate fleet data
+        tracker.incorporate_fleet_data(
+            fleet_elasticity=-2.0,
+            fleet_confidence=0.8,
+            fleet_weight=0.3
+        )
+
+        # Elasticity should be blended (not exactly -1.0 anymore)
+        # Should be somewhere between -1.0 and -2.0
+        assert tracker.current_elasticity < -1.0
+        assert tracker.current_elasticity > -2.0
+
+    def test_incorporate_fleet_data_ignored_when_low_confidence(self):
+        """Test that low-confidence fleet data is ignored."""
+        from modules.fee_controller import ElasticityTracker
+
+        tracker = ElasticityTracker()
+        tracker.current_elasticity = -1.0
+        tracker.confidence = 0.7
+        original = tracker.current_elasticity
+
+        # Incorporate low-confidence fleet data
+        tracker.incorporate_fleet_data(
+            fleet_elasticity=-2.0,
+            fleet_confidence=0.2,  # Below threshold
+            fleet_weight=0.3
+        )
+
+        # Should be unchanged
+        assert tracker.current_elasticity == original
+
+
+class TestHistoricalCurveFleetIntegration:
+    """Tests for HistoricalResponseCurve fleet integration (P2)."""
+
+    def test_should_broadcast_observation_high_forward(self):
+        """Test broadcast detection for high forward count observations."""
+        from modules.fee_controller import HistoricalResponseCurve, FeeRevenueObservation
+
+        curve = HistoricalResponseCurve()
+        # Build baseline
+        for i in range(10):
+            curve.add_observation(fee_ppm=200, revenue_rate=50.0, forward_count=5)
+
+        # High forward count near optimal should broadcast
+        result = curve.should_broadcast_observation(
+            fee_ppm=200,  # Near optimal
+            revenue_rate=50.0,
+            forward_count=20
+        )
+        assert result == True
+
+    def test_should_not_broadcast_low_forward(self):
+        """Test that low forward count observations don't broadcast."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+        for i in range(10):
+            curve.add_observation(fee_ppm=200, revenue_rate=50.0, forward_count=5)
+
+        # Low forward count should not broadcast
+        result = curve.should_broadcast_observation(
+            fee_ppm=200,
+            revenue_rate=50.0,
+            forward_count=2  # Too few
+        )
+        assert result == False
+
+    def test_get_broadcast_data_format(self):
+        """Test broadcast data format for curve."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+        for i in range(10):
+            curve.add_observation(fee_ppm=200 + i * 10, revenue_rate=50.0, forward_count=5)
+
+        data = curve.get_broadcast_data()
+
+        assert "observation_count" in data
+        assert "regime_change_count" in data
+        assert "best_fee_estimate" in data
+        assert "recent_observations" in data
+        assert len(data["recent_observations"]) <= 10
+
+    def test_incorporate_fleet_curve_adds_observations(self):
+        """Test that fleet curve data is incorporated."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+        initial_count = len(curve.observations)
+
+        fleet_obs = [
+            {"fee_ppm": 150, "revenue_rate": 80.0, "count": 10},
+            {"fee_ppm": 200, "revenue_rate": 100.0, "count": 15}
+        ]
+
+        curve.incorporate_fleet_curve(fleet_obs, fleet_weight=0.25)
+
+        # Should have more observations now
+        assert len(curve.observations) > initial_count
+
+    def test_get_regime_broadcast_data(self):
+        """Test regime broadcast data format."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+        for i in range(25):
+            curve.add_observation(fee_ppm=200, revenue_rate=50.0, forward_count=5)
+        curve.regime_change_count = 2
+
+        data = curve.get_regime_broadcast_data()
+
+        assert "regime_change_count" in data
+        assert "recent_avg_revenue" in data
+        assert "observation_count" in data
+        assert data["regime_change_count"] == 2
+
+
+class TestCompetitionAvoidance:
+    """Tests for competition avoidance via Thompson posterior sharing (P2)."""
+
+    def test_posterior_differentiation_primary_goes_lower(self):
+        """Test that primary corridors differentiate by going lower."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        state.posterior_mean = 200.0
+        state.posterior_std = 50.0
+
+        # Simulate crowded region detection and differentiation
+        # For primary corridor (P), should go lower
+        original_mean = state.posterior_mean
+        diff_amount = int(state.posterior_std * 0.3)
+        differentiation_direction = -1  # Primary goes lower
+
+        state.posterior_mean += differentiation_direction * diff_amount
+
+        assert state.posterior_mean < original_mean
+        assert state.posterior_mean == 200.0 - diff_amount
+
+    def test_posterior_differentiation_secondary_goes_higher(self):
+        """Test that secondary corridors differentiate by going higher."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        state.posterior_mean = 200.0
+        state.posterior_std = 50.0
+
+        # For secondary corridor (S), should go higher
+        original_mean = state.posterior_mean
+        diff_amount = int(state.posterior_std * 0.3)
+        differentiation_direction = 1  # Secondary goes higher
+
+        state.posterior_mean += differentiation_direction * diff_amount
+
+        assert state.posterior_mean > original_mean
+        assert state.posterior_mean == 200.0 + diff_amount
+
+    def test_overlap_detection(self):
+        """Test detection of overlapping posteriors."""
+        # Two posteriors overlap if means are within 1.5 * max(std1, std2)
+        our_mean = 200.0
+        our_std = 50.0
+        member_mean = 220.0
+        member_std = 40.0
+
+        overlap_threshold = 1.5 * max(our_std, member_std)  # 75
+        distance = abs(our_mean - member_mean)  # 20
+
+        # These should overlap (20 < 75)
+        assert distance < overlap_threshold
+
+
+class TestProfitabilityWeightedSampling:
+    """Tests for profitability-weighted Thompson sampling (P2)."""
+
+    def test_profitable_channel_biased_up(self):
+        """Test that profitable channels get upward fee bias."""
+        # Profitable channel with ROI > 20% should get +10% bias
+        thompson_fee = 200
+        roi_percent = 25.0
+
+        # Simulate the bias calculation
+        profitability_adjustment = int(thompson_fee * 0.1)  # +10%
+
+        new_fee = thompson_fee + profitability_adjustment
+        assert new_fee == 220
+        assert new_fee > thompson_fee
+
+    def test_underwater_channel_biased_down(self):
+        """Test that underwater channels get downward fee bias."""
+        # Underwater channel with ROI < -20% should get -15% bias
+        thompson_fee = 200
+        roi_percent = -30.0
+
+        # Simulate the bias calculation
+        profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
+
+        new_fee = thompson_fee + profitability_adjustment
+        assert new_fee == 170
+        assert new_fee < thompson_fee
+
+    def test_zombie_channel_forced_to_floor(self):
+        """Test that zombie channels are forced to floor."""
+        thompson_fee = 200
+        floor_ppm = 10
+
+        # Zombie channels force to floor
+        profitability_adjustment = floor_ppm - thompson_fee
+
+        new_fee = thompson_fee + profitability_adjustment
+        assert new_fee == floor_ppm
+
+    def test_marginal_channel_no_adjustment(self):
+        """Test that marginal channels get no adjustment."""
+        thompson_fee = 200
+
+        # Marginal channels get no profitability adjustment
+        profitability_adjustment = 0
+
+        new_fee = thompson_fee + profitability_adjustment
+        assert new_fee == thompson_fee

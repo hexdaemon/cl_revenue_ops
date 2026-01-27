@@ -1338,6 +1338,411 @@ class HiveFeeIntelligenceBridge:
             return None
 
     # =========================================================================
+    # P2 Integration: Elasticity Sharing
+    # =========================================================================
+
+    def broadcast_elasticity_observation(
+        self,
+        peer_id: str,
+        elasticity: float,
+        confidence: float,
+        sample_count: int = 0
+    ) -> bool:
+        """
+        Broadcast elasticity observation to the fleet.
+
+        Shares demand elasticity data so fleet members can learn from each
+        other's price sensitivity observations.
+
+        Args:
+            peer_id: Peer this elasticity is for
+            elasticity: Estimated elasticity (negative = elastic)
+            confidence: Confidence in estimate (0.0-1.0)
+            sample_count: Number of samples used
+
+        Returns:
+            True if broadcasted successfully
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return False
+
+        # Only broadcast high-confidence elasticity
+        if confidence < 0.5:
+            return False
+
+        try:
+            params = {
+                "peer_id": peer_id,
+                "elasticity": elasticity,
+                "confidence": confidence,
+                "sample_count": sample_count,
+                "timestamp": int(time.time())
+            }
+
+            result = self.plugin.rpc.call("hive-broadcast-elasticity", params)
+
+            if result.get("error"):
+                self._log(f"Elasticity broadcast error: {result.get('error')}", level="debug")
+                return False
+
+            self._log(
+                f"Elasticity broadcasted: peer={peer_id[:12]}... "
+                f"elasticity={elasticity:.2f} conf={confidence:.2f}",
+                level="debug"
+            )
+            return True
+
+        except Exception as e:
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to broadcast elasticity: {e}", level="debug")
+            return False
+
+    def query_fleet_elasticity(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Query fleet-aggregated elasticity for a peer.
+
+        Gets elasticity data aggregated from multiple fleet members for
+        better demand sensitivity estimation.
+
+        Args:
+            peer_id: Peer to query elasticity for
+
+        Returns:
+            Aggregated elasticity dict or None:
+            {
+                "peer_id": "02abc...",
+                "fleet_elasticity": -1.2,
+                "fleet_confidence": 0.75,
+                "reporter_count": 3,
+                "min_elasticity": -1.8,
+                "max_elasticity": -0.6
+            }
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-query-elasticity", {"peer_id": peer_id})
+
+            if result.get("error"):
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to query fleet elasticity: {e}", level="debug")
+            return None
+
+    # =========================================================================
+    # P2 Integration: Historical Response Curve Aggregation
+    # =========================================================================
+
+    def broadcast_curve_observation(
+        self,
+        peer_id: str,
+        fee_ppm: int,
+        revenue_rate: float,
+        forward_count: int
+    ) -> bool:
+        """
+        Broadcast response curve observation to fleet.
+
+        Shares fee→revenue data points for fleet-wide curve aggregation,
+        enabling better market understanding across all members.
+
+        Args:
+            peer_id: Peer this observation is for
+            fee_ppm: Fee that was charged
+            revenue_rate: Observed revenue rate
+            forward_count: Number of forwards
+
+        Returns:
+            True if broadcasted successfully
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return False
+
+        # Only broadcast meaningful observations
+        if forward_count < 1 or revenue_rate < 1.0:
+            return False
+
+        try:
+            params = {
+                "peer_id": peer_id,
+                "fee_ppm": fee_ppm,
+                "revenue_rate": revenue_rate,
+                "forward_count": forward_count,
+                "timestamp": int(time.time())
+            }
+
+            result = self.plugin.rpc.call("hive-broadcast-curve-observation", params)
+
+            if result.get("error"):
+                return False
+
+            return True
+
+        except Exception as e:
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to broadcast curve observation: {e}", level="debug")
+            return False
+
+    def query_aggregated_curve(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Query fleet-aggregated response curve for a peer.
+
+        Gets fee→revenue curve data aggregated from multiple fleet members.
+
+        Args:
+            peer_id: Peer to query curve for
+
+        Returns:
+            Aggregated curve dict or None:
+            {
+                "peer_id": "02abc...",
+                "observations": [
+                    {"fee_ppm": 100, "avg_revenue": 50.0, "sample_count": 5},
+                    {"fee_ppm": 200, "avg_revenue": 75.0, "sample_count": 8},
+                    ...
+                ],
+                "optimal_fee_estimate": 180,
+                "confidence": 0.7,
+                "reporter_count": 3
+            }
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-query-aggregated-curve", {"peer_id": peer_id})
+
+            if result.get("error"):
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to query aggregated curve: {e}", level="debug")
+            return None
+
+    # =========================================================================
+    # P2 Integration: Regime Change Coordination
+    # =========================================================================
+
+    def broadcast_regime_change(
+        self,
+        peer_id: str,
+        change_type: str,
+        old_regime: str,
+        new_regime: str,
+        evidence: Dict[str, Any] = None
+    ) -> bool:
+        """
+        Broadcast regime change detection to fleet.
+
+        When local analysis detects a market regime change, share with fleet
+        so members can coordinate their response.
+
+        Args:
+            peer_id: Peer where regime change detected
+            change_type: Type of change ("demand_shift", "competition", "seasonal")
+            old_regime: Previous regime description
+            new_regime: New regime description
+            evidence: Supporting data for the detection
+
+        Returns:
+            True if broadcasted successfully
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return False
+
+        try:
+            params = {
+                "peer_id": peer_id,
+                "change_type": change_type,
+                "old_regime": old_regime,
+                "new_regime": new_regime,
+                "timestamp": int(time.time())
+            }
+            if evidence:
+                params["evidence"] = evidence
+
+            result = self.plugin.rpc.call("hive-broadcast-regime-change", params)
+
+            if result.get("error"):
+                return False
+
+            self._log(
+                f"Regime change broadcasted: peer={peer_id[:12]}... "
+                f"type={change_type} {old_regime}->{new_regime}",
+                level="info"
+            )
+            return True
+
+        except Exception as e:
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to broadcast regime change: {e}", level="debug")
+            return False
+
+    def query_fleet_regime_status(self, peer_id: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Query fleet-wide regime status.
+
+        Check if other fleet members have detected regime changes for a peer,
+        which helps validate local detections and reduce false positives.
+
+        Args:
+            peer_id: Specific peer to check (None for all recent changes)
+
+        Returns:
+            Fleet regime status dict or None:
+            {
+                "recent_changes": [
+                    {
+                        "peer_id": "02abc...",
+                        "change_type": "demand_shift",
+                        "reporters": 2,
+                        "first_detected": 1705000000,
+                        "confidence": 0.8
+                    }
+                ],
+                "peer_status": {  # Only if peer_id specified
+                    "regime_stable": False,
+                    "recent_change": True,
+                    "change_type": "demand_shift",
+                    "fleet_consensus": 0.7
+                }
+            }
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return None
+
+        try:
+            params = {}
+            if peer_id:
+                params["peer_id"] = peer_id
+
+            result = self.plugin.rpc.call("hive-query-regime-status", params)
+
+            if result.get("error"):
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to query fleet regime status: {e}", level="debug")
+            return None
+
+    # =========================================================================
+    # P2 Integration: Thompson Posterior Sharing
+    # =========================================================================
+
+    def share_posterior_summary(
+        self,
+        peer_id: str,
+        posterior_mean: float,
+        posterior_std: float,
+        observation_count: int,
+        corridor_role: str = "P"
+    ) -> bool:
+        """
+        Share Thompson posterior summary with fleet.
+
+        Enables coordination by sharing what fee range we think is optimal.
+        Primary corridors share to help secondaries avoid undercutting.
+
+        Args:
+            peer_id: Peer this posterior is for
+            posterior_mean: Current posterior mean fee
+            posterior_std: Current posterior std
+            observation_count: Number of observations
+            corridor_role: Our role ("P" primary, "S" secondary)
+
+        Returns:
+            True if shared successfully
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return False
+
+        # Only share if we have meaningful data
+        if observation_count < 5:
+            return False
+
+        try:
+            params = {
+                "peer_id": peer_id,
+                "posterior_mean": posterior_mean,
+                "posterior_std": posterior_std,
+                "observation_count": observation_count,
+                "corridor_role": corridor_role,
+                "timestamp": int(time.time())
+            }
+
+            result = self.plugin.rpc.call("hive-share-posterior", params)
+
+            if result.get("error"):
+                return False
+
+            return True
+
+        except Exception as e:
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to share posterior: {e}", level="debug")
+            return False
+
+    def query_fleet_posteriors(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Query fleet posterior summaries for a peer.
+
+        Gets Thompson posterior data from other fleet members for coordination.
+        Useful for secondary corridors to avoid undercutting primaries.
+
+        Args:
+            peer_id: Peer to query posteriors for
+
+        Returns:
+            Fleet posteriors dict or None:
+            {
+                "peer_id": "02abc...",
+                "posteriors": [
+                    {
+                        "member_id": "03def...",
+                        "corridor_role": "P",
+                        "posterior_mean": 200.0,
+                        "posterior_std": 30.0,
+                        "observation_count": 50
+                    },
+                    ...
+                ],
+                "primary_mean": 200.0,  # Weighted mean of primaries
+                "secondary_mean": 180.0,  # Weighted mean of secondaries
+                "fleet_consensus_fee": 195.0  # Overall fleet estimate
+            }
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-query-posteriors", {"peer_id": peer_id})
+
+            if result.get("error"):
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to query fleet posteriors: {e}", level="debug")
+            return None
+
+    # =========================================================================
     # YIELD OPTIMIZATION PHASE 3: COST REDUCTION (PREDICTIVE REBALANCING)
     # =========================================================================
     # These methods support predictive rebalancing and fleet path optimization
