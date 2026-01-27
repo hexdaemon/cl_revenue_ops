@@ -367,16 +367,20 @@ class HiveFeeIntelligenceBridge:
             return cached_data
 
         # If circuit is open, return stale cache or None
+        # Get cache entry once to avoid race conditions
+        cache_entry = self._cache.get(peer_id)
+        cache_timestamp = cache_entry.timestamp if cache_entry else 0
+
         if self._is_circuit_open():
-            if cached_data:
-                age = time.time() - self._cache[peer_id].timestamp
+            if cached_data and cache_entry:
+                age = time.time() - cache_timestamp
                 return self._stale_with_reduced_confidence(cached_data, age)
             return None
 
         # Check if cl-hive is available
         if not self.is_available():
-            if cached_data:
-                age = time.time() - self._cache[peer_id].timestamp
+            if cached_data and cache_entry:
+                age = time.time() - cache_timestamp
                 return self._stale_with_reduced_confidence(cached_data, age)
             return None
 
@@ -394,8 +398,8 @@ class HiveFeeIntelligenceBridge:
                     return None
                 self._log(f"Query error: {result.get('error')}", level="debug")
                 self._record_failure()
-                if cached_data:
-                    age = time.time() - self._cache[peer_id].timestamp
+                if cached_data and cache_entry:
+                    age = time.time() - cache_timestamp
                     return self._stale_with_reduced_confidence(cached_data, age)
                 return None
 
@@ -408,8 +412,8 @@ class HiveFeeIntelligenceBridge:
             self._log(f"Failed to query fee intelligence: {e}", level="debug")
             self._record_failure()
 
-            if cached_data:
-                age = time.time() - self._cache[peer_id].timestamp
+            if cached_data and cache_entry:
+                age = time.time() - cache_timestamp
                 return self._stale_with_reduced_confidence(cached_data, age)
             return None
 
@@ -1922,6 +1926,19 @@ class HiveFeeIntelligenceBridge:
 
         if self._is_circuit_open():
             return False
+
+        # Validate parameters to prevent invalid data propagation
+        if not (0.0 <= confidence <= 1.0):
+            self._log(f"Invalid confidence value {confidence}, clamping to [0,1]", level="debug")
+            confidence = max(0.0, min(1.0, confidence))
+
+        if not (-1.0 <= flow_ratio <= 1.0):
+            self._log(f"Invalid flow_ratio value {flow_ratio}, clamping to [-1,1]", level="debug")
+            flow_ratio = max(-1.0, min(1.0, flow_ratio))
+
+        if uncertainty < 0:
+            self._log(f"Invalid uncertainty value {uncertainty}, using abs", level="debug")
+            uncertainty = abs(uncertainty)
 
         try:
             result = self.plugin.rpc.call("hive-report-kalman-velocity", {

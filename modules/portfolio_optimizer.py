@@ -58,6 +58,29 @@ HIGH_CORRELATION_THRESHOLD = 0.7    # Channels moving together
 NEGATIVE_CORRELATION_THRESHOLD = -0.3  # Natural hedges
 
 
+def _safe_msat_to_sats(value: Any) -> int:
+    """
+    Safely convert msat value (int or string) to sats.
+
+    Handles:
+    - Integer values (millisatoshis)
+    - String values like "1000000msat" or "1000000"
+    - None or invalid values (returns 0)
+    """
+    if value is None:
+        return 0
+    try:
+        if isinstance(value, str):
+            # Remove "msat" suffix if present
+            value = value.replace("msat", "").strip()
+            return int(value) // 1000
+        elif isinstance(value, (int, float)):
+            return int(value) // 1000
+        return 0
+    except (ValueError, TypeError, AttributeError):
+        return 0
+
+
 class ChannelRole(Enum):
     """Channel classification for portfolio analysis."""
     EXCHANGE = "exchange"       # High volume, high variance
@@ -333,17 +356,11 @@ class PortfolioOptimizer:
         for scid, ch in channel_info.items():
             peer_id = ch.get("peer_id", "")
 
-            # Get capacity
-            capacity = ch.get("total_msat", 0)
-            if isinstance(capacity, str):
-                capacity = int(capacity.replace("msat", ""))
-            capacity_sats = capacity // 1000
+            # Get capacity (safely handle string or int msat values)
+            capacity_sats = _safe_msat_to_sats(ch.get("total_msat", 0))
 
-            # Get local balance
-            local = ch.get("to_us_msat", 0)
-            if isinstance(local, str):
-                local = int(local.replace("msat", ""))
-            local_sats = local // 1000
+            # Get local balance (safely handle string or int msat values)
+            local_sats = _safe_msat_to_sats(ch.get("to_us_msat", 0))
 
             # Current allocation
             current_alloc = local_sats / total_local_sats if total_local_sats > 0 else 0
@@ -374,11 +391,8 @@ class PortfolioOptimizer:
             avg_size = 0
             freq = 0.0
             if fwds:
-                sizes = [f.get("out_msat", 0) for f in fwds]
-                if isinstance(sizes[0], str):
-                    sizes = [int(s.replace("msat", "")) // 1000 for s in sizes]
-                else:
-                    sizes = [s // 1000 for s in sizes]
+                sizes = [_safe_msat_to_sats(f.get("out_msat", 0)) for f in fwds]
+                sizes = [s for s in sizes if s > 0]  # Filter out invalid entries
                 avg_size = sum(sizes) // len(sizes) if sizes else 0
                 hours = (now - window_start) / 3600
                 freq = len(fwds) / hours if hours > 0 else 0
@@ -434,11 +448,17 @@ class PortfolioOptimizer:
 
             bucket_idx = (ts - window_start) // interval_secs
 
-            # Get fee earned
-            fee = fwd.get("fee_msat") or fwd.get("fee", 0)
-            if isinstance(fee, str):
-                fee = int(fee.replace("msat", ""))
-            fee_sats = fee / 1000  # Keep as float for precision
+            # Get fee earned (safely handle string or int msat values)
+            fee_msat = fwd.get("fee_msat") or fwd.get("fee", 0)
+            fee_sats = _safe_msat_to_sats(fee_msat) if fee_msat else 0
+            # For sub-sat precision, also handle as float
+            if isinstance(fee_msat, (int, float)):
+                fee_sats = fee_msat / 1000
+            elif isinstance(fee_msat, str):
+                try:
+                    fee_sats = int(fee_msat.replace("msat", "").strip()) / 1000
+                except (ValueError, AttributeError):
+                    fee_sats = 0
 
             if bucket_idx not in buckets:
                 buckets[bucket_idx] = 0.0
@@ -473,13 +493,9 @@ class PortfolioOptimizer:
         if not forwards:
             return ChannelRole.UNKNOWN
 
-        # Check forward size distribution
-        sizes = []
-        for fwd in forwards:
-            size = fwd.get("out_msat", 0)
-            if isinstance(size, str):
-                size = int(size.replace("msat", ""))
-            sizes.append(size // 1000)
+        # Check forward size distribution (safely handle msat values)
+        sizes = [_safe_msat_to_sats(fwd.get("out_msat", 0)) for fwd in forwards]
+        sizes = [s for s in sizes if s > 0]  # Filter invalid entries
 
         if not sizes:
             return ChannelRole.UNKNOWN
@@ -580,20 +596,29 @@ class PortfolioOptimizer:
                 vals_a = [series_a[b] for b in sorted(common_buckets)]
                 vals_b = [series_b[b] for b in sorted(common_buckets)]
 
-                # Calculate covariance
-                mean_a = sum(vals_a) / len(vals_a)
-                mean_b = sum(vals_b) / len(vals_b)
+                # Safety check: need at least 2 values for variance calculation
+                n_samples = len(vals_a)
+                if n_samples < 2:
+                    covariance_matrix[(scid_a, scid_b)] = 0.0
+                    correlation_matrix[(scid_a, scid_b)] = 0.0
+                    continue
 
+                # Calculate covariance
+                mean_a = sum(vals_a) / n_samples
+                mean_b = sum(vals_b) / n_samples
+
+                # Use max(1, n-1) to prevent division by zero
+                denominator = max(1, n_samples - 1)
                 cov = sum(
                     (a - mean_a) * (b - mean_b)
                     for a, b in zip(vals_a, vals_b)
-                ) / (len(vals_a) - 1)
+                ) / denominator
 
                 covariance_matrix[(scid_a, scid_b)] = cov
 
                 # Calculate correlation
-                var_a = sum((a - mean_a) ** 2 for a in vals_a) / (len(vals_a) - 1)
-                var_b = sum((b - mean_b) ** 2 for b in vals_b) / (len(vals_b) - 1)
+                var_a = sum((a - mean_a) ** 2 for a in vals_a) / denominator
+                var_b = sum((b - mean_b) ** 2 for b in vals_b) / denominator
 
                 if var_a > MIN_VARIANCE and var_b > MIN_VARIANCE:
                     corr = cov / (math.sqrt(var_a) * math.sqrt(var_b))
