@@ -509,6 +509,914 @@ class ThompsonSamplingState:
         return state
 
 
+# =============================================================================
+# IMPROVEMENT #6: Gaussian Thompson Sampling (Primary Algorithm)
+# =============================================================================
+# Continuous posterior for fee optimization using Gaussian conjugate priors.
+# Replaces discrete 5-arm Thompson Sampling with continuous fee space.
+# Security mitigations:
+# - Bounded observations (max 200 per channel)
+# - Exponential decay on old observations
+# - Fleet-informed priors with confidence weighting
+# =============================================================================
+
+@dataclass
+class GaussianThompsonState:
+    """
+    Gaussian Thompson Sampling for continuous fee optimization.
+
+    Uses Normal-Normal conjugate prior for continuous fee space:
+    - Prior: N(mu_0, sigma_0^2) from hive intelligence or defaults
+    - Likelihood: N(fee, sigma_obs^2) for observed revenue
+    - Posterior: N(mu_n, sigma_n^2) updated via Bayesian inference
+
+    This replaces the discrete 5-arm ThompsonSamplingState with a
+    continuous approach that can explore the full fee space.
+
+    Security mitigations:
+    - MAX_OBSERVATIONS: Bounded memory per channel (200)
+    - DECAY_HOURS: Exponential decay on old observations (7-day half-life)
+    - MIN_OBSERVATIONS: Minimum data before using posterior (3)
+    """
+    MAX_OBSERVATIONS = 200          # Security: bounded memory
+    DECAY_HOURS = 168.0             # 7-day half-life for observation decay
+    MIN_OBSERVATIONS = 3            # Minimum before trusting posterior
+    MIN_STD = 10                    # Never let uncertainty go below 10 ppm
+
+    # Prior parameters (initialized from hive intelligence or defaults)
+    prior_mean_fee: int = 200       # Default prior mean: 200 ppm
+    prior_std_fee: int = 100        # Default prior uncertainty: 100 ppm
+
+    # Observations: List of (fee_ppm, revenue_rate, weight, timestamp)
+    observations: List[Tuple[int, float, float, int]] = field(default_factory=list)
+
+    # Posterior parameters (updated from observations)
+    posterior_mean: float = 200.0
+    posterior_std: float = 100.0
+
+    # Context-specific posteriors: {context_key: (mean, std, count)}
+    contextual_posteriors: Dict[str, Tuple[float, float, int]] = field(default_factory=dict)
+
+    # Fleet-informed data (from hive aggregated profiles)
+    fleet_optimal_estimate: Optional[int] = None
+    fleet_confidence: float = 0.0
+    fleet_avg_fee: Optional[int] = None          # Average fee peer charges
+    fleet_fee_volatility: float = 0.0            # How much peer's fees vary
+    fleet_min_fee: Optional[int] = None          # Minimum observed fee
+    fleet_max_fee: Optional[int] = None          # Maximum observed fee
+    fleet_reporters: int = 0                     # Number of hive members reporting
+    fleet_elasticity: float = -1.0               # Estimated demand elasticity
+
+    # Tracking
+    last_sampled_fee: int = 0
+    last_sample_time: int = 0
+
+    def initialize_from_hive(self, optimal_fee: int, confidence: float,
+                            elasticity: float) -> None:
+        """
+        Initialize prior from hive intelligence (simple version).
+
+        For richer initialization, use initialize_from_hive_profile() instead.
+
+        Args:
+            optimal_fee: Hive's estimate of optimal fee for this peer
+            confidence: Confidence in the estimate (0-1)
+            elasticity: Estimated demand elasticity (negative for elastic)
+        """
+        self.fleet_optimal_estimate = optimal_fee
+        self.fleet_confidence = confidence
+        self.fleet_elasticity = elasticity
+
+        # Blend hive prior with default based on confidence
+        if confidence > 0.3:
+            # Higher confidence = trust hive estimate more
+            blend_weight = min(0.8, confidence)  # Cap at 80% hive weight
+            self.prior_mean_fee = int(
+                optimal_fee * blend_weight +
+                self.prior_mean_fee * (1 - blend_weight)
+            )
+
+            # Higher confidence = lower prior uncertainty
+            # High elasticity = higher uncertainty (market is sensitive)
+            elasticity_factor = min(2.0, max(0.5, abs(elasticity)))
+            self.prior_std_fee = int(
+                self.prior_std_fee * (1 - confidence * 0.3) * elasticity_factor
+            )
+            self.prior_std_fee = max(self.MIN_STD, self.prior_std_fee)
+
+        # Initialize posterior to prior
+        self.posterior_mean = float(self.prior_mean_fee)
+        self.posterior_std = float(self.prior_std_fee)
+
+    def initialize_from_hive_profile(self, profile: Dict[str, Any]) -> None:
+        """
+        Initialize prior from full hive aggregated profile.
+
+        Uses the complete fee intelligence profile from cl-hive's
+        FeeIntelligenceManager for better prior calibration:
+        - avg_fee_charged: Grounds prior mean on observed market rates
+        - fee_volatility: Scales uncertainty based on market stability
+        - hive_reporters: Boosts confidence when multiple nodes report
+        - min_fee/max_fee: Informs reasonable fee bounds
+
+        Args:
+            profile: Full fee intelligence dict from query_fee_intelligence()
+                {
+                    "avg_fee_charged": 250,
+                    "min_fee": 100,
+                    "max_fee": 500,
+                    "fee_volatility": 0.15,
+                    "estimated_elasticity": -0.8,
+                    "optimal_fee_estimate": 180,
+                    "confidence": 0.75,
+                    "hive_reporters": 3,
+                    ...
+                }
+        """
+        if not profile:
+            return
+
+        # Store all fleet data
+        self.fleet_optimal_estimate = profile.get("optimal_fee_estimate")
+        self.fleet_confidence = profile.get("confidence", 0.0)
+        self.fleet_avg_fee = profile.get("avg_fee_charged")
+        self.fleet_fee_volatility = profile.get("fee_volatility", 0.0)
+        self.fleet_min_fee = profile.get("min_fee")
+        self.fleet_max_fee = profile.get("max_fee")
+        self.fleet_reporters = profile.get("hive_reporters", 0)
+        self.fleet_elasticity = profile.get("estimated_elasticity", -1.0)
+
+        confidence = self.fleet_confidence
+
+        # Boost confidence if multiple reporters agree
+        if self.fleet_reporters >= 3:
+            confidence = min(0.95, confidence * 1.15)
+        elif self.fleet_reporters >= 2:
+            confidence = min(0.9, confidence * 1.05)
+
+        # Only apply hive priors if confidence threshold met
+        if confidence < 0.3:
+            return
+
+        # Determine best prior mean:
+        # - Prefer optimal_fee_estimate (hive's computed optimal)
+        # - Fall back to avg_fee_charged (market observation)
+        optimal = self.fleet_optimal_estimate
+        avg = self.fleet_avg_fee
+
+        if optimal and optimal > 0:
+            # Use optimal, but validate against market average
+            base_fee = optimal
+            if avg and avg > 0:
+                # If optimal differs hugely from avg, blend them
+                if abs(optimal - avg) > avg * 0.5:
+                    base_fee = int(optimal * 0.7 + avg * 0.3)
+        elif avg and avg > 0:
+            base_fee = avg
+        else:
+            base_fee = self.prior_mean_fee
+
+        # Blend with current prior based on confidence
+        blend_weight = min(0.85, confidence)
+        self.prior_mean_fee = int(
+            base_fee * blend_weight +
+            self.prior_mean_fee * (1 - blend_weight)
+        )
+
+        # Calculate prior std from volatility and elasticity
+        # Base uncertainty from config (default 100 ppm)
+        base_std = self.prior_std_fee
+
+        # Volatility factor: higher volatility = more uncertainty
+        # fee_volatility is typically 0.0-1.0 (0 = stable, 1 = highly variable)
+        volatility = self.fleet_fee_volatility
+        volatility_factor = 1.0 + volatility * 1.5  # Range 1.0-2.5
+
+        # Elasticity factor: higher elasticity = more price sensitive = more uncertainty
+        elasticity_factor = min(2.0, max(0.5, abs(self.fleet_elasticity)))
+
+        # Confidence factor: higher confidence = less uncertainty
+        confidence_factor = 1.0 - confidence * 0.4  # Range 0.6-1.0
+
+        # Reporters factor: more reporters = less uncertainty
+        reporters_factor = 1.0
+        if self.fleet_reporters >= 5:
+            reporters_factor = 0.8
+        elif self.fleet_reporters >= 3:
+            reporters_factor = 0.9
+
+        # Combine factors
+        self.prior_std_fee = int(
+            base_std * volatility_factor * elasticity_factor *
+            confidence_factor * reporters_factor
+        )
+
+        # Bound the std
+        self.prior_std_fee = max(self.MIN_STD, min(200, self.prior_std_fee))
+
+        # If we have min/max bounds, constrain std to reasonable range
+        if self.fleet_min_fee and self.fleet_max_fee:
+            observed_range = self.fleet_max_fee - self.fleet_min_fee
+            # Std shouldn't be much larger than observed market range
+            self.prior_std_fee = min(self.prior_std_fee, observed_range // 2)
+            self.prior_std_fee = max(self.MIN_STD, self.prior_std_fee)
+
+        # Initialize posterior to prior
+        self.posterior_mean = float(self.prior_mean_fee)
+        self.posterior_std = float(self.prior_std_fee)
+
+    def sample_fee(self, floor: int, ceiling: int) -> int:
+        """
+        Sample a fee from the posterior distribution.
+
+        Uses Thompson Sampling: sample from posterior, return sampled fee.
+        This naturally balances exploration (high uncertainty) vs
+        exploitation (low uncertainty around known good fees).
+
+        Args:
+            floor: Minimum allowed fee (ppm)
+            ceiling: Maximum allowed fee (ppm)
+
+        Returns:
+            Sampled fee in ppm, clamped to [floor, ceiling]
+        """
+        # If not enough observations, explore more widely
+        if len(self.observations) < self.MIN_OBSERVATIONS:
+            # Use prior with extra exploration
+            explore_std = self.prior_std_fee * 1.5
+            sampled = random.gauss(self.prior_mean_fee, explore_std)
+        else:
+            # Sample from posterior
+            sampled = random.gauss(self.posterior_mean, self.posterior_std)
+
+        # Clamp to bounds
+        sampled_fee = int(max(floor, min(ceiling, sampled)))
+        self.last_sampled_fee = sampled_fee
+        self.last_sample_time = int(time.time())
+
+        return sampled_fee
+
+    def sample_fee_contextual(self, context_key: str, floor: int, ceiling: int) -> int:
+        """
+        Sample fee using context-specific posterior if available.
+
+        Context keys encode balance state, pheromone level, time bucket,
+        and corridor role. This allows learning different optimal fees
+        for different market conditions.
+
+        Args:
+            context_key: Context identifier (e.g., "low:strong:peak:P")
+            floor: Minimum allowed fee
+            ceiling: Maximum allowed fee
+
+        Returns:
+            Sampled fee in ppm
+        """
+        if context_key in self.contextual_posteriors:
+            ctx_mean, ctx_std, ctx_count = self.contextual_posteriors[context_key]
+
+            if ctx_count >= self.MIN_OBSERVATIONS:
+                # Use contextual posterior
+                sampled = random.gauss(ctx_mean, ctx_std)
+                sampled_fee = int(max(floor, min(ceiling, sampled)))
+                self.last_sampled_fee = sampled_fee
+                self.last_sample_time = int(time.time())
+                return sampled_fee
+
+        # Fall back to global posterior
+        return self.sample_fee(floor, ceiling)
+
+    def update_posterior(self, fee: int, revenue_rate: float, hours: float) -> None:
+        """
+        Update posterior after observing revenue at a given fee.
+
+        Uses Bayesian update for Normal-Normal conjugate prior.
+        Higher revenue rates increase the weight of that fee observation.
+
+        Args:
+            fee: Fee that was charged (ppm)
+            revenue_rate: Observed revenue rate (sats/hour)
+            hours: Hours of observation
+        """
+        now = int(time.time())
+
+        # Weight based on revenue (higher revenue = more confidence)
+        # and observation duration (longer = more confidence)
+        weight = min(1.0, hours / 6.0) * min(1.0, (revenue_rate + 1) / 100.0)
+        weight = max(0.01, weight)  # Minimum weight
+
+        # Add observation
+        self.observations.append((fee, revenue_rate, weight, now))
+
+        # Prune old observations
+        if len(self.observations) > self.MAX_OBSERVATIONS:
+            self.observations = self.observations[-self.MAX_OBSERVATIONS:]
+
+        # Recompute posterior
+        self._recompute_posterior()
+
+    def update_contextual(self, context_key: str, fee: int, revenue_rate: float) -> None:
+        """
+        Update context-specific posterior.
+
+        Args:
+            context_key: Context identifier
+            fee: Fee that was charged
+            revenue_rate: Observed revenue rate
+        """
+        if context_key not in self.contextual_posteriors:
+            # Initialize from global posterior
+            self.contextual_posteriors[context_key] = (
+                self.posterior_mean, self.posterior_std, 0
+            )
+
+        ctx_mean, ctx_std, ctx_count = self.contextual_posteriors[context_key]
+
+        # Simple online update: weighted average toward observed fee
+        # weighted by revenue (good outcomes have more influence)
+        revenue_weight = min(1.0, revenue_rate / 100.0)
+        learning_rate = 0.1 * (1 + revenue_weight)
+
+        new_mean = ctx_mean + learning_rate * (fee - ctx_mean) * revenue_weight
+
+        # Decrease uncertainty as we gather more observations
+        new_std = max(self.MIN_STD, ctx_std * 0.95)
+        new_count = ctx_count + 1
+
+        self.contextual_posteriors[context_key] = (new_mean, new_std, new_count)
+
+        # Prune contextual posteriors to prevent memory bloat
+        if len(self.contextual_posteriors) > 50:
+            # Keep only the most used contexts
+            sorted_contexts = sorted(
+                self.contextual_posteriors.items(),
+                key=lambda x: x[1][2],  # Sort by count
+                reverse=True
+            )
+            self.contextual_posteriors = dict(sorted_contexts[:40])
+
+    def _recompute_posterior(self) -> None:
+        """
+        Recompute posterior from all observations using weighted mean.
+
+        Uses exponential decay weighting so recent observations matter more.
+        High-revenue observations are weighted more heavily.
+        """
+        if not self.observations:
+            self.posterior_mean = float(self.prior_mean_fee)
+            self.posterior_std = float(self.prior_std_fee)
+            return
+
+        now = int(time.time())
+        total_weight = 0.0
+        weighted_sum = 0.0
+        weighted_sq_sum = 0.0
+
+        for fee, revenue_rate, base_weight, timestamp in self.observations:
+            # Apply time decay
+            age_hours = (now - timestamp) / 3600.0
+            decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
+
+            # Revenue weighting: better outcomes get more weight
+            # Normalize so 100 sats/hr observation gets weight ~1.0
+            revenue_factor = min(2.0, (revenue_rate + 10) / 50.0)
+
+            weight = base_weight * decay * revenue_factor
+
+            total_weight += weight
+            weighted_sum += fee * weight
+            weighted_sq_sum += fee * fee * weight
+
+        if total_weight > 0.1:
+            # Posterior mean: weighted average of observations blended with prior
+            obs_mean = weighted_sum / total_weight
+
+            # Prior weight decreases as we get more observations
+            prior_weight = max(0.1, 1.0 / (1 + len(self.observations) / 10.0))
+
+            self.posterior_mean = (
+                obs_mean * (1 - prior_weight) +
+                self.prior_mean_fee * prior_weight
+            )
+
+            # Posterior std: derived from variance of observations
+            variance = (weighted_sq_sum / total_weight) - (obs_mean ** 2)
+            variance = max(self.MIN_STD ** 2, variance)
+            obs_std = math.sqrt(variance)
+
+            # Blend with prior std, decreasing as observations accumulate
+            self.posterior_std = (
+                obs_std * (1 - prior_weight) +
+                self.prior_std_fee * prior_weight
+            )
+            self.posterior_std = max(self.MIN_STD, self.posterior_std)
+        else:
+            # Not enough weighted observations, use prior
+            self.posterior_mean = float(self.prior_mean_fee)
+            self.posterior_std = float(self.prior_std_fee)
+
+    def get_exploitation_fee(self) -> int:
+        """Get the current best estimate (posterior mean) without exploration."""
+        return int(self.posterior_mean)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize state to dict for database storage."""
+        return {
+            "prior_mean_fee": self.prior_mean_fee,
+            "prior_std_fee": self.prior_std_fee,
+            "observations": self.observations,  # List of tuples
+            "posterior_mean": self.posterior_mean,
+            "posterior_std": self.posterior_std,
+            "contextual_posteriors": self.contextual_posteriors,
+            "fleet_optimal_estimate": self.fleet_optimal_estimate,
+            "fleet_confidence": self.fleet_confidence,
+            "fleet_avg_fee": self.fleet_avg_fee,
+            "fleet_fee_volatility": self.fleet_fee_volatility,
+            "fleet_min_fee": self.fleet_min_fee,
+            "fleet_max_fee": self.fleet_max_fee,
+            "fleet_reporters": self.fleet_reporters,
+            "fleet_elasticity": self.fleet_elasticity,
+            "last_sampled_fee": self.last_sampled_fee,
+            "last_sample_time": self.last_sample_time
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "GaussianThompsonState":
+        """Deserialize state from dict."""
+        state = cls()
+        state.prior_mean_fee = d.get("prior_mean_fee", 200)
+        state.prior_std_fee = d.get("prior_std_fee", 100)
+        state.observations = [tuple(o) for o in d.get("observations", [])]
+        state.posterior_mean = d.get("posterior_mean", 200.0)
+        state.posterior_std = d.get("posterior_std", 100.0)
+        state.contextual_posteriors = {
+            k: tuple(v) for k, v in d.get("contextual_posteriors", {}).items()
+        }
+        state.fleet_optimal_estimate = d.get("fleet_optimal_estimate")
+        state.fleet_confidence = d.get("fleet_confidence", 0.0)
+        state.fleet_avg_fee = d.get("fleet_avg_fee")
+        state.fleet_fee_volatility = d.get("fleet_fee_volatility", 0.0)
+        state.fleet_min_fee = d.get("fleet_min_fee")
+        state.fleet_max_fee = d.get("fleet_max_fee")
+        state.fleet_reporters = d.get("fleet_reporters", 0)
+        state.fleet_elasticity = d.get("fleet_elasticity", -1.0)
+        state.last_sampled_fee = d.get("last_sampled_fee", 0)
+        state.last_sample_time = d.get("last_sample_time", 0)
+        return state
+
+
+# =============================================================================
+# IMPROVEMENT #7: AIMD Defense Layer
+# =============================================================================
+# Additive Increase / Multiplicative Decrease for rapid response to failures.
+# When consecutive failures occur, we quickly drop fees to find working level.
+# When things are going well, we slowly increase to find optimal.
+# =============================================================================
+
+@dataclass
+class AIMDDefenseState:
+    """
+    AIMD (Additive Increase / Multiplicative Decrease) defense layer.
+
+    Provides rapid response to routing failures by:
+    - Tracking consecutive successes and failures
+    - Multiplicative decrease (0.85x) on failure streaks
+    - Additive increase (+5 ppm) on success streaks
+
+    This overlays Thompson Sampling to provide quick recovery when
+    market conditions change suddenly. Thompson learns slowly but
+    correctly; AIMD reacts quickly to protect revenue.
+
+    Security mitigations:
+    - MIN_DECREASE_INTERVAL: 1 hour cooldown prevents rapid oscillation
+    - is_active flag prevents AIMD from fighting Thompson
+    - Bounded modifier range (0.5 to 1.5)
+    """
+    # AIMD parameters
+    ADDITIVE_INCREASE_PPM = 5       # Add 5 ppm per success streak
+    MULTIPLICATIVE_DECREASE = 0.85  # Multiply by 0.85 on failure streak
+
+    # Thresholds for triggering AIMD
+    FAILURE_THRESHOLD = 3           # Failures before multiplicative decrease
+    SUCCESS_THRESHOLD = 10          # Successes before additive increase
+
+    # Cooldowns
+    MIN_DECREASE_INTERVAL = 3600    # 1 hour between decreases
+
+    # State tracking
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+
+    # AIMD modifier (1.0 = no adjustment)
+    aimd_modifier: float = 1.0
+
+    # Defense mode tracking
+    is_active: bool = False          # True when AIMD is overriding Thompson
+    last_decrease_time: int = 0      # Timestamp of last decrease
+    total_decreases: int = 0         # Count for diagnostics
+    total_increases: int = 0         # Count for diagnostics
+
+    # Fleet defense coordination (from hive MyceliumDefenseSystem)
+    fleet_threat_active: bool = False           # True when hive reports threat
+    fleet_threat_type: Optional[str] = None     # "drain", "unreliable", etc.
+    fleet_threat_severity: float = 0.0          # 0.0 to 1.0
+    fleet_defensive_multiplier: float = 1.0     # From hive defense system
+    fleet_threat_expires: int = 0               # When threat warning expires
+
+    def record_outcome(self, was_success: bool) -> None:
+        """
+        Record a routing outcome (success or failure).
+
+        Success is defined as: forward_count > 0 since last observation.
+        This updates the AIMD state machine.
+
+        Args:
+            was_success: True if routing succeeded, False if no forwards
+        """
+        now = int(time.time())
+
+        if was_success:
+            self.consecutive_successes += 1
+            self.consecutive_failures = 0
+
+            # Check for additive increase
+            if self.consecutive_successes >= self.SUCCESS_THRESHOLD:
+                # Additive increase: nudge modifier up slightly
+                self.aimd_modifier = min(1.5, self.aimd_modifier + 0.02)
+                self.consecutive_successes = 0  # Reset counter
+                self.total_increases += 1
+
+                # Deactivate AIMD mode if we're doing well
+                if self.aimd_modifier >= 1.0:
+                    self.is_active = False
+        else:
+            self.consecutive_failures += 1
+            self.consecutive_successes = 0
+
+            # Check for multiplicative decrease
+            if self.consecutive_failures >= self.FAILURE_THRESHOLD:
+                # Check cooldown
+                if (now - self.last_decrease_time) >= self.MIN_DECREASE_INTERVAL:
+                    # Multiplicative decrease
+                    self.aimd_modifier = max(0.5, self.aimd_modifier * self.MULTIPLICATIVE_DECREASE)
+                    self.last_decrease_time = now
+                    self.consecutive_failures = 0  # Reset counter
+                    self.total_decreases += 1
+                    self.is_active = True  # Activate defense mode
+
+    def apply_to_fee(self, thompson_fee: int, floor: int, ceiling: int) -> int:
+        """
+        Apply AIMD and fleet defense modifiers to Thompson's sampled fee.
+
+        Combines:
+        - Local AIMD modifier: Reduces fee after failure streaks
+        - Fleet defensive multiplier: Increases fee for threat peers
+
+        When neither is active, passes through Thompson's fee unchanged.
+
+        Args:
+            thompson_fee: Fee sampled by Thompson Sampling
+            floor: Minimum allowed fee
+            ceiling: Maximum allowed fee
+
+        Returns:
+            Adjusted fee in ppm
+        """
+        # Get combined modifier (local AIMD + fleet defense)
+        modifier = self.get_effective_modifier()
+
+        if modifier == 1.0:
+            return thompson_fee
+
+        # Apply combined modifier
+        adjusted = int(thompson_fee * modifier)
+
+        # Clamp to bounds
+        return max(floor, min(ceiling, adjusted))
+
+    def update_fleet_threat(self, threat_info: Optional[Dict[str, Any]]) -> None:
+        """
+        Update fleet threat state from hive MyceliumDefenseSystem.
+
+        The hive's defense system aggregates threat signals across the fleet,
+        detecting drain attacks, unreliable peers, and other threats.
+        This allows coordinated defensive response across all fleet channels.
+
+        Args:
+            threat_info: Threat data from query_defense_status(), e.g.:
+                {
+                    "is_threat": True,
+                    "threat_type": "drain",
+                    "severity": 0.8,
+                    "defensive_multiplier": 2.6,
+                    "expires_at": 1705100000
+                }
+                Or None to clear threat state.
+        """
+        if not threat_info:
+            # Clear threat state
+            self.fleet_threat_active = False
+            self.fleet_threat_type = None
+            self.fleet_threat_severity = 0.0
+            self.fleet_defensive_multiplier = 1.0
+            self.fleet_threat_expires = 0
+            return
+
+        # Check if threat is still valid
+        now = int(time.time())
+        expires = threat_info.get("expires_at", 0)
+        if expires > 0 and now > expires:
+            # Threat has expired
+            self.fleet_threat_active = False
+            self.fleet_threat_type = None
+            self.fleet_threat_severity = 0.0
+            self.fleet_defensive_multiplier = 1.0
+            self.fleet_threat_expires = 0
+            return
+
+        # Update threat state
+        if threat_info.get("is_threat", False):
+            self.fleet_threat_active = True
+            self.fleet_threat_type = threat_info.get("threat_type", "unknown")
+            self.fleet_threat_severity = threat_info.get("severity", 0.0)
+            self.fleet_defensive_multiplier = threat_info.get("defensive_multiplier", 1.0)
+            self.fleet_threat_expires = expires
+
+            # For drain attacks, also trigger local AIMD defense mode
+            if self.fleet_threat_type == "drain" and self.fleet_threat_severity > 0.5:
+                self.is_active = True
+        else:
+            self.fleet_threat_active = False
+            self.fleet_threat_type = None
+            self.fleet_threat_severity = 0.0
+            self.fleet_defensive_multiplier = 1.0
+            self.fleet_threat_expires = 0
+
+    def get_effective_modifier(self) -> float:
+        """
+        Get the effective fee modifier combining local AIMD and fleet defense.
+
+        Combines:
+        - Local AIMD modifier (based on consecutive failures)
+        - Fleet defensive multiplier (from hive threat detection)
+
+        The fleet multiplier INCREASES fees (>1.0 for threats), while
+        AIMD modifier DECREASES fees (<1.0 on failures). We apply both.
+
+        Returns:
+            Combined modifier to apply to Thompson's sampled fee
+        """
+        if not self.is_active and not self.fleet_threat_active:
+            return 1.0
+
+        # Start with AIMD modifier (typically <= 1.0 when active)
+        modifier = self.aimd_modifier if self.is_active else 1.0
+
+        # Apply fleet defensive multiplier if threat is active
+        # This INCREASES fees when peer is a threat
+        if self.fleet_threat_active and self.fleet_defensive_multiplier > 1.0:
+            modifier *= self.fleet_defensive_multiplier
+
+        return modifier
+
+    def reset(self) -> None:
+        """Reset AIMD state (used on regime change or manual intervention)."""
+        self.consecutive_failures = 0
+        self.consecutive_successes = 0
+        self.aimd_modifier = 1.0
+        self.is_active = False
+        # Note: Does NOT reset fleet threat state (that comes from hive)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dict for database storage."""
+        return {
+            "consecutive_failures": self.consecutive_failures,
+            "consecutive_successes": self.consecutive_successes,
+            "aimd_modifier": self.aimd_modifier,
+            "is_active": self.is_active,
+            "last_decrease_time": self.last_decrease_time,
+            "total_decreases": self.total_decreases,
+            "total_increases": self.total_increases,
+            # Fleet defense state
+            "fleet_threat_active": self.fleet_threat_active,
+            "fleet_threat_type": self.fleet_threat_type,
+            "fleet_threat_severity": self.fleet_threat_severity,
+            "fleet_defensive_multiplier": self.fleet_defensive_multiplier,
+            "fleet_threat_expires": self.fleet_threat_expires
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AIMDDefenseState":
+        """Deserialize from dict."""
+        state = cls()
+        state.consecutive_failures = d.get("consecutive_failures", 0)
+        state.consecutive_successes = d.get("consecutive_successes", 0)
+        state.aimd_modifier = d.get("aimd_modifier", 1.0)
+        state.is_active = d.get("is_active", False)
+        state.last_decrease_time = d.get("last_decrease_time", 0)
+        state.total_decreases = d.get("total_decreases", 0)
+        state.total_increases = d.get("total_increases", 0)
+        # Fleet defense state
+        state.fleet_threat_active = d.get("fleet_threat_active", False)
+        state.fleet_threat_type = d.get("fleet_threat_type")
+        state.fleet_threat_severity = d.get("fleet_threat_severity", 0.0)
+        state.fleet_defensive_multiplier = d.get("fleet_defensive_multiplier", 1.0)
+        state.fleet_threat_expires = d.get("fleet_threat_expires", 0)
+        return state
+
+
+# =============================================================================
+# IMPROVEMENT #8: Combined Thompson+AIMD State
+# =============================================================================
+# Unified state class that combines Thompson Sampling with AIMD defense.
+# This replaces HillClimbState as the primary fee optimization state.
+# =============================================================================
+
+@dataclass
+class ThompsonAIMDState:
+    """
+    Combined state for Thompson Sampling + AIMD fee optimization.
+
+    This replaces HillClimbState as the primary algorithm. It combines:
+    - GaussianThompsonState: Learns optimal fee through Bayesian exploration
+    - AIMDDefenseState: Rapid response to sudden market changes
+
+    The Thompson algorithm provides careful, statistically-sound fee
+    optimization, while AIMD provides quick defensive adjustments when
+    things go wrong.
+
+    Preserved from HillClimbState (for compatibility):
+    - Deadband hysteresis (sleep mode)
+    - Revenue rate tracking
+    - Historical curve data (seeds Thompson prior)
+    - Elasticity data (informs prior uncertainty)
+    """
+    # Thompson Sampling state
+    thompson: GaussianThompsonState = field(default_factory=GaussianThompsonState)
+
+    # AIMD defense state
+    aimd: AIMDDefenseState = field(default_factory=AIMDDefenseState)
+
+    # Preserved from HillClimbState for hysteresis and tracking
+    last_revenue_rate: float = 0.0      # Raw revenue rate
+    ema_revenue_rate: float = 0.0       # EMA-smoothed revenue rate
+    last_fee_ppm: int = 0               # Last fee we set
+    last_broadcast_fee_ppm: int = 0     # Last fee broadcasted to network
+    last_update: int = 0                # Timestamp of last update
+    last_state: str = 'balanced'        # Flow state during last update
+
+    # Deadband hysteresis
+    is_sleeping: bool = False
+    sleep_until: int = 0
+    stable_cycles: int = 0
+
+    # Tracking for dynamic windows
+    forward_count_since_update: int = 0
+    last_volume_sats: int = 0
+
+    # Keep historical curve for regime detection and prior seeding
+    historical_curve_data: Dict[str, Any] = field(default_factory=dict)
+
+    # Keep elasticity for prior uncertainty
+    elasticity_data: Dict[str, Any] = field(default_factory=dict)
+
+    # Legacy Thompson data (for migration, deprecated)
+    thompson_data: Dict[str, Any] = field(default_factory=dict)
+
+    # Algorithm tracking
+    algorithm_version: str = "thompson_aimd_v1"
+
+    def get_historical_curve(self) -> HistoricalResponseCurve:
+        """Deserialize historical curve from dict."""
+        if self.historical_curve_data:
+            return HistoricalResponseCurve.from_dict(self.historical_curve_data)
+        return HistoricalResponseCurve()
+
+    def set_historical_curve(self, curve: HistoricalResponseCurve) -> None:
+        """Serialize historical curve to dict."""
+        self.historical_curve_data = curve.to_dict()
+
+    def get_elasticity_tracker(self) -> ElasticityTracker:
+        """Deserialize elasticity tracker from dict."""
+        if self.elasticity_data:
+            return ElasticityTracker.from_dict(self.elasticity_data)
+        return ElasticityTracker()
+
+    def set_elasticity_tracker(self, tracker: ElasticityTracker) -> None:
+        """Serialize elasticity tracker to dict."""
+        self.elasticity_data = tracker.to_dict()
+
+    def update_ema_revenue_rate(self, current_rate: float, alpha: float = 0.3) -> float:
+        """
+        Update EMA-smoothed revenue rate.
+
+        Args:
+            current_rate: Current raw revenue rate (sats/hour)
+            alpha: Smoothing factor (0.1=slow, 0.5=fast)
+
+        Returns:
+            Updated EMA revenue rate
+        """
+        if self.ema_revenue_rate == 0:
+            self.ema_revenue_rate = current_rate
+        else:
+            self.ema_revenue_rate = (
+                alpha * current_rate +
+                (1 - alpha) * self.ema_revenue_rate
+            )
+        return self.ema_revenue_rate
+
+    def to_v2_dict(self) -> Dict[str, Any]:
+        """
+        Serialize to v2 JSON format for database storage.
+
+        This format is stored in the v2_state_json column and contains
+        all Thompson+AIMD state plus preserved legacy fields.
+        """
+        return {
+            "algorithm_version": self.algorithm_version,
+            "thompson_state": self.thompson.to_dict(),
+            "aimd_state": self.aimd.to_dict(),
+            "ema_revenue_rate": self.ema_revenue_rate,
+            "historical_curve": self.historical_curve_data,
+            "elasticity": self.elasticity_data,
+            # Legacy thompson_data kept for migration path
+            "thompson": self.thompson_data
+        }
+
+    @classmethod
+    def from_v2_dict(cls, d: Dict[str, Any], legacy_state: Dict[str, Any] = None) -> "ThompsonAIMDState":
+        """
+        Deserialize from v2 JSON format.
+
+        Args:
+            d: v2_state_json data
+            legacy_state: Optional legacy HillClimbState fields from main table
+
+        Returns:
+            ThompsonAIMDState instance
+        """
+        state = cls()
+
+        # Check if this is new Thompson+AIMD state or needs migration
+        if d.get("algorithm_version") == "thompson_aimd_v1":
+            # New format - load directly
+            state.thompson = GaussianThompsonState.from_dict(
+                d.get("thompson_state", {})
+            )
+            state.aimd = AIMDDefenseState.from_dict(
+                d.get("aimd_state", {})
+            )
+        else:
+            # Migration: Initialize from historical data
+            state.thompson = GaussianThompsonState()
+            state.aimd = AIMDDefenseState()
+
+            # Seed Thompson from historical curve if available
+            historical = d.get("historical_curve", {})
+            observations = historical.get("observations", [])
+            for obs in observations:
+                if isinstance(obs, dict):
+                    state.thompson.observations.append((
+                        obs.get("fee_ppm", 200),
+                        obs.get("revenue_rate", 0),
+                        min(1.0, obs.get("forward_count", 1) / 10.0),
+                        obs.get("timestamp", 0)
+                    ))
+
+            # Recompute posterior from migrated observations
+            if state.thompson.observations:
+                state.thompson._recompute_posterior()
+
+            # Seed prior uncertainty from elasticity
+            elasticity = d.get("elasticity", {})
+            confidence = elasticity.get("confidence", 0)
+            if confidence > 0:
+                state.thompson.prior_std_fee = int(100 * (1 - confidence * 0.3))
+
+        # Load common fields
+        state.ema_revenue_rate = d.get("ema_revenue_rate", 0.0)
+        state.historical_curve_data = d.get("historical_curve", {})
+        state.elasticity_data = d.get("elasticity", {})
+        state.thompson_data = d.get("thompson", {})
+        state.algorithm_version = d.get("algorithm_version", "migrated")
+
+        # Load legacy fields from main table if provided
+        if legacy_state:
+            state.last_revenue_rate = legacy_state.get("last_revenue_rate", 0.0)
+            state.last_fee_ppm = legacy_state.get("last_fee_ppm", 0)
+            state.last_broadcast_fee_ppm = legacy_state.get("last_broadcast_fee_ppm", 0)
+            state.last_update = legacy_state.get("last_update", 0)
+            state.last_state = legacy_state.get("last_state", "balanced")
+            state.is_sleeping = bool(legacy_state.get("is_sleeping", 0))
+            state.sleep_until = legacy_state.get("sleep_until", 0)
+            state.stable_cycles = legacy_state.get("stable_cycles", 0)
+            state.forward_count_since_update = legacy_state.get("forward_count_since_update", 0)
+            state.last_volume_sats = legacy_state.get("last_volume_sats", 0)
+
+        return state
+
+
 @dataclass
 class HillClimbState:
     """
@@ -909,6 +1817,19 @@ class HillClimbingFeeController:
     ENABLE_COMPETITION_AVOIDANCE = True  # Avoid undercutting fleet members
     COMPETITION_DEFER_PCT = 0.05      # Stay within 5% of primary's fee when secondary
 
+    # ==========================================================================
+    # Thompson Sampling + AIMD Fee Optimization (v1.7.0)
+    # ==========================================================================
+    # Primary algorithm: Gaussian Thompson Sampling with continuous posteriors
+    # Defense layer: AIMD for rapid response to routing failures
+    #
+    # Thompson Sampling is now the PRIMARY algorithm (not secondary to Hill Climbing)
+    # AIMD provides quick defensive adjustments when market conditions change
+    ENABLE_THOMPSON_AIMD = True       # Master switch for Thompson+AIMD (replaces Hill Climbing)
+    THOMPSON_COLD_START_BONUS = 1.5   # Extra exploration for channels with few observations
+    THOMPSON_CONTEXT_WEIGHT = 0.7     # Weight for contextual vs global posterior
+    AIMD_DEFENSE_CEILING_BOOST = 0.1  # Allow 10% above ceiling when in defense mode
+
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
@@ -935,10 +1856,267 @@ class HillClimbingFeeController:
         self.hive_bridge = hive_bridge
 
         # In-memory cache of Hill Climbing states (also persisted to DB)
+        # Note: This cache is used for both legacy HillClimbState and new ThompsonAIMDState
         self._hill_climb_states: Dict[str, HillClimbState] = {}
+
+        # Thompson+AIMD state cache (v1.7.0)
+        self._thompson_aimd_states: Dict[str, ThompsonAIMDState] = {}
 
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
+
+    # =========================================================================
+    # Thompson Sampling + AIMD Helper Methods (v1.7.0)
+    # =========================================================================
+
+    def _get_context_key(
+        self,
+        channel_id: str,
+        peer_id: str,
+        outbound_ratio: float
+    ) -> str:
+        """
+        Extract context features for contextual Thompson Sampling.
+
+        Context keys encode market conditions that affect optimal fees:
+        - Balance state: depleted/low/balanced/high/saturated
+        - Pheromone level: none/weak/medium/strong (historical success)
+        - Time bucket: low/normal/peak (from hive time-based adjustments)
+        - Corridor role: P (primary) or S (secondary)
+
+        Args:
+            channel_id: Channel SCID
+            peer_id: Peer pubkey
+            outbound_ratio: Current outbound liquidity ratio (0.0-1.0)
+
+        Returns:
+            Context key string (e.g., "low:strong:peak:P")
+        """
+        # Balance bucket
+        if outbound_ratio < 0.15:
+            balance = "depleted"
+        elif outbound_ratio < 0.35:
+            balance = "low"
+        elif outbound_ratio < 0.65:
+            balance = "balanced"
+        elif outbound_ratio < 0.85:
+            balance = "high"
+        else:
+            balance = "saturated"
+
+        # Pheromone bucket (from hive)
+        pheromone = "none"
+        if self.hive_bridge:
+            try:
+                level_data = self.hive_bridge.query_pheromone_level(channel_id)
+                if level_data:
+                    level = level_data.get("level", 0)
+                    if level >= 15:
+                        pheromone = "strong"
+                    elif level >= 5:
+                        pheromone = "medium"
+                    elif level >= 2:
+                        pheromone = "weak"
+            except Exception:
+                pass  # Fall back to "none"
+
+        # Time bucket
+        time_bucket = "normal"
+        if self.hive_bridge:
+            try:
+                adj = self.hive_bridge.query_time_fee_adjustment(channel_id)
+                if adj:
+                    intensity = adj.get("intensity", 0.5)
+                    if intensity > 0.7:
+                        time_bucket = "peak"
+                    elif intensity < 0.3:
+                        time_bucket = "low"
+            except Exception:
+                pass
+
+        # Corridor role
+        role = "P"  # Primary by default
+        if self.hive_bridge:
+            try:
+                coord = self.hive_bridge.query_coordinated_fee_recommendation(
+                    channel_id=channel_id,
+                    current_fee=0  # Don't need actual fee for role check
+                )
+                if coord and not coord.get("is_primary", True):
+                    role = "S"  # Secondary
+            except Exception:
+                pass
+
+        return f"{balance}:{pheromone}:{time_bucket}:{role}"
+
+    def _initialize_thompson_from_hive(
+        self,
+        channel_id: str,
+        peer_id: str
+    ) -> GaussianThompsonState:
+        """
+        Initialize Thompson state with hive-informed priors.
+
+        Queries cl-hive for full fee intelligence profile:
+        - optimal_fee_estimate: Hive's computed optimal fee
+        - avg_fee_charged: Market observation of peer's typical fees
+        - fee_volatility: How much peer's fees vary (uncertainty signal)
+        - min_fee/max_fee: Observed fee bounds
+        - hive_reporters: Number of fleet nodes with data
+        - confidence: Overall confidence in the estimate
+        - estimated_elasticity: Demand elasticity
+
+        These inform the Thompson prior, giving new channels a better
+        starting point based on fleet intelligence.
+
+        Args:
+            channel_id: Channel SCID
+            peer_id: Peer pubkey
+
+        Returns:
+            Initialized GaussianThompsonState
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        state = GaussianThompsonState()
+        state.prior_std_fee = cfg.thompson_prior_std_fee
+
+        if self.hive_bridge and self.hive_bridge.is_available():
+            try:
+                intel = self.hive_bridge.query_fee_intelligence(peer_id)
+                if intel and intel.get("confidence", 0) >= cfg.hive_min_confidence_for_prior:
+                    # Use the full profile initialization
+                    state.initialize_from_hive_profile(intel)
+
+                    # Log detailed initialization
+                    reporters = intel.get("hive_reporters", 0)
+                    volatility = intel.get("fee_volatility", 0)
+                    self.plugin.log(
+                        f"THOMPSON_INIT: {channel_id[:12]}... initialized from hive profile "
+                        f"(optimal={intel.get('optimal_fee_estimate')}, "
+                        f"avg={intel.get('avg_fee_charged')}, "
+                        f"volatility={volatility:.2f}, "
+                        f"reporters={reporters}, "
+                        f"conf={intel.get('confidence', 0):.2f}) -> "
+                        f"prior_mean={state.prior_mean_fee}, prior_std={state.prior_std_fee}",
+                        level='debug'
+                    )
+            except Exception as e:
+                self.plugin.log(
+                    f"THOMPSON_INIT: Failed to get hive intel for {peer_id[:12]}...: {e}",
+                    level='debug'
+                )
+
+        return state
+
+    def _get_thompson_aimd_state(
+        self,
+        channel_id: str,
+        peer_id: str,
+        actual_fee_ppm: int = None
+    ) -> ThompsonAIMDState:
+        """
+        Get Thompson+AIMD state for a channel.
+
+        Checks in-memory cache first, then database. Handles migration from
+        legacy HillClimbState if needed.
+
+        Args:
+            channel_id: Channel ID
+            peer_id: Peer ID (for hive prior initialization)
+            actual_fee_ppm: Optional actual fee from chain for desync detection
+
+        Returns:
+            ThompsonAIMDState for the channel
+        """
+        import json
+
+        # Check in-memory cache
+        if channel_id in self._thompson_aimd_states:
+            cached_state = self._thompson_aimd_states[channel_id]
+            # Desync check
+            if actual_fee_ppm is not None and actual_fee_ppm > 0:
+                tracked = cached_state.last_broadcast_fee_ppm
+                if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
+                    self.plugin.log(
+                        f"FEE DESYNC (thompson cached): {channel_id[:16]}... "
+                        f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
+                        level='warn'
+                    )
+                    cached_state.last_broadcast_fee_ppm = actual_fee_ppm
+                    self._save_thompson_aimd_state(channel_id, cached_state)
+            return cached_state
+
+        # Load from database
+        db_state = self.database.get_fee_strategy_state(channel_id)
+
+        # Parse v2.0 JSON state
+        v2_json_str = db_state.get("v2_state_json", "{}")
+        try:
+            v2_data = json.loads(v2_json_str) if v2_json_str else {}
+        except json.JSONDecodeError:
+            v2_data = {}
+
+        # Check if this is Thompson+AIMD or needs migration
+        if v2_data.get("algorithm_version") == "thompson_aimd_v1":
+            # Load directly
+            state = ThompsonAIMDState.from_v2_dict(v2_data, db_state)
+        else:
+            # Migration from HillClimbState
+            state = ThompsonAIMDState.from_v2_dict(v2_data, db_state)
+
+            # Initialize Thompson from hive if no prior observations
+            if not state.thompson.observations:
+                state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
+
+            self.plugin.log(
+                f"THOMPSON_MIGRATE: {channel_id[:12]}... migrated from Hill Climbing "
+                f"({len(state.thompson.observations)} observations from history)",
+                level='info'
+            )
+
+        # Desync check
+        if actual_fee_ppm is not None and actual_fee_ppm > 0:
+            tracked = state.last_broadcast_fee_ppm
+            if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
+                self.plugin.log(
+                    f"FEE DESYNC (thompson db): {channel_id[:16]}... "
+                    f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
+                    level='warn'
+                )
+                state.last_broadcast_fee_ppm = actual_fee_ppm
+
+        self._thompson_aimd_states[channel_id] = state
+        return state
+
+    def _save_thompson_aimd_state(self, channel_id: str, state: ThompsonAIMDState) -> None:
+        """Save Thompson+AIMD state to cache and database."""
+        import json
+
+        self._thompson_aimd_states[channel_id] = state
+
+        # Serialize to v2 JSON format
+        v2_data = state.to_v2_dict()
+        v2_json_str = json.dumps(v2_data)
+
+        # Save to database using existing fee_strategy_state table
+        # This maintains compatibility with the existing schema
+        self.database.update_fee_strategy_state(
+            channel_id=channel_id,
+            last_revenue_rate=state.last_revenue_rate,
+            last_fee_ppm=state.last_fee_ppm,
+            trend_direction=1,  # Not used by Thompson but kept for schema
+            step_ppm=50,  # Not used by Thompson but kept for schema
+            consecutive_same_direction=0,  # Not used by Thompson
+            last_broadcast_fee_ppm=state.last_broadcast_fee_ppm,
+            last_state=state.last_state,
+            is_sleeping=1 if state.is_sleeping else 0,
+            sleep_until=state.sleep_until,
+            stable_cycles=state.stable_cycles,
+            forward_count_since_update=state.forward_count_since_update,
+            last_volume_sats=state.last_volume_sats,
+            v2_state_json=v2_json_str
+        )
 
     def _get_balance_based_floor(self, local_balance_pct: float, global_min: int) -> int:
         """
@@ -1503,6 +2681,12 @@ class HillClimbingFeeController:
             del self._hill_climb_states[key]
             pruned += 1
 
+        # Prune Thompson+AIMD states from memory
+        stale_thompson_keys = [k for k in self._thompson_aimd_states.keys() if k not in active_channel_ids]
+        for key in stale_thompson_keys:
+            del self._thompson_aimd_states[key]
+            pruned += 1
+
         # Also prune from database to prevent stale entries in debug output
         # Get all fee states from database and remove those for closed channels
         try:
@@ -1543,13 +2727,22 @@ class HillClimbingFeeController:
         woken = 0
         now = int(time.time())
 
-        # Wake in-memory states
+        # Wake in-memory Hill Climbing states
         for channel_id, state in self._hill_climb_states.items():
             if state.is_sleeping:
                 state.is_sleeping = False
                 state.sleep_until = 0
                 state.stable_cycles = 0
                 self._save_hill_climb_state(channel_id, state)
+                woken += 1
+
+        # Wake in-memory Thompson+AIMD states
+        for channel_id, ts_state in self._thompson_aimd_states.items():
+            if ts_state.is_sleeping:
+                ts_state.is_sleeping = False
+                ts_state.sleep_until = 0
+                ts_state.stable_cycles = 0
+                self._save_thompson_aimd_state(channel_id, ts_state)
                 woken += 1
 
         # Also wake any sleeping channels in database not in memory
@@ -2271,8 +3464,299 @@ class HillClimbingFeeController:
                 previous_rate = hc_state.last_revenue_rate
                 target_found = True
 
-        # Priority 4: Hill Climbing (Discovery)
-        if not target_found:
+        # Priority 4: Fee Discovery Algorithm
+        # =====================================================================
+        # Thompson Sampling + AIMD (v1.7.0) - Primary Algorithm
+        # OR Hill Climbing (Legacy) - Fallback
+        # =====================================================================
+        if not target_found and self.ENABLE_THOMPSON_AIMD:
+            # =====================================================================
+            # THOMPSON SAMPLING + AIMD FEE OPTIMIZATION
+            # =====================================================================
+            # Primary: Gaussian Thompson Sampling samples from posterior distribution
+            # Defense: AIMD provides rapid response to routing failures
+            # =====================================================================
+
+            # Load Thompson+AIMD state
+            ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+
+            # Track rate change for logging and hysteresis
+            rate_change = current_revenue_rate - ts_state.last_revenue_rate
+            previous_rate = ts_state.last_revenue_rate
+
+            # Get context key for contextual Thompson Sampling
+            context_key = self._get_context_key(channel_id, peer_id, outbound_ratio)
+
+            # =====================================================================
+            # Historical Response Curve & Elasticity (preserved from HC for data)
+            # =====================================================================
+            historical_curve = ts_state.get_historical_curve()
+            elasticity_tracker = ts_state.get_elasticity_tracker()
+
+            # Record observation for historical analysis
+            if self.ENABLE_HISTORICAL_CURVE:
+                historical_curve.add_observation(
+                    fee_ppm=current_fee_ppm,
+                    revenue_rate=current_revenue_rate,
+                    forward_count=forward_count
+                )
+
+                # Check for regime change
+                if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
+                    historical_curve.last_regime_check = now
+                    if historical_curve.detect_regime_change(current_revenue_rate):
+                        self.plugin.log(
+                            f"THOMPSON: Regime change detected for {channel_id[:12]}... "
+                            f"Resetting Thompson posterior.",
+                            level='info'
+                        )
+                        historical_curve.reset_curve()
+                        # Reset Thompson and AIMD on regime change
+                        ts_state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
+                        ts_state.aimd.reset()
+
+                ts_state.set_historical_curve(historical_curve)
+
+            # Update elasticity tracker
+            if self.ENABLE_ELASTICITY:
+                elasticity_tracker.add_observation(
+                    fee_ppm=current_fee_ppm,
+                    volume_sats=volume_since_sats,
+                    revenue_rate=current_revenue_rate
+                )
+                ts_state.set_elasticity_tracker(elasticity_tracker)
+
+            # =====================================================================
+            # VOLATILITY & HYSTERESIS (preserved)
+            # =====================================================================
+            volatility_reset = False
+            rate_change_ratio = 0.0
+            if ts_state.last_update > 0 and ts_state.last_revenue_rate > 0:
+                delta_rate = abs(current_revenue_rate - ts_state.last_revenue_rate)
+                rate_change_ratio = delta_rate / max(1.0, ts_state.last_revenue_rate)
+
+                if rate_change_ratio > self.VOLATILITY_THRESHOLD:
+                    volatility_reset = True
+                    ts_state.stable_cycles = 0
+
+            # Check for sleep mode entry
+            if ts_state.last_update > 0 and rate_change_ratio < self.STABILITY_THRESHOLD:
+                ts_state.stable_cycles += 1
+                if ts_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED:
+                    sleep_duration_seconds = cfg.fee_interval * self.SLEEP_CYCLES
+                    ts_state.is_sleeping = True
+                    ts_state.sleep_until = now + sleep_duration_seconds
+                    ts_state.last_revenue_rate = current_revenue_rate
+                    ts_state.last_fee_ppm = current_fee_ppm
+                    ts_state.last_volume_sats = volume_since_sats
+                    ts_state.last_update = now
+                    self._save_thompson_aimd_state(channel_id, ts_state)
+                    self.plugin.log(
+                        f"THOMPSON: Market Calm - {channel_id[:12]}... entering sleep mode.",
+                        level='info'
+                    )
+                    return None
+            else:
+                if rate_change_ratio >= self.STABILITY_THRESHOLD:
+                    ts_state.stable_cycles = 0
+
+            # =====================================================================
+            # THOMPSON SAMPLING: Update Posterior and Sample Fee
+            # =====================================================================
+            # Update Thompson posterior with this observation
+            ts_state.thompson.update_posterior(
+                fee=current_fee_ppm,
+                revenue_rate=current_revenue_rate,
+                hours=hours_elapsed
+            )
+
+            # Update contextual posterior
+            ts_state.thompson.update_contextual(
+                context_key=context_key,
+                fee=current_fee_ppm,
+                revenue_rate=current_revenue_rate
+            )
+
+            # Record outcome for AIMD defense
+            was_success = (forward_count > 0)
+            ts_state.aimd.record_outcome(was_success)
+
+            # Sample fee from Thompson posterior (contextual if enough data)
+            thompson_fee = ts_state.thompson.sample_fee_contextual(
+                context_key=context_key,
+                floor=floor_ppm,
+                ceiling=ceiling_ppm
+            )
+
+            # =====================================================================
+            # FLEET DEFENSE COORDINATION
+            # =====================================================================
+            # Query hive MyceliumDefenseSystem for fleet-wide threat warnings
+            # This allows coordinated defensive response across all fleet channels
+            fleet_threat_info = None
+            if self.hive_bridge and self.hive_bridge.is_available():
+                try:
+                    defense_status = self.hive_bridge.query_defense_status(peer_id)
+                    if defense_status:
+                        fleet_threat_info = defense_status.get("peer_threat")
+
+                        # Update AIMD state with fleet threat info
+                        ts_state.aimd.update_fleet_threat(fleet_threat_info)
+
+                        # Log if threat is active
+                        if fleet_threat_info and fleet_threat_info.get("is_threat"):
+                            self.plugin.log(
+                                f"FLEET_DEFENSE: {channel_id[:12]}... peer has active {fleet_threat_info.get('threat_type')} "
+                                f"threat (severity={fleet_threat_info.get('severity', 0):.2f}, "
+                                f"multiplier={fleet_threat_info.get('defensive_multiplier', 1.0):.2f})",
+                                level='info'
+                            )
+                except Exception as e:
+                    self.plugin.log(
+                        f"FLEET_DEFENSE: Failed to query defense status: {e}",
+                        level='debug'
+                    )
+            else:
+                # Clear any stale fleet threat state when hive unavailable
+                ts_state.aimd.update_fleet_threat(None)
+
+            # =====================================================================
+            # AIMD DEFENSE LAYER
+            # =====================================================================
+            # Apply AIMD modifier when in defense mode (after failure streak)
+            # Also applies fleet defensive multiplier for threat peers
+            new_fee_ppm = ts_state.aimd.apply_to_fee(thompson_fee, floor_ppm, ceiling_ppm)
+
+            # Build decision reason
+            effective_mod = ts_state.aimd.get_effective_modifier()
+            if ts_state.aimd.fleet_threat_active:
+                decision_reason = (
+                    f"thompson_fleet_defense ({ts_state.aimd.fleet_threat_type}, "
+                    f"sev={ts_state.aimd.fleet_threat_severity:.2f}, "
+                    f"mod={effective_mod:.2f})"
+                )
+            elif ts_state.aimd.is_active:
+                decision_reason = f"thompson_aimd_defense (mod={effective_mod:.2f})"
+            else:
+                decision_reason = f"thompson_sample (ctx={context_key})"
+
+            # Cold-start mode: channels with very few forwards need lower fees
+            is_cold_start = False
+            total_forwards = state.get("forward_count", 0) if state else 0
+            if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
+                if current_fee_ppm > cfg.min_fee_ppm:
+                    is_cold_start = True
+                    # Bias Thompson toward lower fees for cold channels
+                    cold_target = min(new_fee_ppm, floor_ppm + 50)
+                    new_fee_ppm = cold_target
+                    decision_reason = f"thompson_cold_start (fwds={total_forwards})"
+                    self.plugin.log(
+                        f"THOMPSON COLD-START: {channel_id[:12]}... has {total_forwards} forwards. "
+                        f"Biasing toward floor ({new_fee_ppm} ppm).",
+                        level='info'
+                    )
+
+            # Update volume tracking
+            ts_state.last_volume_sats = volume_since_sats
+
+            # Phase 7: Scarcity Pricing (preserved)
+            opener = channel_info.get("opener", "local")
+            total_sats_out = state.get("sats_out", 0) if state else 0
+            is_virgin_remote = (opener == "remote" and total_sats_out == 0)
+
+            if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
+                if is_virgin_remote:
+                    self.plugin.log(
+                        f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... suppressing scarcity.",
+                        level='info'
+                    )
+                else:
+                    scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
+                    original_fee = new_fee_ppm
+                    new_fee_ppm = int(new_fee_ppm * scarcity_mult)
+                    self.plugin.log(
+                        f"SCARCITY: {channel_id[:12]}... {original_fee}->{new_fee_ppm} ppm "
+                        f"({scarcity_mult:.2f}x)",
+                        level='info'
+                    )
+
+            # Apply cold-start ceiling cap
+            effective_ceiling = ceiling_ppm
+            if is_cold_start:
+                cold_start_ceiling = max(self.COLD_START_MAX_FEE_PPM, floor_ppm + 50)
+                effective_ceiling = min(ceiling_ppm, cold_start_ceiling)
+
+            # Clamp to bounds
+            new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
+            base_new_fee = new_fee_ppm  # For logging compatibility
+
+            # =====================================================================
+            # Hive Coordination (preserved from Hill Climbing)
+            # =====================================================================
+            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not is_congested and not is_fire_sale:
+                coord_rec = self._get_coordinated_fee_recommendation(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    current_fee=new_fee_ppm,
+                    local_balance_pct=outbound_ratio
+                )
+                if coord_rec is not None:
+                    weight = self.HIVE_COORDINATION_WEIGHT
+                    blended_fee = int(new_fee_ppm * (1 - weight) + coord_rec * weight)
+                    blended_fee = max(floor_ppm, min(effective_ceiling, blended_fee))
+                    if blended_fee != new_fee_ppm:
+                        self.plugin.log(
+                            f"THOMPSON_HIVE: {channel_id[:12]}... blending "
+                            f"{new_fee_ppm}->{blended_fee} ppm",
+                            level='debug'
+                        )
+                        new_fee_ppm = blended_fee
+
+            # Defense multiplier
+            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION:
+                defense_fee = self._apply_defense_multiplier(peer_id, new_fee_ppm)
+                if defense_fee != new_fee_ppm:
+                    new_fee_ppm = max(floor_ppm, defense_fee)
+
+            # Fleet-aware adjustment
+            if self.hive_bridge and not is_congested and not is_fire_sale:
+                fleet_adjusted_fee = self._get_fleet_aware_fee_adjustment(peer_id, new_fee_ppm)
+                if fleet_adjusted_fee != new_fee_ppm:
+                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, fleet_adjusted_fee))
+
+            # Internal competition avoidance
+            if self.hive_bridge and self.ENABLE_COMPETITION_AVOIDANCE and not is_congested:
+                competition_adjusted = self._check_internal_competition(peer_id, new_fee_ppm, channel_id)
+                if competition_adjusted != new_fee_ppm:
+                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, competition_adjusted))
+
+            # =====================================================================
+            # Thompson+AIMD State Saving and Result Preparation
+            # =====================================================================
+            new_direction = 1 if new_fee_ppm > current_fee_ppm else (-1 if new_fee_ppm < current_fee_ppm else 0)
+            step_ppm = abs(new_fee_ppm - current_fee_ppm)  # For logging compatibility
+
+            # Mark target as found
+            target_found = True
+
+            # Build the hc_state alias for end-of-method compatibility
+            # (Thompson state will be saved separately)
+            hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=raw_chain_fee)
+            hc_state.last_revenue_rate = current_revenue_rate
+            hc_state.last_fee_ppm = current_fee_ppm
+            hc_state.trend_direction = new_direction
+            hc_state.step_ppm = step_ppm
+            hc_state.forward_count_since_update = forward_count
+            hc_state.last_volume_sats = volume_since_sats
+
+            # Store decision_reason for use in logging
+            elasticity_info = f"thompson_posterior_mean={ts_state.thompson.posterior_mean:.0f}"
+
+        # =====================================================================
+        # FALLBACK: Hill Climbing (Legacy Algorithm)
+        # =====================================================================
+        # Used when ENABLE_THOMPSON_AIMD is False
+        elif not target_found:
             # HILL CLIMBING DECISION (Rate-Based)
             rate_change = current_revenue_rate - hc_state.last_revenue_rate
             last_direction = hc_state.trend_direction
@@ -2644,13 +4128,36 @@ class HillClimbingFeeController:
         mult_note = f", mult=liq{liquidity_multiplier:.2f}*prof{profitability_multiplier:.2f}"
         # Issue #28: Log both raw and EMA-smoothed rates for debugging
         ema_note = f" (raw={raw_revenue_rate:.2f})" if raw_revenue_rate != current_revenue_rate else ""
-        reason = (
-            f"HillClimb: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
-            f"hill_dir={hill_dir}, applied={applied_dir}({applied_delta:+d}ppm), "
-            f"step={step_ppm}ppm{base_fee_note}{mult_note}, state={flow_state}, "
-            f"liquidity={bucket} ({outbound_ratio:.0%}), "
-            f"{marginal_roi_info}"
-        )
+
+        # Choose algorithm name based on which was used
+        if self.ENABLE_THOMPSON_AIMD and "thompson" in decision_reason:
+            # Thompson+AIMD was used
+            algorithm_name = "Thompson+AIMD"
+            # Include Thompson-specific info
+            ts_state_local = self._thompson_aimd_states.get(channel_id)
+            if ts_state_local:
+                thompson_info = (
+                    f"posterior_mean={ts_state_local.thompson.posterior_mean:.0f}, "
+                    f"posterior_std={ts_state_local.thompson.posterior_std:.0f}, "
+                    f"aimd_active={ts_state_local.aimd.is_active}"
+                )
+            else:
+                thompson_info = "state_unavailable"
+            reason = (
+                f"{algorithm_name}: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
+                f"{thompson_info}, applied={applied_dir}({applied_delta:+d}ppm), "
+                f"state={flow_state}, liquidity={bucket} ({outbound_ratio:.0%}), "
+                f"{marginal_roi_info}"
+            )
+        else:
+            # Hill Climbing (legacy) was used
+            reason = (
+                f"HillClimb: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
+                f"hill_dir={hill_dir}, applied={applied_dir}({applied_delta:+d}ppm), "
+                f"step={step_ppm}ppm{base_fee_note}{mult_note}, state={flow_state}, "
+                f"liquidity={bucket} ({outbound_ratio:.0%}), "
+                f"{marginal_roi_info}"
+            )
         
         # IDEMPOTENCY GUARD: Skip RPC if target is physically set (Phase 5.5)
         if new_fee_ppm == raw_chain_fee:
@@ -2662,6 +4169,17 @@ class HillClimbingFeeController:
             hc_state.step_ppm = step_ppm
             hc_state.last_update = now  # Reset observation timer
             self._save_hill_climb_state(channel_id, hc_state)
+
+            # Save Thompson+AIMD state if that algorithm was used
+            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+                ts_state = self._thompson_aimd_states[channel_id]
+                ts_state.last_revenue_rate = current_revenue_rate
+                ts_state.last_fee_ppm = raw_chain_fee
+                ts_state.last_broadcast_fee_ppm = new_fee_ppm
+                ts_state.last_state = decision_reason
+                ts_state.last_update = now
+                self._save_thompson_aimd_state(channel_id, ts_state)
+
             self.plugin.log(
                 f"IDEMPOTENT: {channel_id[:12]}... target fee {new_fee_ppm} ppm already set on chain. "
                 f"Observation window reset, no RPC needed.",
@@ -2682,6 +4200,16 @@ class HillClimbingFeeController:
             hc_state.step_ppm = step_ppm
             hc_state.last_update = now
             self._save_hill_climb_state(channel_id, hc_state)
+
+            # Save Thompson+AIMD state if that algorithm was used
+            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+                ts_state = self._thompson_aimd_states[channel_id]
+                ts_state.last_revenue_rate = current_revenue_rate
+                ts_state.last_fee_ppm = current_fee_ppm
+                ts_state.last_broadcast_fee_ppm = new_fee_ppm
+                ts_state.last_state = decision_reason
+                ts_state.last_update = now
+                self._save_thompson_aimd_state(channel_id, ts_state)
 
             # Report observation to cl-hive for collective intelligence (Phase 2)
             if self.hive_bridge:

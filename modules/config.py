@@ -75,6 +75,18 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'enable_velocity_gate': bool,
     'min_velocity_threshold': float,
     'new_channel_grace_days': int,
+    # Thompson Sampling + AIMD (v1.7.0)
+    'thompson_prior_std_fee': int,
+    'thompson_observation_decay_hours': int,
+    'thompson_max_observations': int,
+    'thompson_min_observations': int,
+    'aimd_failure_threshold': int,
+    'aimd_success_threshold': int,
+    'aimd_multiplicative_decrease': float,
+    'aimd_additive_increase_ppm': int,
+    'aimd_min_decrease_interval': int,
+    'hive_prior_weight': float,
+    'hive_min_confidence_for_prior': float,
 }
 
 # Range constraints for numeric fields
@@ -109,6 +121,18 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # Issue #30: Velocity gate for rebalancing
     'min_velocity_threshold': (0.0, 1.0),
     'new_channel_grace_days': (0, 30),
+    # Thompson Sampling + AIMD (v1.7.0)
+    'thompson_prior_std_fee': (10, 500),
+    'thompson_observation_decay_hours': (24, 720),  # 1 day to 30 days
+    'thompson_max_observations': (50, 500),
+    'thompson_min_observations': (1, 20),
+    'aimd_failure_threshold': (1, 10),
+    'aimd_success_threshold': (3, 30),
+    'aimd_multiplicative_decrease': (0.5, 0.95),
+    'aimd_additive_increase_ppm': (1, 20),
+    'aimd_min_decrease_interval': (300, 86400),  # 5 min to 24 hours
+    'hive_prior_weight': (0.0, 1.0),
+    'hive_min_confidence_for_prior': (0.0, 1.0),
 }
 
 
@@ -235,6 +259,29 @@ class Config:
     enable_velocity_gate: bool = True      # Require minimum velocity before full rebalancing
     min_velocity_threshold: float = 0.01   # Min daily_volume/capacity ratio (1% daily turnover)
     new_channel_grace_days: int = 7        # Days before velocity gate applies to new channels
+
+    # ==========================================================================
+    # Thompson Sampling + AIMD Fee Optimization (v1.7.0)
+    # ==========================================================================
+    # Primary algorithm: Gaussian Thompson Sampling with contextual bandits
+    # Defense layer: AIMD for rapid response to routing failures
+    #
+    # Thompson Sampling parameters
+    thompson_prior_std_fee: int = 100         # Default prior uncertainty in ppm
+    thompson_observation_decay_hours: int = 168  # 7-day half-life for observations
+    thompson_max_observations: int = 200      # Bounded memory per channel
+    thompson_min_observations: int = 3        # Minimum before trusting posterior
+
+    # AIMD Defense parameters
+    aimd_failure_threshold: int = 3           # Failures before multiplicative decrease
+    aimd_success_threshold: int = 10          # Successes before additive increase
+    aimd_multiplicative_decrease: float = 0.85  # 15% reduction on failure streak
+    aimd_additive_increase_ppm: int = 5       # +5 ppm per success streak
+    aimd_min_decrease_interval: int = 3600    # 1 hour cooldown between decreases
+
+    # Hive Prior Integration
+    hive_prior_weight: float = 0.6            # Weight for hive-informed priors
+    hive_min_confidence_for_prior: float = 0.3  # Min confidence to use hive data
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -456,6 +503,19 @@ class ConfigSnapshot:
     min_velocity_threshold: float
     new_channel_grace_days: int
 
+    # Thompson Sampling + AIMD (v1.7.0)
+    thompson_prior_std_fee: int
+    thompson_observation_decay_hours: int
+    thompson_max_observations: int
+    thompson_min_observations: int
+    aimd_failure_threshold: int
+    aimd_success_threshold: int
+    aimd_multiplicative_decrease: float
+    aimd_additive_increase_ppm: int
+    aimd_min_decrease_interval: int
+    hive_prior_weight: float
+    hive_min_confidence_for_prior: float
+
     # Version tracking
     version: int = 0
     
@@ -522,6 +582,18 @@ class ConfigSnapshot:
             enable_velocity_gate=config.enable_velocity_gate,
             min_velocity_threshold=config.min_velocity_threshold,
             new_channel_grace_days=config.new_channel_grace_days,
+            # Thompson Sampling + AIMD (v1.7.0)
+            thompson_prior_std_fee=config.thompson_prior_std_fee,
+            thompson_observation_decay_hours=config.thompson_observation_decay_hours,
+            thompson_max_observations=config.thompson_max_observations,
+            thompson_min_observations=config.thompson_min_observations,
+            aimd_failure_threshold=config.aimd_failure_threshold,
+            aimd_success_threshold=config.aimd_success_threshold,
+            aimd_multiplicative_decrease=config.aimd_multiplicative_decrease,
+            aimd_additive_increase_ppm=config.aimd_additive_increase_ppm,
+            aimd_min_decrease_interval=config.aimd_min_decrease_interval,
+            hive_prior_weight=config.hive_prior_weight,
+            hive_min_confidence_for_prior=config.hive_min_confidence_for_prior,
             version=config._version,
         )
 
