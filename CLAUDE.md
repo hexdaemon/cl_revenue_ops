@@ -40,7 +40,7 @@ Core Lightning
 
 | Module | Purpose |
 |--------|---------|
-| `fee_controller.py` | Hill Climbing fee algorithm, Vegas Reflex, Scarcity Pricing |
+| `fee_controller.py` | Thompson Sampling + AIMD fee optimization, Vegas Reflex, Scarcity Pricing |
 | `rebalancer.py` | EV-based rebalancing, sling integration, futility circuit breaker |
 | `flow_analysis.py` | Sink/Source detection, flow classification |
 | `policy_manager.py` | Per-peer policy engine (dynamic/static/passive/hive) |
@@ -56,7 +56,7 @@ Core Lightning
 1. **Congestion Check**: HTLC slots > 80% → Max Fee
 2. **Vegas Reflex**: Mempool spike > 200% → Raise floor
 3. **Scarcity Pricing**: Local balance < 35% → Exponential increase
-4. **Hill Climbing**: Stable channel → Seek optimal revenue point
+4. **Thompson Sampling**: Stable channel → Bayesian exploration of optimal fee point
 
 **EV-Based Rebalancing**:
 - Only rebalance if `Expected_Revenue > Rebalance_Cost`
@@ -160,7 +160,7 @@ Core Lightning
 cl-revenue-ops/
 ├── cl-revenue-ops.py       # Main plugin entry point
 ├── modules/
-│   ├── fee_controller.py   # Hill Climbing + Alpha Sequence
+│   ├── fee_controller.py   # Thompson Sampling + Alpha Sequence
 │   ├── rebalancer.py       # EV-based rebalancing
 │   ├── flow_analysis.py    # Sink/Source detection
 │   ├── policy_manager.py   # Per-peer policies

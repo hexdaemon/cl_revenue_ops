@@ -32,16 +32,19 @@ Both modes use the same codebase. Hive features activate automatically when cl-h
 - Classifies channels as **SOURCE** (draining), **SINK** (filling), or **BALANCED**
 - Uses bookkeeper plugin data when available for accurate cost tracking
 
-### Module 2: Hill Climbing Fee Controller
-Implements a **Hill Climbing (Perturb & Observe)** algorithm for revenue-maximizing fee adjustment.
+### Module 2: Thompson Sampling Fee Controller
+Implements **Gaussian Thompson Sampling with AIMD** for revenue-maximizing fee optimization.
 
 **The Alpha Sequence** - A prioritized decision flow for fee setting:
 1. **Congestion:** If HTLC slots > 80% full, force Max Fee
 2. **Vegas Reflex:** If L1 mempool spikes >200%, raise fee floor to prevent toxic arbitrage
 3. **Scarcity Pricing:** If local balance < 35%, exponentially raise fees (1x to 3x)
-4. **Hill Climbing:** If channel is stable, seek optimal revenue point
+4. **Thompson Sampling:** Bayesian exploration of fee space with continuous posteriors
 
-Additional features:
+**Thompson Sampling Features:**
+- **Contextual Bandits:** Learns optimal fees based on flow direction and balance state
+- **AIMD Defense:** Additive-Increase/Multiplicative-Decrease for rapid market response
+- **Fleet Coordination:** Shares posterior summaries with hive members to avoid competition
 - **Gossip Hysteresis:** Suppresses small fee updates (<5%) to reduce network noise
 - **Virgin Channel Amnesty:** Protects new remote channels from scarcity pricing until break-in
 
@@ -58,7 +61,7 @@ Centralized control via `revenue-policy` command.
 **Strategies:**
 | Strategy | Behavior |
 |----------|----------|
-| `dynamic` | Full Hill Climbing + Scarcity (Default) |
+| `dynamic` | Thompson Sampling + Scarcity (Default) |
 | `static` | Fixed fee override |
 | `passive` | Do not manage fees (let CLBoss handle it) |
 | `hive` | Fleet mode (0-fee internal routing) |
@@ -87,7 +90,7 @@ cl-revenue-ops supports two operating modes:
 
 When running without cl-hive (or with `revenue-ops-hive-enabled=false`), you get:
 
-- Hill Climbing fee optimization
+- Thompson Sampling fee optimization
 - EV-based rebalancing
 - Per-channel profitability tracking
 - Financial dashboard and reporting
