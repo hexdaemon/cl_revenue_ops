@@ -1222,6 +1222,82 @@ class HiveFeeIntelligenceBridge:
             self._log(f"Failed to broadcast warning: {e}", level="debug")
             return False
 
+    def broadcast_fee_observation(
+        self,
+        peer_id: str,
+        fee_ppm: int,
+        revenue_rate: float,
+        confidence: float,
+        discovery_type: str = "observation",
+        metadata: Dict[str, Any] = None
+    ) -> bool:
+        """
+        Broadcast a fee observation/discovery to the fleet.
+
+        When Thompson Sampling discovers a particularly successful fee point,
+        share this knowledge with the fleet so other members can benefit.
+        This is like pheromone trail reinforcement - successful paths get marked.
+
+        Args:
+            peer_id: Peer this observation is for
+            fee_ppm: Fee that was charged (ppm)
+            revenue_rate: Observed revenue rate (sats/hour)
+            confidence: Confidence in this observation (0.0-1.0)
+            discovery_type: Type of discovery:
+                - "observation": Regular observation
+                - "high_revenue": Unusually high revenue at this fee
+                - "optimal_fee": Confirmed good fee near posterior mean
+            metadata: Optional additional data (posterior_mean, etc.)
+
+        Returns:
+            True if observation broadcasted successfully
+        """
+        if not self.is_available():
+            return False
+
+        if self._is_circuit_open():
+            return False
+
+        # Rate limit: don't flood hive with observations
+        # Only broadcast discoveries, not every observation
+        if discovery_type == "observation" and confidence < 0.7:
+            return False
+
+        try:
+            params = {
+                "peer_id": peer_id,
+                "fee_ppm": fee_ppm,
+                "revenue_rate": revenue_rate,
+                "confidence": confidence,
+                "discovery_type": discovery_type,
+                "timestamp": int(time.time())
+            }
+            if metadata:
+                params["metadata"] = metadata
+
+            result = self.plugin.rpc.call("hive-broadcast-fee-observation", params)
+
+            if result.get("error"):
+                self._log(
+                    f"Fee observation broadcast error: {result.get('error')}",
+                    level="debug"
+                )
+                return False
+
+            self._log(
+                f"Fee observation broadcasted: peer={peer_id[:12]}... "
+                f"fee={fee_ppm}ppm revenue={revenue_rate:.1f}sats/hr "
+                f"type={discovery_type} conf={confidence:.2f}",
+                level="info"
+            )
+            return True
+
+        except Exception as e:
+            # Don't record failure for non-existent RPC (graceful degradation)
+            if "Unknown command" not in str(e):
+                self._log(f"Failed to broadcast fee observation: {e}", level="debug")
+            return False
+
     def query_fee_coordination_status(self) -> Optional[Dict[str, Any]]:
         """
         Query overall fee coordination status from cl-hive.

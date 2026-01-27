@@ -711,3 +711,251 @@ class TestFleetDefenseCoordination:
         assert restored.fleet_threat_type == state.fleet_threat_type
         assert restored.fleet_threat_severity == state.fleet_threat_severity
         assert restored.fleet_defensive_multiplier == state.fleet_defensive_multiplier
+
+
+class TestStigmergicModulation:
+    """Tests for stigmergic (pheromone-based) exploration modulation (P1)."""
+
+    def test_set_context_modulation(self):
+        """Test setting context modulation parameters."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        state.set_context_modulation(
+            pheromone_level=15.0,
+            corridor_role="P",
+            time_bucket="peak"
+        )
+
+        assert state.current_pheromone_level == 15.0
+        assert state.current_corridor_role == "P"
+        assert state.current_time_bucket == "peak"
+
+    def test_high_pheromone_reduces_exploration(self):
+        """Test that high pheromone level reduces exploration (exploitation mode)."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        # Add some observations
+        for i in range(10):
+            state.update_posterior(fee=200, revenue_rate=50.0, hours=1.0)
+
+        # High pheromone should reduce exploration modifier
+        state.set_context_modulation(pheromone_level=20.0, corridor_role="P")
+        high_mod = state._get_exploration_modifier()
+
+        # Low pheromone should increase exploration modifier
+        state.set_context_modulation(pheromone_level=0.0, corridor_role="P")
+        low_mod = state._get_exploration_modifier()
+
+        assert high_mod < low_mod
+        assert high_mod < 1.0  # Exploitation mode
+        assert low_mod > 1.0  # Exploration mode
+
+    def test_secondary_corridor_explores_more(self):
+        """Test that secondary corridors have higher exploration."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+
+        # Same pheromone, different role
+        state.set_context_modulation(pheromone_level=5.0, corridor_role="P")
+        primary_mod = state._get_exploration_modifier()
+
+        state.set_context_modulation(pheromone_level=5.0, corridor_role="S")
+        secondary_mod = state._get_exploration_modifier()
+
+        assert secondary_mod > primary_mod
+
+    def test_sample_fee_applies_modulation(self):
+        """Test that sampled fees are affected by modulation."""
+        from modules.fee_controller import GaussianThompsonState
+        import statistics
+
+        state = GaussianThompsonState()
+        state.posterior_mean = 200.0
+        state.posterior_std = 50.0
+
+        # Add enough observations
+        for i in range(10):
+            state.observations.append((200, 50.0, 1.0, int(time.time())))
+
+        # High pheromone (exploit) should have less variance
+        state.set_context_modulation(pheromone_level=20.0, corridor_role="P")
+        exploit_samples = [state.sample_fee(floor=50, ceiling=500) for _ in range(100)]
+
+        # Low pheromone (explore) should have more variance
+        state.set_context_modulation(pheromone_level=0.0, corridor_role="S")
+        explore_samples = [state.sample_fee(floor=50, ceiling=500) for _ in range(100)]
+
+        exploit_std = statistics.stdev(exploit_samples)
+        explore_std = statistics.stdev(explore_samples)
+
+        # Exploration should have higher variance
+        assert explore_std > exploit_std
+
+
+class TestTimeWeightedObservations:
+    """Tests for time-weighted observation learning (P1)."""
+
+    def test_time_similarity(self):
+        """Test time bucket similarity calculation."""
+        from modules.fee_controller import GaussianThompsonState
+
+        # Same bucket = 1.0
+        assert GaussianThompsonState._time_similarity("peak", "peak") == 1.0
+        assert GaussianThompsonState._time_similarity("normal", "normal") == 1.0
+
+        # Adjacent = 0.5
+        assert GaussianThompsonState._time_similarity("normal", "peak") == 0.5
+        assert GaussianThompsonState._time_similarity("low", "normal") == 0.5
+
+        # Opposite = 0.2
+        assert GaussianThompsonState._time_similarity("low", "peak") == 0.2
+
+    def test_update_contextual_with_time(self):
+        """Test that contextual updates use time-aware weighting."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+
+        # Update with peak time observation
+        state.update_contextual(
+            context_key="balanced:none:peak:P",
+            fee=300,
+            revenue_rate=100.0,
+            time_bucket="peak"
+        )
+
+        # Peak context should have moved toward 300
+        peak_mean, _, _ = state.contextual_posteriors["balanced:none:peak:P"]
+        assert peak_mean > state.posterior_mean
+
+    def test_observation_includes_time_bucket(self):
+        """Test that observations include time bucket."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        state.update_posterior(fee=200, revenue_rate=50.0, hours=1.0, time_bucket="peak")
+
+        assert len(state.observations) == 1
+        obs = state.observations[0]
+        assert len(obs) == 5  # (fee, revenue, weight, timestamp, time_bucket)
+        assert obs[4] == "peak"
+
+
+class TestCorridorRoleDifferentiation:
+    """Tests for primary/secondary corridor differentiation (P1)."""
+
+    def test_secondary_contextual_wider_initial_std(self):
+        """Test that secondary corridors start with wider uncertainty."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        state.posterior_std = 50.0
+
+        # Initialize primary context
+        state.update_contextual("balanced:none:normal:P", fee=200, revenue_rate=50.0)
+        primary_std = state.contextual_posteriors["balanced:none:normal:P"][1]
+
+        # Initialize secondary context
+        state.update_contextual("balanced:none:normal:S", fee=200, revenue_rate=50.0)
+        secondary_std = state.contextual_posteriors["balanced:none:normal:S"][1]
+
+        # Secondary should have wider initial std
+        assert secondary_std > primary_std
+
+    def test_secondary_learns_faster(self):
+        """Test that secondary corridors adapt more quickly."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+
+        # Initialize both
+        state.update_contextual("balanced:none:normal:P", fee=200, revenue_rate=50.0)
+        state.update_contextual("balanced:none:normal:S", fee=200, revenue_rate=50.0)
+
+        # Get initial means
+        initial_primary = state.contextual_posteriors["balanced:none:normal:P"][0]
+        initial_secondary = state.contextual_posteriors["balanced:none:normal:S"][0]
+
+        # Update both with same high-fee observation
+        state.update_contextual("balanced:none:normal:P", fee=400, revenue_rate=100.0)
+        state.update_contextual("balanced:none:normal:S", fee=400, revenue_rate=100.0)
+
+        # Get updated means
+        new_primary = state.contextual_posteriors["balanced:none:normal:P"][0]
+        new_secondary = state.contextual_posteriors["balanced:none:normal:S"][0]
+
+        primary_shift = new_primary - initial_primary
+        secondary_shift = new_secondary - initial_secondary
+
+        # Secondary should shift more (faster learning)
+        assert secondary_shift > primary_shift
+
+
+class TestFeeDiscoveryBroadcast:
+    """Tests for fee discovery detection and broadcast (P1)."""
+
+    def test_no_discovery_without_enough_observations(self):
+        """Test that discoveries require minimum observations."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        # Only 2 observations
+        state.update_posterior(fee=200, revenue_rate=100.0, hours=1.0)
+        state.update_posterior(fee=200, revenue_rate=100.0, hours=1.0)
+
+        discovery = state.check_for_discovery(fee=200, revenue_rate=100.0)
+        assert discovery is None
+
+    def test_no_discovery_with_low_revenue(self):
+        """Test that low revenue doesn't trigger discovery."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        for i in range(10):
+            state.update_posterior(fee=200, revenue_rate=10.0, hours=1.0)
+
+        discovery = state.check_for_discovery(fee=200, revenue_rate=10.0)
+        assert discovery is None
+
+    def test_discovery_on_high_revenue(self):
+        """Test discovery detection on unusually high revenue."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        # Build up history with moderate revenue
+        for i in range(10):
+            state.update_posterior(fee=200, revenue_rate=40.0, hours=1.0)
+
+        # Check for discovery with significantly higher revenue
+        discovery = state.check_for_discovery(fee=200, revenue_rate=80.0)
+
+        # Should detect discovery
+        assert discovery is not None
+        assert discovery["discovery_type"] == "high_revenue"
+        assert discovery["fee_ppm"] == 200
+        assert discovery["revenue_rate"] == 80.0
+
+    def test_discovery_confirms_optimal_fee(self):
+        """Test discovery detection when fee matches posterior."""
+        from modules.fee_controller import GaussianThompsonState
+
+        state = GaussianThompsonState()
+        state.posterior_mean = 200.0
+        state.posterior_std = 30.0
+
+        # Build up consistent history at posterior mean
+        for i in range(15):
+            state.update_posterior(fee=200, revenue_rate=80.0, hours=1.0)
+
+        # Check near posterior mean with good revenue
+        discovery = state.check_for_discovery(
+            fee=195,  # Near posterior mean
+            revenue_rate=80.0,
+            min_revenue_rate=50.0
+        )
+
+        assert discovery is not None
+        assert discovery["discovery_type"] == "optimal_fee"

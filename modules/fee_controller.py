@@ -571,6 +571,20 @@ class GaussianThompsonState:
     last_sampled_fee: int = 0
     last_sample_time: int = 0
 
+    # Stigmergic modulation parameters
+    PHEROMONE_EXPLOIT_THRESHOLD = 10     # Above this, reduce exploration
+    PHEROMONE_EXPLORE_BOOST = 1.5        # Exploration multiplier when no pheromone
+    PHEROMONE_EXPLOIT_FACTOR = 0.6       # Reduce std to this fraction when exploiting
+
+    # Corridor role parameters
+    SECONDARY_EXPLORE_BOOST = 1.3        # Secondary corridors explore more
+    PRIMARY_EXPLOIT_FACTOR = 0.85        # Primary corridors exploit more
+
+    # Current modulation state (set before sampling)
+    current_pheromone_level: float = 0.0
+    current_corridor_role: str = "P"     # P=Primary, S=Secondary
+    current_time_bucket: str = "normal"  # low/normal/peak
+
     def initialize_from_hive(self, optimal_fee: int, confidence: float,
                             elasticity: float) -> None:
         """
@@ -725,6 +739,73 @@ class GaussianThompsonState:
         self.posterior_mean = float(self.prior_mean_fee)
         self.posterior_std = float(self.prior_std_fee)
 
+    def set_context_modulation(
+        self,
+        pheromone_level: float = 0.0,
+        corridor_role: str = "P",
+        time_bucket: str = "normal"
+    ) -> None:
+        """
+        Set context for stigmergic modulation before sampling.
+
+        This allows the sampling to be modulated by:
+        - Pheromone level: High pheromone = exploit, low = explore
+        - Corridor role: Primary = exploit, secondary = explore
+        - Time bucket: For time-weighted posterior selection
+
+        Args:
+            pheromone_level: Pheromone strength (0-20+)
+            corridor_role: "P" for primary, "S" for secondary
+            time_bucket: "low", "normal", or "peak"
+        """
+        self.current_pheromone_level = pheromone_level
+        self.current_corridor_role = corridor_role
+        self.current_time_bucket = time_bucket
+
+    def _get_exploration_modifier(self) -> float:
+        """
+        Compute exploration/exploitation modifier based on stigmergic signals.
+
+        Returns a multiplier for posterior_std:
+        - > 1.0: More exploration (widen distribution)
+        - < 1.0: More exploitation (narrow distribution)
+        - = 1.0: No modification
+
+        Combines:
+        - Pheromone level: Strong pheromone = exploit (good corridor found)
+        - Corridor role: Secondary = explore (find niche pricing)
+
+        Returns:
+            Multiplier for posterior standard deviation
+        """
+        modifier = 1.0
+
+        # Pheromone modulation: strong pheromone = exploit
+        if self.current_pheromone_level >= self.PHEROMONE_EXPLOIT_THRESHOLD:
+            # Strong pheromone: this is a proven good corridor, exploit
+            pheromone_factor = self.PHEROMONE_EXPLOIT_FACTOR
+        elif self.current_pheromone_level <= 1:
+            # No/weak pheromone: unknown territory, explore more
+            pheromone_factor = self.PHEROMONE_EXPLORE_BOOST
+        else:
+            # Medium pheromone: interpolate
+            ratio = self.current_pheromone_level / self.PHEROMONE_EXPLOIT_THRESHOLD
+            pheromone_factor = self.PHEROMONE_EXPLORE_BOOST - (
+                (self.PHEROMONE_EXPLORE_BOOST - self.PHEROMONE_EXPLOIT_FACTOR) * ratio
+            )
+
+        modifier *= pheromone_factor
+
+        # Corridor role modulation
+        if self.current_corridor_role == "S":
+            # Secondary corridor: explore more to find niche
+            modifier *= self.SECONDARY_EXPLORE_BOOST
+        else:
+            # Primary corridor: exploit more, we're the main route
+            modifier *= self.PRIMARY_EXPLOIT_FACTOR
+
+        return modifier
+
     def sample_fee(self, floor: int, ceiling: int) -> int:
         """
         Sample a fee from the posterior distribution.
@@ -733,6 +814,11 @@ class GaussianThompsonState:
         This naturally balances exploration (high uncertainty) vs
         exploitation (low uncertainty around known good fees).
 
+        Applies stigmergic modulation based on current context:
+        - High pheromone: reduce std (exploit known good fee)
+        - Low pheromone: increase std (explore more)
+        - Secondary corridor: increase std (find niche)
+
         Args:
             floor: Minimum allowed fee (ppm)
             ceiling: Maximum allowed fee (ppm)
@@ -740,14 +826,18 @@ class GaussianThompsonState:
         Returns:
             Sampled fee in ppm, clamped to [floor, ceiling]
         """
+        # Get stigmergic exploration modifier
+        explore_mod = self._get_exploration_modifier()
+
         # If not enough observations, explore more widely
         if len(self.observations) < self.MIN_OBSERVATIONS:
             # Use prior with extra exploration
-            explore_std = self.prior_std_fee * 1.5
+            explore_std = self.prior_std_fee * 1.5 * explore_mod
             sampled = random.gauss(self.prior_mean_fee, explore_std)
         else:
-            # Sample from posterior
-            sampled = random.gauss(self.posterior_mean, self.posterior_std)
+            # Sample from posterior with stigmergic modulation
+            modulated_std = max(self.MIN_STD, self.posterior_std * explore_mod)
+            sampled = random.gauss(self.posterior_mean, modulated_std)
 
         # Clamp to bounds
         sampled_fee = int(max(floor, min(ceiling, sampled)))
@@ -764,6 +854,11 @@ class GaussianThompsonState:
         and corridor role. This allows learning different optimal fees
         for different market conditions.
 
+        Applies stigmergic modulation to both contextual and global posteriors:
+        - High pheromone: exploit (narrow distribution)
+        - Low pheromone: explore (wide distribution)
+        - Secondary corridor: explore more
+
         Args:
             context_key: Context identifier (e.g., "low:strong:peak:P")
             floor: Minimum allowed fee
@@ -772,21 +867,31 @@ class GaussianThompsonState:
         Returns:
             Sampled fee in ppm
         """
+        # Get stigmergic exploration modifier
+        explore_mod = self._get_exploration_modifier()
+
         if context_key in self.contextual_posteriors:
             ctx_mean, ctx_std, ctx_count = self.contextual_posteriors[context_key]
 
             if ctx_count >= self.MIN_OBSERVATIONS:
-                # Use contextual posterior
-                sampled = random.gauss(ctx_mean, ctx_std)
+                # Use contextual posterior with stigmergic modulation
+                modulated_std = max(self.MIN_STD, ctx_std * explore_mod)
+                sampled = random.gauss(ctx_mean, modulated_std)
                 sampled_fee = int(max(floor, min(ceiling, sampled)))
                 self.last_sampled_fee = sampled_fee
                 self.last_sample_time = int(time.time())
                 return sampled_fee
 
-        # Fall back to global posterior
+        # Fall back to global posterior (which also applies modulation)
         return self.sample_fee(floor, ceiling)
 
-    def update_posterior(self, fee: int, revenue_rate: float, hours: float) -> None:
+    def update_posterior(
+        self,
+        fee: int,
+        revenue_rate: float,
+        hours: float,
+        time_bucket: str = "normal"
+    ) -> None:
         """
         Update posterior after observing revenue at a given fee.
 
@@ -797,6 +902,7 @@ class GaussianThompsonState:
             fee: Fee that was charged (ppm)
             revenue_rate: Observed revenue rate (sats/hour)
             hours: Hours of observation
+            time_bucket: Time period bucket ("low", "normal", "peak")
         """
         now = int(time.time())
 
@@ -805,8 +911,8 @@ class GaussianThompsonState:
         weight = min(1.0, hours / 6.0) * min(1.0, (revenue_rate + 1) / 100.0)
         weight = max(0.01, weight)  # Minimum weight
 
-        # Add observation
-        self.observations.append((fee, revenue_rate, weight, now))
+        # Add observation with time bucket (5-tuple)
+        self.observations.append((fee, revenue_rate, weight, now, time_bucket))
 
         # Prune old observations
         if len(self.observations) > self.MAX_OBSERVATIONS:
@@ -815,19 +921,62 @@ class GaussianThompsonState:
         # Recompute posterior
         self._recompute_posterior()
 
-    def update_contextual(self, context_key: str, fee: int, revenue_rate: float) -> None:
+    @staticmethod
+    def _time_similarity(bucket1: str, bucket2: str) -> float:
         """
-        Update context-specific posterior.
+        Compute similarity between two time buckets for weighted learning.
+
+        Same bucket = 1.0, adjacent = 0.5, opposite = 0.2
+
+        Args:
+            bucket1: First time bucket
+            bucket2: Second time bucket
+
+        Returns:
+            Similarity score (0.2 to 1.0)
+        """
+        if bucket1 == bucket2:
+            return 1.0
+        # Adjacent buckets share some characteristics
+        adjacent_pairs = {
+            ("low", "normal"), ("normal", "low"),
+            ("normal", "peak"), ("peak", "normal")
+        }
+        if (bucket1, bucket2) in adjacent_pairs:
+            return 0.5
+        # Opposite buckets (low vs peak) are least similar
+        return 0.2
+
+    def update_contextual(
+        self,
+        context_key: str,
+        fee: int,
+        revenue_rate: float,
+        time_bucket: str = "normal"
+    ) -> None:
+        """
+        Update context-specific posterior with time and role aware weighting.
+
+        Observations from the same time bucket have more influence on that
+        context's posterior. Secondary corridors learn faster (more adaptive).
 
         Args:
             context_key: Context identifier
             fee: Fee that was charged
             revenue_rate: Observed revenue rate
+            time_bucket: Current time bucket ("low", "normal", "peak")
         """
         if context_key not in self.contextual_posteriors:
             # Initialize from global posterior
+            # Secondary corridors start with wider uncertainty (more exploration)
+            parts = context_key.split(":") if ":" in context_key else []
+            role = parts[3] if len(parts) >= 4 else "P"
+            initial_std = self.posterior_std
+            if role == "S":
+                initial_std = self.posterior_std * self.SECONDARY_EXPLORE_BOOST
+
             self.contextual_posteriors[context_key] = (
-                self.posterior_mean, self.posterior_std, 0
+                self.posterior_mean, initial_std, 0
             )
 
         ctx_mean, ctx_std, ctx_count = self.contextual_posteriors[context_key]
@@ -835,15 +984,39 @@ class GaussianThompsonState:
         # Simple online update: weighted average toward observed fee
         # weighted by revenue (good outcomes have more influence)
         revenue_weight = min(1.0, revenue_rate / 100.0)
-        learning_rate = 0.1 * (1 + revenue_weight)
+
+        # Time-aware weighting: boost learning rate for same time bucket
+        # Context key format: "balance:pheromone:time:role"
+        parts = context_key.split(":") if ":" in context_key else []
+        ctx_time = parts[2] if len(parts) >= 3 else "normal"
+        ctx_role = parts[3] if len(parts) >= 4 else "P"
+        time_weight = self._time_similarity(time_bucket, ctx_time)
+
+        # Role-aware learning rate: secondary corridors adapt faster
+        # They need to find niche pricing more aggressively
+        role_learning_boost = 1.3 if ctx_role == "S" else 1.0
+
+        # Combined learning rate
+        learning_rate = 0.1 * (1 + revenue_weight) * time_weight * role_learning_boost
 
         new_mean = ctx_mean + learning_rate * (fee - ctx_mean) * revenue_weight
 
         # Decrease uncertainty as we gather more observations
-        new_std = max(self.MIN_STD, ctx_std * 0.95)
+        # Faster convergence for same-time observations
+        # Secondary corridors converge slower (maintain exploration)
+        if ctx_role == "S":
+            decay = 0.97 if time_weight == 1.0 else 0.99
+        else:
+            decay = 0.95 if time_weight == 1.0 else 0.98
+        new_std = max(self.MIN_STD, ctx_std * decay)
         new_count = ctx_count + 1
 
         self.contextual_posteriors[context_key] = (new_mean, new_std, new_count)
+
+        # Also update related time buckets with reduced weight
+        # This allows cross-pollination of learning
+        if time_weight == 1.0:
+            self._update_related_time_contexts(context_key, fee, revenue_rate, time_bucket)
 
         # Prune contextual posteriors to prevent memory bloat
         if len(self.contextual_posteriors) > 50:
@@ -854,6 +1027,52 @@ class GaussianThompsonState:
                 reverse=True
             )
             self.contextual_posteriors = dict(sorted_contexts[:40])
+
+    def _update_related_time_contexts(
+        self,
+        context_key: str,
+        fee: int,
+        revenue_rate: float,
+        observed_time: str
+    ) -> None:
+        """
+        Update related time contexts with reduced weight for cross-learning.
+
+        When we observe a good fee at peak time, adjacent time contexts
+        (normal) should also learn from it, but with reduced influence.
+
+        Args:
+            context_key: The exact context that was observed
+            fee: Fee that was charged
+            revenue_rate: Observed revenue rate
+            observed_time: Time bucket that was actually observed
+        """
+        parts = context_key.split(":")
+        if len(parts) != 4:
+            return
+
+        balance, pheromone, _, role = parts
+
+        # Determine adjacent time buckets
+        adjacent = {
+            "low": ["normal"],
+            "normal": ["low", "peak"],
+            "peak": ["normal"]
+        }.get(observed_time, [])
+
+        # Update adjacent time contexts with reduced learning
+        for adj_time in adjacent:
+            adj_key = f"{balance}:{pheromone}:{adj_time}:{role}"
+            if adj_key in self.contextual_posteriors:
+                adj_mean, adj_std, adj_count = self.contextual_posteriors[adj_key]
+
+                # Reduced learning rate for cross-pollination
+                revenue_weight = min(1.0, revenue_rate / 100.0)
+                learning_rate = 0.03 * revenue_weight  # Much smaller
+
+                new_mean = adj_mean + learning_rate * (fee - adj_mean)
+                # Don't reduce std for cross-pollination (keep uncertainty)
+                self.contextual_posteriors[adj_key] = (new_mean, adj_std, adj_count)
 
     def _recompute_posterior(self) -> None:
         """
@@ -872,7 +1091,14 @@ class GaussianThompsonState:
         weighted_sum = 0.0
         weighted_sq_sum = 0.0
 
-        for fee, revenue_rate, base_weight, timestamp in self.observations:
+        for obs in self.observations:
+            # Support both 4-tuple (legacy) and 5-tuple (with time_bucket) formats
+            if len(obs) >= 4:
+                fee, revenue_rate, base_weight, timestamp = obs[:4]
+                # time_bucket = obs[4] if len(obs) > 4 else "normal" (not used here)
+            else:
+                continue  # Skip malformed observations
+
             # Apply time decay
             age_hours = (now - timestamp) / 3600.0
             decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
@@ -918,6 +1144,87 @@ class GaussianThompsonState:
     def get_exploitation_fee(self) -> int:
         """Get the current best estimate (posterior mean) without exploration."""
         return int(self.posterior_mean)
+
+    def check_for_discovery(
+        self,
+        fee: int,
+        revenue_rate: float,
+        min_revenue_rate: float = 50.0,
+        min_observations: int = 5
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check if the current observation represents a significant discovery.
+
+        A discovery is when we find a fee that performs significantly better
+        than expected, which should be shared with the fleet.
+
+        Criteria for discovery:
+        - Revenue rate above threshold
+        - Fee is within observed successful range
+        - We have enough observations to be confident
+        - Revenue rate is significantly above our posterior mean expectation
+
+        Args:
+            fee: Current fee in ppm
+            revenue_rate: Current revenue rate (sats/hour)
+            min_revenue_rate: Minimum revenue to consider (default 50 sats/hr)
+            min_observations: Minimum observations needed (default 5)
+
+        Returns:
+            Discovery dict if significant, None otherwise:
+            {
+                "fee_ppm": 200,
+                "revenue_rate": 75.0,
+                "confidence": 0.8,
+                "discovery_type": "high_revenue" | "optimal_fee"
+            }
+        """
+        # Need enough observations to claim discovery
+        if len(self.observations) < min_observations:
+            return None
+
+        # Need reasonable revenue to be a discovery
+        if revenue_rate < min_revenue_rate:
+            return None
+
+        # Calculate mean revenue from recent observations at similar fees
+        similar_obs = [
+            obs for obs in self.observations[-20:]
+            if len(obs) >= 2 and abs(obs[0] - fee) < 50
+        ]
+
+        if len(similar_obs) < 3:
+            return None
+
+        avg_similar_revenue = sum(obs[1] for obs in similar_obs) / len(similar_obs)
+
+        # Discovery: current revenue significantly beats similar fee observations
+        if revenue_rate > avg_similar_revenue * 1.3:
+            confidence = min(0.9, len(similar_obs) / 10.0)
+            return {
+                "fee_ppm": fee,
+                "revenue_rate": revenue_rate,
+                "avg_revenue_at_fee": avg_similar_revenue,
+                "confidence": confidence,
+                "discovery_type": "high_revenue",
+                "observation_count": len(similar_obs)
+            }
+
+        # Discovery: fee near posterior mean with good consistent revenue
+        if abs(fee - self.posterior_mean) < self.posterior_std and revenue_rate > min_revenue_rate * 1.5:
+            # This confirms our posterior estimate is good
+            confidence = min(0.85, 0.5 + len(self.observations) / 40.0)
+            return {
+                "fee_ppm": fee,
+                "revenue_rate": revenue_rate,
+                "posterior_mean": self.posterior_mean,
+                "posterior_std": self.posterior_std,
+                "confidence": confidence,
+                "discovery_type": "optimal_fee",
+                "observation_count": len(self.observations)
+            }
+
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state to dict for database storage."""
@@ -1948,6 +2255,85 @@ class HillClimbingFeeController:
                 pass
 
         return f"{balance}:{pheromone}:{time_bucket}:{role}"
+
+    def _get_context_with_values(
+        self,
+        channel_id: str,
+        peer_id: str,
+        outbound_ratio: float
+    ) -> Tuple[str, float, str, str]:
+        """
+        Extract context features and return both the key and raw values.
+
+        Used for stigmergic modulation where we need the raw pheromone level,
+        not just the bucket name.
+
+        Args:
+            channel_id: Channel SCID
+            peer_id: Peer pubkey
+            outbound_ratio: Current outbound liquidity ratio (0.0-1.0)
+
+        Returns:
+            Tuple of (context_key, pheromone_level, time_bucket, corridor_role)
+        """
+        # Balance bucket
+        if outbound_ratio < 0.15:
+            balance = "depleted"
+        elif outbound_ratio < 0.35:
+            balance = "low"
+        elif outbound_ratio < 0.65:
+            balance = "balanced"
+        elif outbound_ratio < 0.85:
+            balance = "high"
+        else:
+            balance = "saturated"
+
+        # Pheromone level (raw value for modulation)
+        pheromone_level = 0.0
+        pheromone_bucket = "none"
+        if self.hive_bridge:
+            try:
+                level_data = self.hive_bridge.query_pheromone_level(channel_id)
+                if level_data:
+                    pheromone_level = level_data.get("level", 0)
+                    if pheromone_level >= 15:
+                        pheromone_bucket = "strong"
+                    elif pheromone_level >= 5:
+                        pheromone_bucket = "medium"
+                    elif pheromone_level >= 2:
+                        pheromone_bucket = "weak"
+            except Exception:
+                pass
+
+        # Time bucket
+        time_bucket = "normal"
+        if self.hive_bridge:
+            try:
+                adj = self.hive_bridge.query_time_fee_adjustment(channel_id)
+                if adj:
+                    intensity = adj.get("intensity", 0.5)
+                    if intensity > 0.7:
+                        time_bucket = "peak"
+                    elif intensity < 0.3:
+                        time_bucket = "low"
+            except Exception:
+                pass
+
+        # Corridor role
+        role = "P"  # Primary by default
+        if self.hive_bridge:
+            try:
+                coord = self.hive_bridge.query_coordinated_fee_recommendation(
+                    channel_id=channel_id,
+                    current_fee=0
+                )
+                if coord and not coord.get("is_primary", True):
+                    role = "S"
+            except Exception:
+                pass
+
+        context_key = f"{balance}:{pheromone_bucket}:{time_bucket}:{role}"
+        return (context_key, pheromone_level, time_bucket, role)
 
     def _initialize_thompson_from_hive(
         self,
@@ -3484,8 +3870,11 @@ class HillClimbingFeeController:
             rate_change = current_revenue_rate - ts_state.last_revenue_rate
             previous_rate = ts_state.last_revenue_rate
 
-            # Get context key for contextual Thompson Sampling
-            context_key = self._get_context_key(channel_id, peer_id, outbound_ratio)
+            # Get context key and raw values for contextual Thompson Sampling
+            # This also returns raw pheromone level for stigmergic modulation
+            context_key, pheromone_level, time_bucket, corridor_role = self._get_context_with_values(
+                channel_id, peer_id, outbound_ratio
+            )
 
             # =====================================================================
             # Historical Response Curve & Elasticity (preserved from HC for data)
@@ -3563,25 +3952,75 @@ class HillClimbingFeeController:
             # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
             # =====================================================================
-            # Update Thompson posterior with this observation
+            # Update Thompson posterior with this observation (time-weighted)
             ts_state.thompson.update_posterior(
                 fee=current_fee_ppm,
                 revenue_rate=current_revenue_rate,
-                hours=hours_elapsed
+                hours=hours_elapsed,
+                time_bucket=time_bucket
             )
 
-            # Update contextual posterior
+            # Update contextual posterior (time-aware weighting)
             ts_state.thompson.update_contextual(
                 context_key=context_key,
                 fee=current_fee_ppm,
-                revenue_rate=current_revenue_rate
+                revenue_rate=current_revenue_rate,
+                time_bucket=time_bucket
             )
 
             # Record outcome for AIMD defense
             was_success = (forward_count > 0)
             ts_state.aimd.record_outcome(was_success)
 
+            # =====================================================================
+            # BROADCAST FEE DISCOVERIES (P1 Integration)
+            # =====================================================================
+            # Check if this observation represents a significant discovery
+            # that should be shared with the fleet
+            if self.hive_bridge and self.hive_bridge.is_available():
+                discovery = ts_state.thompson.check_for_discovery(
+                    fee=current_fee_ppm,
+                    revenue_rate=current_revenue_rate,
+                    min_revenue_rate=50.0,
+                    min_observations=5
+                )
+                if discovery:
+                    self.hive_bridge.broadcast_fee_observation(
+                        peer_id=peer_id,
+                        fee_ppm=discovery["fee_ppm"],
+                        revenue_rate=discovery["revenue_rate"],
+                        confidence=discovery["confidence"],
+                        discovery_type=discovery["discovery_type"],
+                        metadata={
+                            "posterior_mean": ts_state.thompson.posterior_mean,
+                            "posterior_std": ts_state.thompson.posterior_std,
+                            "observation_count": discovery.get("observation_count", 0),
+                            "context": context_key
+                        }
+                    )
+                    self.plugin.log(
+                        f"THOMPSON_DISCOVERY: {channel_id[:12]}... broadcasting "
+                        f"{discovery['discovery_type']} at {discovery['fee_ppm']}ppm "
+                        f"(revenue={discovery['revenue_rate']:.1f}sats/hr, "
+                        f"conf={discovery['confidence']:.2f})",
+                        level='info'
+                    )
+
+            # =====================================================================
+            # STIGMERGIC MODULATION (P1 Integration)
+            # =====================================================================
+            # Set context for exploration/exploitation balance based on:
+            # - Pheromone level: High = exploit, low = explore
+            # - Corridor role: Primary = exploit, secondary = explore
+            # - Time bucket: For time-aware posterior selection
+            ts_state.thompson.set_context_modulation(
+                pheromone_level=pheromone_level,
+                corridor_role=corridor_role,
+                time_bucket=time_bucket
+            )
+
             # Sample fee from Thompson posterior (contextual if enough data)
+            # Now applies stigmergic modulation to exploration/exploitation
             thompson_fee = ts_state.thompson.sample_fee_contextual(
                 context_key=context_key,
                 floor=floor_ppm,
