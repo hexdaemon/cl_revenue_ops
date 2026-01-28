@@ -462,11 +462,21 @@ class ThreadSafeRpcProxy:
         self._log_history: Dict[Tuple[str, str], float] = {}
 
     def _get_group(self, method_name: str) -> str:
-        """Determine method group for circuit breaking."""
+        """Determine method group for circuit breaking.
+
+        Groups isolate breaker state so a timeout in one group
+        doesn't block calls in another. Inter-plugin calls (hive-*,
+        revenue-*) get their own group to prevent a slow plugin
+        from blocking core lightningd RPC.
+        """
         if method_name.startswith("sling-"):
             return "sling"
         if method_name.startswith("bkpr-"):
             return "bkpr"
+        if method_name.startswith("hive-"):
+            return "hive"
+        if method_name.startswith("revenue-"):
+            return "revenue"
         if method_name == "listforwards":
             return "listforwards"
         return "general"

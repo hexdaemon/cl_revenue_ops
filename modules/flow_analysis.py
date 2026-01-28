@@ -878,6 +878,27 @@ class FlowAnalyzer:
                 kalman_uncertainty=metrics.kalman_uncertainty
             )
 
+        # Reconcile: remove stale channel_states entries for closed channels.
+        # _get_channels() only returns CHANNELD_NORMAL, so any channel_states
+        # entry not in our active set is from a closed/closing channel.
+        try:
+            active_channel_ids = set(results.keys())
+            all_stored = self.database.get_all_channel_states()
+            stale_count = 0
+            for stored in all_stored:
+                stored_id = stored.get("channel_id")
+                if stored_id and stored_id not in active_channel_ids:
+                    peer_id = stored.get("peer_id")
+                    self.database.remove_closed_channel_data(stored_id, peer_id)
+                    stale_count += 1
+            if stale_count > 0:
+                self.plugin.log(
+                    f"Cleaned up {stale_count} stale channel_states entries "
+                    f"(closed channels not in {len(active_channel_ids)} active channels)"
+                )
+        except Exception as e:
+            self.plugin.log(f"Warning: failed to clean stale channel states: {e}")
+
         return results
     
     def analyze_channel(self, channel_id: str) -> Optional[FlowMetrics]:
