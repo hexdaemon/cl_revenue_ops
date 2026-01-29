@@ -486,6 +486,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_states_peer ON channel_states(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_time ON mempool_fee_history(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_history_time ON rebalance_history(timestamp)")
         
         # Composite index for get_volume_since optimization (TODO #17)
         # Fee Controller queries by out_channel + timestamp every 30min
@@ -3618,6 +3619,16 @@ class Database:
             conn.execute("DELETE FROM flow_history WHERE timestamp < ?", (cutoff,))
             conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))
             conn.execute("DELETE FROM peer_connection_history WHERE timestamp < ?", (cutoff,))
+
+            # AUDIT LOG CLEANUP: Prevent unbounded growth of operational logs
+            # Keep 90 days of audit history (vs 8 days for flow data)
+            audit_cutoff = now - (90 * 86400)
+            conn.execute("DELETE FROM fee_changes WHERE timestamp < ?", (audit_cutoff,))
+            conn.execute("DELETE FROM rebalance_history WHERE timestamp < ?", (audit_cutoff,))
+
+            # SNAPSHOT CLEANUP: Keep 1 year of financial snapshots for trend analysis
+            snapshot_cutoff = now - (365 * 86400)
+            conn.execute("DELETE FROM financial_snapshots WHERE timestamp < ?", (snapshot_cutoff,))
 
         # VACUUM to reclaim disk space after pruning
         # SQLite DELETE only marks pages as free; VACUUM actually shrinks the file.
