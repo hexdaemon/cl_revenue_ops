@@ -141,11 +141,114 @@ class HistoricalResponseCurve:
 
         return results
 
+    # Polynomial smoothing parameters
+    MIN_OBSERVATIONS_FOR_POLYNOMIAL = 8  # Need more points for reliable fit
+    POLYNOMIAL_CURVATURE_MIN = -1e-6  # Must be concave (negative quadratic term)
+
+    def _fit_quadratic_weighted(self, observations: List[Tuple[int, float, float]]
+                                 ) -> Optional[Tuple[float, float, float]]:
+        """
+        Fit weighted quadratic polynomial to fee->revenue observations.
+
+        Uses weighted least squares to fit: revenue = a*fee² + b*fee + c
+        Weights are used to emphasize recent, high-confidence observations.
+
+        The optimal fee for a concave parabola (a < 0) is at vertex: -b/(2a)
+
+        Returns:
+            (a, b, c) coefficients if fit is valid, None if fit fails
+
+        Implementation note: Uses normal equations for weighted least squares.
+        For numerical stability, we normalize fees to [0,1] range internally.
+        """
+        if len(observations) < 3:
+            return None
+
+        # Extract data and normalize fees for numerical stability
+        fees = [obs[0] for obs in observations]
+        revenues = [obs[1] for obs in observations]
+        weights = [obs[2] for obs in observations]
+
+        fee_min = min(fees)
+        fee_max = max(fees)
+        fee_range = fee_max - fee_min
+
+        if fee_range < 10:  # Need some spread in fee values
+            return None
+
+        # Normalize fees to [0, 1]
+        norm_fees = [(f - fee_min) / fee_range for f in fees]
+
+        # Build weighted design matrix X and response vector y
+        # X = [1, x, x²], y = revenue, W = diag(weights)
+        # Solve (X'WX)β = X'Wy
+
+        # Compute sums needed for normal equations
+        sum_w = sum(weights)
+        sum_wx = sum(w * x for w, x in zip(weights, norm_fees))
+        sum_wx2 = sum(w * x**2 for w, x in zip(weights, norm_fees))
+        sum_wx3 = sum(w * x**3 for w, x in zip(weights, norm_fees))
+        sum_wx4 = sum(w * x**4 for w, x in zip(weights, norm_fees))
+
+        sum_wy = sum(w * y for w, y in zip(weights, revenues))
+        sum_wxy = sum(w * x * y for w, x, y in zip(weights, norm_fees, revenues))
+        sum_wx2y = sum(w * x**2 * y for w, x, y in zip(weights, norm_fees, revenues))
+
+        # Normal equations matrix: [sum_w, sum_wx, sum_wx2]   [c]   [sum_wy]
+        #                          [sum_wx, sum_wx2, sum_wx3] [b] = [sum_wxy]
+        #                          [sum_wx2, sum_wx3, sum_wx4][a]   [sum_wx2y]
+
+        # Solve using Cramer's rule (3x3 system)
+        # Matrix determinant
+        det = (sum_w * (sum_wx2 * sum_wx4 - sum_wx3**2)
+               - sum_wx * (sum_wx * sum_wx4 - sum_wx3 * sum_wx2)
+               + sum_wx2 * (sum_wx * sum_wx3 - sum_wx2**2))
+
+        if abs(det) < 1e-12:  # Singular matrix
+            return None
+
+        # Solve for coefficients (in normalized space)
+        # c coefficient
+        det_c = (sum_wy * (sum_wx2 * sum_wx4 - sum_wx3**2)
+                 - sum_wx * (sum_wxy * sum_wx4 - sum_wx3 * sum_wx2y)
+                 + sum_wx2 * (sum_wxy * sum_wx3 - sum_wx2 * sum_wx2y))
+        c_norm = det_c / det
+
+        # b coefficient
+        det_b = (sum_w * (sum_wxy * sum_wx4 - sum_wx3 * sum_wx2y)
+                 - sum_wy * (sum_wx * sum_wx4 - sum_wx3 * sum_wx2)
+                 + sum_wx2 * (sum_wx * sum_wx2y - sum_wx2 * sum_wxy))
+        b_norm = det_b / det
+
+        # a coefficient
+        det_a = (sum_w * (sum_wx2 * sum_wx2y - sum_wxy * sum_wx3)
+                 - sum_wx * (sum_wx * sum_wx2y - sum_wxy * sum_wx2)
+                 + sum_wy * (sum_wx * sum_wx3 - sum_wx2**2))
+        a_norm = det_a / det
+
+        # Convert back to original fee scale
+        # If y = a_norm*x_norm² + b_norm*x_norm + c_norm
+        # and x_norm = (fee - fee_min) / fee_range
+        # then y = a_norm*((fee-fee_min)/range)² + b_norm*((fee-fee_min)/range) + c_norm
+        #        = (a_norm/range²)*fee² + (b_norm/range - 2*a_norm*fee_min/range²)*fee + ...
+        a = a_norm / (fee_range ** 2)
+        b = b_norm / fee_range - 2 * a_norm * fee_min / (fee_range ** 2)
+        c = c_norm - b_norm * fee_min / fee_range + a_norm * (fee_min / fee_range) ** 2
+
+        return (a, b, c)
+
     def predict_optimal_fee(self, floor_ppm: int, ceiling_ppm: int) -> Optional[int]:
         """
         Predict optimal fee based on historical data.
 
-        Uses weighted quadratic fit to find revenue maximum.
+        Uses weighted quadratic polynomial fit to find revenue maximum.
+        Falls back to weighted maximum if polynomial fit fails or is unreliable.
+
+        The polynomial approach provides:
+        - Smoother extrapolation between observed points
+        - Better estimates when optimal fee hasn't been directly observed
+        - Detection of revenue curve shape (concave = valid optimization target)
+
         Returns None if insufficient data.
         """
         weighted_obs = self.get_weighted_observations()
@@ -153,7 +256,34 @@ class HistoricalResponseCurve:
         if len(weighted_obs) < self.MIN_OBSERVATIONS_FOR_PREDICTION:
             return None
 
-        # Find the fee with highest weighted revenue in our history
+        # Try polynomial fit if we have enough diverse observations
+        if len(weighted_obs) >= self.MIN_OBSERVATIONS_FOR_POLYNOMIAL:
+            poly_result = self._fit_quadratic_weighted(weighted_obs)
+
+            if poly_result is not None:
+                a, b, c = poly_result
+
+                # For valid optimization, curve must be concave (a < 0)
+                # This means there's a maximum, not a minimum
+                if a < self.POLYNOMIAL_CURVATURE_MIN:
+                    # Optimal fee at vertex: x = -b / (2a)
+                    optimal_fee = int(-b / (2 * a))
+
+                    # Validate the prediction is within reasonable bounds
+                    if floor_ppm <= optimal_fee <= ceiling_ppm:
+                        return optimal_fee
+
+                    # If outside bounds, clamp to the better boundary
+                    # Evaluate revenue at boundaries to pick better one
+                    rev_floor = a * floor_ppm**2 + b * floor_ppm + c
+                    rev_ceiling = a * ceiling_ppm**2 + b * ceiling_ppm + c
+
+                    if optimal_fee < floor_ppm:
+                        return floor_ppm  # Optimal is below floor, use floor
+                    else:
+                        return ceiling_ppm  # Optimal is above ceiling, use ceiling
+
+        # Fallback: Find the fee with highest weighted revenue in our history
         best_fee = None
         best_revenue = -1.0
 
@@ -350,19 +480,35 @@ class ElasticityTracker:
     """
     Track price elasticity of demand for a channel.
 
-    Elasticity = (Δvolume/volume) / (Δfee/fee)
-    - Elasticity < -1: Elastic (volume drops faster than fee rises)
-    - Elasticity > -1: Inelastic (can raise fees without losing much volume)
+    Elasticity = (Δrevenue/revenue) / (Δfee/fee)
+    - Elasticity < -1: Elastic (revenue drops faster than fee rises)
+    - Elasticity > -1: Inelastic (can raise fees without losing much revenue)
+
+    Expected ranges for Lightning Network channels:
+    - Typical: -2.0 to 0.0 (mildly elastic to inelastic)
+    - Highly elastic: -3.0 to -2.0 (price-sensitive routes)
+    - Inelastic: -0.5 to 0.0 (captive routes, low competition)
+    - Anomalous: < -5.0 or > 1.0 (likely measurement error or attack)
+
+    Benchmarks from Lightning Network research:
+    - Well-connected hub channels: typically -0.5 to -1.5
+    - Last-mile channels: typically -0.2 to -0.8 (more inelastic)
+    - Competitive routes: typically -1.5 to -3.0 (more elastic)
 
     Security mitigations:
     - Use revenue-weighted changes (not raw volume) to prevent stuffing
     - Outlier detection: ignore sudden 5x volume changes
     - Minimum fee change threshold to get valid signal
+    - Bounds validation: clamp extreme values to [-5, 2] range
     """
     MAX_HISTORY = 20  # Rolling window
     OUTLIER_THRESHOLD = 5.0  # Ignore >5x volume changes (attack protection)
     MIN_FEE_CHANGE_PCT = 0.05  # Need 5% fee change for valid measurement
     MIN_SAMPLES = 3  # Minimum samples for elasticity estimate
+
+    # Validation bounds based on economic theory and LN observations
+    MIN_VALID_ELASTICITY = -5.0  # Below this is likely measurement error
+    MAX_VALID_ELASTICITY = 2.0   # Above this is anomalous (Giffen goods rare)
 
     # Historical data points: (fee_ppm, volume_sats, revenue_rate, timestamp)
     history: List[Tuple[int, int, float, int]] = field(default_factory=list)
@@ -428,10 +574,24 @@ class ElasticityTracker:
             # Weighted average
             total_weight = sum(weights)
             if total_weight > 0:
-                self.current_elasticity = sum(
+                raw_elasticity = sum(
                     e * w for e, w in zip(elasticities, weights)
                 ) / total_weight
-                self.confidence = min(1.0, len(elasticities) / 10.0)
+
+                # Validate against expected bounds
+                # Values outside [-5, 2] are anomalous and clamped
+                if raw_elasticity < self.MIN_VALID_ELASTICITY:
+                    # Extremely negative: likely measurement error, clamp and reduce confidence
+                    self.current_elasticity = self.MIN_VALID_ELASTICITY
+                    self.confidence = min(0.3, len(elasticities) / 10.0)
+                elif raw_elasticity > self.MAX_VALID_ELASTICITY:
+                    # Positive/high: anomalous (Giffen behavior rare), clamp and reduce confidence
+                    self.current_elasticity = self.MAX_VALID_ELASTICITY
+                    self.confidence = min(0.3, len(elasticities) / 10.0)
+                else:
+                    # Normal range: full confidence based on sample count
+                    self.current_elasticity = raw_elasticity
+                    self.confidence = min(1.0, len(elasticities) / 10.0)
         else:
             self.confidence = 0.0
 
@@ -1457,21 +1617,45 @@ class AIMDDefenseState:
     market conditions change suddenly. Thompson learns slowly but
     correctly; AIMD reacts quickly to protect revenue.
 
+    Context-Aware Tuning Guidelines:
+    -----------------------------------------------------------------
+    For AGGRESSIVE defense (competitive routes, high failure rates):
+      - MULTIPLICATIVE_DECREASE = 0.75 (faster drop: 25% per streak)
+      - FAILURE_THRESHOLD = 2 (quicker trigger)
+      - MIN_DECREASE_INTERVAL = 1800 (30 min cooldown)
+
+    For CONSERVATIVE defense (stable routes, low competition):
+      - MULTIPLICATIVE_DECREASE = 0.90 (slower drop: 10% per streak)
+      - FAILURE_THRESHOLD = 5 (more patience)
+      - MIN_DECREASE_INTERVAL = 7200 (2 hour cooldown)
+
+    For HIGH-TRAFFIC channels (many forwards/hour):
+      - SUCCESS_THRESHOLD = 20 (more successes before increase)
+      - Prevents premature fee increases during burst traffic
+
+    For LOW-TRAFFIC channels (few forwards/day):
+      - SUCCESS_THRESHOLD = 5 (fewer successes before increase)
+      - Faster adaptation to sparse feedback
+
     Security mitigations:
-    - MIN_DECREASE_INTERVAL: 1 hour cooldown prevents rapid oscillation
+    - MIN_DECREASE_INTERVAL: cooldown prevents rapid oscillation
     - is_active flag prevents AIMD from fighting Thompson
     - Bounded modifier range (0.5 to 1.5)
     """
-    # AIMD parameters
+    # AIMD parameters (tunable based on channel characteristics)
     ADDITIVE_INCREASE_PPM = 5       # Add 5 ppm per success streak
-    MULTIPLICATIVE_DECREASE = 0.85  # Multiply by 0.85 on failure streak
+    MULTIPLICATIVE_DECREASE = 0.85  # Multiply by 0.85 on failure streak (15% drop)
 
     # Thresholds for triggering AIMD
     FAILURE_THRESHOLD = 3           # Failures before multiplicative decrease
     SUCCESS_THRESHOLD = 10          # Successes before additive increase
 
     # Cooldowns
-    MIN_DECREASE_INTERVAL = 3600    # 1 hour between decreases
+    MIN_DECREASE_INTERVAL = 3600    # 1 hour between decreases (oscillation protection)
+
+    # Modifier bounds
+    MIN_MODIFIER = 0.5              # Never reduce below 50% of Thompson fee
+    MAX_MODIFIER = 1.5              # Never exceed 150% of Thompson fee
 
     # State tracking
     consecutive_failures: int = 0

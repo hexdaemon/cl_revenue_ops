@@ -1242,3 +1242,125 @@ class TestProfitabilityWeightedSampling:
 
         new_fee = thompson_fee + profitability_adjustment
         assert new_fee == thompson_fee
+
+
+class TestPolynomialSmoothing:
+    """Tests for polynomial smoothing in HistoricalResponseCurve."""
+
+    def test_polynomial_fit_concave_curve(self):
+        """Test that polynomial fit correctly finds optimal for concave revenue curve."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+
+        # Create a concave revenue curve (inverted parabola)
+        # Revenue peaks around fee=200, declines at lower/higher fees
+        # revenue = -0.005 * (fee - 200)^2 + 100
+        # Optimal should be around 200 ppm
+        test_fees = [100, 120, 150, 180, 200, 220, 250, 280, 300]
+        for fee in test_fees:
+            revenue = -0.005 * (fee - 200)**2 + 100
+            curve.add_observation(fee_ppm=fee, revenue_rate=revenue, forward_count=10)
+
+        # Predict optimal - should be close to 200
+        optimal = curve.predict_optimal_fee(floor_ppm=50, ceiling_ppm=500)
+
+        assert optimal is not None
+        # Allow some tolerance due to fitting
+        assert 180 <= optimal <= 220
+
+    def test_polynomial_fit_respects_floor(self):
+        """Test that polynomial fit respects floor constraint."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+
+        # Create curve with optimal below floor
+        # Revenue peaks at fee=50
+        test_fees = [50, 75, 100, 125, 150, 175, 200, 225, 250]
+        for fee in test_fees:
+            revenue = -0.005 * (fee - 50)**2 + 100
+            curve.add_observation(fee_ppm=fee, revenue_rate=revenue, forward_count=10)
+
+        # Floor is 100, optimal at 50 should clamp to floor
+        optimal = curve.predict_optimal_fee(floor_ppm=100, ceiling_ppm=500)
+
+        assert optimal is not None
+        assert optimal == 100
+
+    def test_polynomial_fit_respects_ceiling(self):
+        """Test that polynomial fit respects ceiling constraint."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+
+        # Create curve with optimal above ceiling
+        # Revenue peaks at fee=400
+        test_fees = [150, 200, 250, 300, 350, 400, 450, 500, 550]
+        for fee in test_fees:
+            revenue = -0.005 * (fee - 400)**2 + 100
+            curve.add_observation(fee_ppm=fee, revenue_rate=revenue, forward_count=10)
+
+        # Ceiling is 300, optimal at 400 should clamp to ceiling
+        optimal = curve.predict_optimal_fee(floor_ppm=50, ceiling_ppm=300)
+
+        assert optimal is not None
+        assert optimal == 300
+
+    def test_insufficient_data_uses_fallback(self):
+        """Test that with insufficient data, weighted maximum fallback is used."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+
+        # Only 5 observations - not enough for polynomial fit
+        curve.add_observation(fee_ppm=100, revenue_rate=50.0, forward_count=10)
+        curve.add_observation(fee_ppm=150, revenue_rate=80.0, forward_count=10)
+        curve.add_observation(fee_ppm=200, revenue_rate=100.0, forward_count=10)  # Best
+        curve.add_observation(fee_ppm=250, revenue_rate=70.0, forward_count=10)
+        curve.add_observation(fee_ppm=300, revenue_rate=40.0, forward_count=10)
+
+        # Should still work using weighted maximum fallback
+        optimal = curve.predict_optimal_fee(floor_ppm=50, ceiling_ppm=500)
+
+        assert optimal is not None
+        assert optimal == 200  # Highest revenue observation
+
+    def test_convex_curve_uses_fallback(self):
+        """Test that convex curve (no maximum) uses weighted max fallback."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+
+        # Create convex curve (U-shaped) - no valid maximum
+        # revenue = 0.005 * (fee - 200)^2 + 50
+        test_fees = [100, 120, 150, 180, 200, 220, 250, 280, 300]
+        for fee in test_fees:
+            revenue = 0.005 * (fee - 200)**2 + 50
+            curve.add_observation(fee_ppm=fee, revenue_rate=revenue, forward_count=10)
+
+        # Should fall back to weighted max since curve is convex
+        optimal = curve.predict_optimal_fee(floor_ppm=50, ceiling_ppm=500)
+
+        assert optimal is not None
+        # Fallback should pick highest revenue (at boundaries)
+        assert optimal in [100, 300]  # Either end has highest revenue
+
+    def test_narrow_fee_range_uses_fallback(self):
+        """Test that narrow fee range triggers fallback."""
+        from modules.fee_controller import HistoricalResponseCurve
+
+        curve = HistoricalResponseCurve()
+
+        # All fees within 10 ppm - too narrow for reliable fit
+        test_fees = [200, 201, 202, 203, 204, 205, 206, 207, 208]
+        for fee in test_fees:
+            revenue = 100 - (fee - 204) ** 2  # Peak at 204
+            curve.add_observation(fee_ppm=fee, revenue_rate=revenue, forward_count=10)
+
+        # Should fall back to weighted max
+        optimal = curve.predict_optimal_fee(floor_ppm=50, ceiling_ppm=500)
+
+        assert optimal is not None
+        # Should pick best from observations
+        assert optimal == 204
