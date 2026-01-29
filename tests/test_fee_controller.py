@@ -545,3 +545,157 @@ class TestRebalanceCostFloor:
 
         result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
         assert result is None
+
+
+class TestSaturationProtectionFloor:
+    """Tests for flash drain protection on idle saturated channels."""
+
+    def test_saturation_floor_only_applies_to_saturated_channels(self, mock_database, mock_plugin):
+        """Saturation floor should not apply to channels below 80% local balance."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        capacity_sats = 5_000_000
+        global_min = 5
+
+        # Not saturated (50% balance) - should return global_min
+        result = fc._get_saturation_protection_floor(channel_id, capacity_sats, 50.0, global_min)
+        assert result == global_min
+
+        # Not saturated (79% balance) - should return global_min
+        result = fc._get_saturation_protection_floor(channel_id, capacity_sats, 79.0, global_min)
+        assert result == global_min
+
+    def test_saturation_floor_applies_to_saturated_idle_channels(self, mock_database, mock_plugin):
+        """Saturated idle channels should get a protective floor."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        capacity_sats = 5_000_000  # 5M sats -> 25 ppm base floor
+        global_min = 5
+
+        # Saturated (100% balance), idle (no recent forwards)
+        mock_database.get_last_forward_time.return_value = None  # Never forwarded
+        mock_database.get_forward_count_since.return_value = 0   # No recent forwards
+
+        result = fc._get_saturation_protection_floor(channel_id, capacity_sats, 100.0, global_min)
+
+        # Should be: max(15, 5M/200K) = 25 ppm base
+        # activity_factor = 1.0 (idle)
+        # idle_multiplier = 1.5 (>72h since no forwards ever)
+        # Final: 25 * 1.0 * 1.5 = 37 ppm (rounded to int)
+        assert result >= 25  # At least base capacity floor
+        assert result > global_min  # Higher than global min
+
+    def test_saturation_floor_decays_with_activity(self, mock_database, mock_plugin):
+        """Protection floor should decay as channel becomes active."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        capacity_sats = 5_000_000
+        global_min = 5
+        now = int(time.time())
+
+        # Recently active channel
+        mock_database.get_last_forward_time.return_value = now - 3600  # 1 hour ago
+
+        # Test with increasing activity levels
+        # Cautious: 10-19 forwards -> 75% protection
+        mock_database.get_forward_count_since.return_value = 15
+        result_cautious = fc._get_saturation_protection_floor(
+            channel_id, capacity_sats, 100.0, global_min
+        )
+
+        # Warming: 20-49 forwards -> 50% protection
+        mock_database.get_forward_count_since.return_value = 30
+        result_warming = fc._get_saturation_protection_floor(
+            channel_id, capacity_sats, 100.0, global_min
+        )
+
+        # Trusted: 50+ forwards -> no protection
+        mock_database.get_forward_count_since.return_value = 60
+        result_trusted = fc._get_saturation_protection_floor(
+            channel_id, capacity_sats, 100.0, global_min
+        )
+
+        # More activity should mean lower (or no) protection
+        assert result_cautious > result_warming
+        assert result_trusted == global_min  # Fully trusted
+
+    def test_saturation_floor_scales_with_capacity(self, mock_database, mock_plugin):
+        """Larger channels should get higher protection floors."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        global_min = 5
+        now = int(time.time())
+
+        # Idle channel setup
+        mock_database.get_last_forward_time.return_value = now - 86400 * 2  # 2 days ago
+        mock_database.get_forward_count_since.return_value = 5  # Low activity
+
+        # 1M sat channel
+        result_1m = fc._get_saturation_protection_floor(
+            channel_id, 1_000_000, 100.0, global_min
+        )
+
+        # 5M sat channel
+        result_5m = fc._get_saturation_protection_floor(
+            channel_id, 5_000_000, 100.0, global_min
+        )
+
+        # 10M sat channel
+        result_10m = fc._get_saturation_protection_floor(
+            channel_id, 10_000_000, 100.0, global_min
+        )
+
+        # Larger channels should have higher floors
+        assert result_5m > result_1m
+        assert result_10m > result_5m
+
+    def test_saturation_floor_disabled_returns_global_min(self, mock_database, mock_plugin):
+        """When feature disabled, should return global_min."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc.ENABLE_SATURATION_FLOOR = False  # Disable feature
+
+        channel_id = "123x456x0"
+        capacity_sats = 10_000_000
+        global_min = 5
+
+        mock_database.get_last_forward_time.return_value = None
+        mock_database.get_forward_count_since.return_value = 0
+
+        result = fc._get_saturation_protection_floor(
+            channel_id, capacity_sats, 100.0, global_min
+        )
+        assert result == global_min

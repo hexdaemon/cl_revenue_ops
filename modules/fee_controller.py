@@ -2441,6 +2441,30 @@ class HillClimbingFeeController:
     REBALANCE_FLOOR_WINDOW_DAYS = 30    # Lookback window for cost history
 
     # ==========================================================================
+    # Flash Drain Protection: Activity-Scaled Saturation Floor
+    # ==========================================================================
+    # Idle saturated channels (high local balance, low recent activity) are
+    # vulnerable to "flash drains" - rapid depletion from payment avalanches
+    # when fees drop too low. This floor protects them while allowing active
+    # channels to optimize revenue normally.
+    #
+    # The protection scales with:
+    # 1. Channel capacity (larger channels = bigger targets)
+    # 2. Recent activity (more forwards = more trust = less protection)
+    # 3. Idle duration (longer idle = more protection needed)
+    ENABLE_SATURATION_FLOOR = True        # Feature flag
+    SATURATION_THRESHOLD_PCT = 80         # Above this % local balance = saturated
+    SATURATION_CAPACITY_DIVISOR = 200_000 # capacity / this = base floor ppm
+    SATURATION_MIN_FLOOR_PPM = 15         # Absolute minimum protection floor
+    # Activity thresholds (forwards in last 24h)
+    SATURATION_TRUSTED_FORWARDS = 50      # 50+ forwards = fully trusted, no floor
+    SATURATION_WARMING_FORWARDS = 20      # 20-49 = warming up, 50% protection
+    SATURATION_CAUTIOUS_FORWARDS = 10     # 10-19 = cautious, 75% protection
+    # Idle duration multipliers (hours since last forward)
+    SATURATION_IDLE_HOURS_LONG = 72       # 3+ days idle = 1.5x protection
+    SATURATION_IDLE_HOURS_SHORT = 24      # 1+ day idle = 1.25x protection
+
+    # ==========================================================================
     # Cold-Start Mode for Stagnant Channels
     # ==========================================================================
     # Channels with very low forward counts need price discovery - force fees
@@ -2887,6 +2911,102 @@ class HillClimbingFeeController:
             return max(global_min, self.LOW_BALANCE_MIN_FEE)
         else:
             return global_min
+
+    def _get_saturation_protection_floor(
+        self,
+        channel_id: str,
+        capacity_sats: int,
+        local_balance_pct: float,
+        global_min: int
+    ) -> int:
+        """
+        Flash drain protection for idle saturated channels.
+
+        Idle channels at high local balance are vulnerable to "flash drains" -
+        rapid depletion when fees drop too low and payment avalanches hit.
+        This floor protects them while allowing active channels to optimize
+        revenue normally through Thompson sampling.
+
+        The protection scales intelligently:
+        1. Channel capacity: Larger channels = bigger targets = higher floor
+        2. Recent activity: More forwards = more trust = less protection needed
+        3. Idle duration: Longer idle = more protection (channel is "cold")
+
+        As a channel proves it can handle flow safely (accumulates forwards
+        without being drained), the protection floor decays, eventually
+        trusting Thompson sampling fully.
+
+        Args:
+            channel_id: Channel to check
+            capacity_sats: Channel capacity in satoshis
+            local_balance_pct: Local balance as percentage (0-100)
+            global_min: Global minimum fee from config
+
+        Returns:
+            Minimum fee floor in PPM (may be global_min if no protection needed)
+        """
+        if not self.ENABLE_SATURATION_FLOOR:
+            return global_min
+
+        # Only apply to saturated channels (high local balance)
+        if local_balance_pct < self.SATURATION_THRESHOLD_PCT:
+            return global_min
+
+        # Get recent activity metrics
+        now = int(time.time())
+        last_forward_ts = self.database.get_last_forward_time(channel_id)
+
+        # Calculate hours since last forward
+        if last_forward_ts and last_forward_ts > 0:
+            hours_since_forward = (now - last_forward_ts) / 3600
+        else:
+            hours_since_forward = 999  # No forwards ever = very idle
+
+        # Get forward count in last 24 hours
+        ts_24h_ago = now - (24 * 3600)
+        recent_forwards = self.database.get_forward_count_since(channel_id, ts_24h_ago)
+
+        # Check if channel is trusted (enough recent activity)
+        if recent_forwards >= self.SATURATION_TRUSTED_FORWARDS:
+            # Channel has proven it can handle flow - trust Thompson sampling
+            return global_min
+
+        # Calculate capacity-based floor
+        # Larger channels are bigger targets and need more protection
+        capacity_floor = max(
+            self.SATURATION_MIN_FLOOR_PPM,
+            capacity_sats // self.SATURATION_CAPACITY_DIVISOR
+        )
+
+        # Scale by activity level (more activity = less protection needed)
+        if recent_forwards >= self.SATURATION_WARMING_FORWARDS:
+            activity_factor = 0.50  # 50% protection - warming up
+        elif recent_forwards >= self.SATURATION_CAUTIOUS_FORWARDS:
+            activity_factor = 0.75  # 75% protection - cautious
+        else:
+            activity_factor = 1.00  # Full protection - idle/minimal activity
+
+        # Apply idle duration multiplier (longer idle = more protection)
+        if hours_since_forward > self.SATURATION_IDLE_HOURS_LONG:
+            idle_multiplier = 1.50  # 3+ days idle
+        elif hours_since_forward > self.SATURATION_IDLE_HOURS_SHORT:
+            idle_multiplier = 1.25  # 1+ day idle
+        else:
+            idle_multiplier = 1.00  # Recently active
+
+        # Calculate final protection floor
+        protection_floor = int(capacity_floor * activity_factor * idle_multiplier)
+
+        if protection_floor > global_min:
+            self.plugin.log(
+                f"SATURATION_FLOOR: {channel_id[:12]}... local={local_balance_pct:.0f}%, "
+                f"forwards_24h={recent_forwards}, idle={hours_since_forward:.1f}h, "
+                f"floor={protection_floor}ppm (capacity={capacity_floor}, "
+                f"activity={activity_factor:.0%}, idle_mult={idle_multiplier:.2f})",
+                level='debug'
+            )
+
+        return max(global_min, protection_floor)
 
     def _get_rebalance_cost_floor(
         self,
@@ -4118,6 +4238,18 @@ class HillClimbingFeeController:
             base_floor_ppm = balance_floor_ppm
 
         # =====================================================================
+        # Flash Drain Protection: Activity-Scaled Saturation Floor
+        # =====================================================================
+        # Idle saturated channels are vulnerable to rapid depletion when fees
+        # drop too low. This floor protects them while allowing active channels
+        # to optimize revenue. Protection decays as channel proves it's safe.
+        saturation_floor_ppm = self._get_saturation_protection_floor(
+            channel_id, capacity, local_balance_pct, cfg.min_fee_ppm
+        )
+        if saturation_floor_ppm > base_floor_ppm:
+            base_floor_ppm = saturation_floor_ppm
+
+        # =====================================================================
         # Issue #32: Rebalance Cost-Aware Fee Floor
         # =====================================================================
         # SOURCE channels should charge fees sufficient to recover rebalance costs.
@@ -4146,13 +4278,13 @@ class HillClimbingFeeController:
         )
 
         # =====================================================================
-        # Issue #18 Fix: Balance Floor Priority (extended for Issue #32)
+        # Issue #18 Fix: Balance Floor Priority (extended for Issue #32 & saturation)
         # =====================================================================
-        # Scarcity protection for drained channels and cost recovery for rebalanced
-        # channels takes priority over normal ceiling limits. If either floor is
-        # active, ensure ceiling accommodates it. This prevents the floor/ceiling
-        # sanity check from clamping down the protective floor.
-        effective_floor = max(balance_floor_ppm, rebalance_floor_ppm or 0)
+        # Scarcity protection for drained channels, flash drain protection for
+        # saturated channels, and cost recovery for rebalanced channels all take
+        # priority over normal ceiling limits. If any protective floor is active,
+        # ensure ceiling accommodates it.
+        effective_floor = max(balance_floor_ppm, saturation_floor_ppm, rebalance_floor_ppm or 0)
         if effective_floor > cfg.min_fee_ppm:  # A protective floor is active
             min_ceiling_for_floor = effective_floor + 100  # Allow room for hill climbing
             if base_ceiling_ppm < min_ceiling_for_floor:
