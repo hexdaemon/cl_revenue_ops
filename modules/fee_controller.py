@@ -3972,29 +3972,10 @@ class HillClimbingFeeController:
         now = int(time.time())
         
         # Decision for target fee (The Alpha Sequence)
-        is_fire_sale = False
-        if self.profitability:
-            from .profitability_analyzer import ProfitabilityClass
-            prof_data = self.profitability.get_profitability(channel_id)
-            if prof_data and prof_data.days_open > 90:
-                if prof_data.classification == ProfitabilityClass.ZOMBIE:
-                    is_fire_sale = True
-                elif prof_data.classification == ProfitabilityClass.UNDERWATER:
-                    if prof_data.roi_percent < -50.0:
-                        is_fire_sale = True
-            
-            # MOMENTUM GUARD: Protect recovering channels from Fire Sale (Phase 5.5)
-            # Channels with positive operational ROI are paying back their debt -
-            # don't kill them just because they had high opening costs.
-            if is_fire_sale and prof_data:
-                marginal_roi = prof_data.marginal_roi
-                if marginal_roi > 0.05 and prof_data.days_open < 180:
-                    self.plugin.log(
-                        f"MOMENTUM GUARD: Channel {channel_id[:12]}... is recovering "
-                        f"(Marginal ROI {marginal_roi:.1%}). Suspending Fire Sale to allow price discovery.",
-                        level='info'
-                    )
-                    is_fire_sale = False
+        # NOTE: FIRE_SALE logic removed in v2.2.3
+        # Reason: FIRE_SALE set fees to 1 ppm for zombie/underwater channels, but this
+        # bypassed all floor protections and caused flash drain on saturated channels.
+        # Thompson Sampling now handles price discovery for all channels naturally.
         
         # =====================================================================
         # DEADBAND HYSTERESIS: Sleep Status Check (Phase 4: Stability & Scaling)
@@ -4357,22 +4338,16 @@ class HillClimbingFeeController:
         # =====================================================================
         # PRIORITY OVERRIDE: Zero-Fee Probe > Fire Sale
         # =====================================================================
-        # The Alpha Sequence priority is: Congestion > Zero-Fee > Fire Sale > Hill Climbing
-        # 
-        # However, Fire Sale appears earlier in the if/elif chain for code clarity.
-        # This guard ensures the correct priority by disabling Fire Sale when a
-        # Zero-Fee Probe is active. We MUST allow the diagnostic probe (0 PPM) to
-        # verify channel liveness before resigning ourselves to liquidation (1 PPM).
+        # The Alpha Sequence priority is: Congestion > Zero-Fee Probe > Thompson/Hill Climbing
+        # NOTE: FIRE_SALE removed in v2.2.3 - Thompson Sampling handles price discovery
         # =====================================================================
-        if is_under_probe:
-            is_fire_sale = False
-        
+
         # Target Decision Block (The Alpha Sequence)
         base_new_fee = None  # For observability; set in Hill Climbing branch
         new_fee_ppm = 0
         target_found = False
         is_cold_start = False  # Initialize here; may be set True in Hill Climbing branch
-        
+
         # Priority 1: Congestion (Emergency High Fee)
         if is_congested:
             new_fee_ppm = ceiling_ppm
@@ -4383,19 +4358,8 @@ class HillClimbingFeeController:
             rate_change = 0.0
             previous_rate = hc_state.last_revenue_rate
             target_found = True
-            
-        # Priority 2: Fire Sale (Dumping Inventory)
-        elif is_fire_sale:
-            new_fee_ppm = 1
-            decision_reason = "FIRE_SALE"
-            new_direction = hc_state.trend_direction
-            step_ppm = hc_state.step_ppm
-            volatility_reset = False
-            rate_change = 0.0
-            previous_rate = hc_state.last_revenue_rate
-            target_found = True
-            
-        # Priority 3: Zero-Fee Probe Logic (Jumpstarting)
+
+        # Priority 2: Zero-Fee Probe Logic (Jumpstarting)
         if not target_found and is_under_probe:
             # Calculate current revenue rate (reuse logic from rate calculation below)
             if cfg.enable_reputation and not is_shielded:
@@ -4971,7 +4935,7 @@ class HillClimbingFeeController:
             # =====================================================================
             # Hive Coordination (preserved from Hill Climbing)
             # =====================================================================
-            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not is_congested and not is_fire_sale:
+            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not is_congested:
                 coord_rec = self._get_coordinated_fee_recommendation(
                     channel_id=channel_id,
                     peer_id=peer_id,
@@ -4997,7 +4961,7 @@ class HillClimbingFeeController:
                     new_fee_ppm = max(floor_ppm, defense_fee)
 
             # Fleet-aware adjustment
-            if self.hive_bridge and not is_congested and not is_fire_sale:
+            if self.hive_bridge and not is_congested:
                 fleet_adjusted_fee = self._get_fleet_aware_fee_adjustment(peer_id, new_fee_ppm)
                 if fleet_adjusted_fee != new_fee_ppm:
                     new_fee_ppm = max(floor_ppm, min(effective_ceiling, fleet_adjusted_fee))
@@ -5294,7 +5258,7 @@ class HillClimbingFeeController:
             # Query cl-hive for coordinated fee that considers corridors,
             # pheromones, stigmergic markers, and defense status.
             # =================================================================
-            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not is_congested and not is_fire_sale:
+            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not is_congested:
                 coord_rec = self._get_coordinated_fee_recommendation(
                     channel_id=channel_id,
                     peer_id=peer_id,
@@ -5334,7 +5298,7 @@ class HillClimbingFeeController:
             # Apply minor adjustments based on fleet liquidity needs.
             # INFORMATION ONLY - no fund transfers between nodes.
             # =================================================================
-            if self.hive_bridge and not is_congested and not is_fire_sale:
+            if self.hive_bridge and not is_congested:
                 fleet_adjusted_fee = self._get_fleet_aware_fee_adjustment(
                     peer_id, new_fee_ppm
                 )
@@ -5363,7 +5327,7 @@ class HillClimbingFeeController:
         else:
             min_change = max(5, current_fee_ppm * 0.03)
             
-        if fee_change < min_change and not (is_congested or is_fire_sale):
+        if fee_change < min_change and not is_congested:
             return None
         
         # =====================================================================
@@ -5379,7 +5343,7 @@ class HillClimbingFeeController:
                              (hc_state.last_broadcast_fee_ppm <= 1) or \
                              (new_fee_ppm <= 1) or \
                              (target_found and hc_state.last_state != decision_reason) or \
-                             (not target_found and hc_state.last_state in ("CONGESTION", "FIRE_SALE"))
+                             (not target_found and hc_state.last_state == "CONGESTION")
 
         if not significant_change:
             # HYSTERESIS: Skip RPC, update internal target, but PAUSE observation window
