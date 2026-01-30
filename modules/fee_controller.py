@@ -37,7 +37,7 @@ import time
 import random
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Any, Tuple, Union, TYPE_CHECKING
 
 from pyln.client import Plugin, RpcError
 
@@ -1940,6 +1940,9 @@ class ThompsonAIMDState:
     # Algorithm tracking
     algorithm_version: str = "thompson_aimd_v1"
 
+    # Gossip refresh tracking
+    last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
+
     def get_historical_curve(self) -> HistoricalResponseCurve:
         """Deserialize historical curve from dict."""
         if self.historical_curve_data:
@@ -2130,6 +2133,9 @@ class HillClimbState:
 
     # v2.0: Thompson Sampling (Improvement #5) - stored as dict for DB
     thompson_data: Dict[str, Any] = field(default_factory=dict)
+
+    # Gossip refresh tracking
+    last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
 
     def get_historical_curve(self) -> HistoricalResponseCurve:
         """Deserialize historical curve from dict."""
@@ -2518,6 +2524,25 @@ class HillClimbingFeeController:
     THOMPSON_COLD_START_BONUS = 1.5   # Extra exploration for channels with few observations
     THOMPSON_CONTEXT_WEIGHT = 0.7     # Weight for contextual vs global posterior
     AIMD_DEFENSE_CEILING_BOOST = 0.1  # Allow 10% above ceiling when in defense mode
+
+    # =============================================================================
+    # GOSSIP REFRESH FOR FROZEN CHANNEL DETECTION
+    # =============================================================================
+    # When channels go quiet and fees stabilize, gossip can go stale.
+    # This forces a minimal fee change to refresh network visibility.
+    ENABLE_GOSSIP_REFRESH = True
+
+    # Minimum hours since last fee broadcast before considering refresh
+    GOSSIP_REFRESH_MIN_BROADCAST_AGE_HOURS = 24
+
+    # Minimum hours since last forward before considering channel "frozen"
+    GOSSIP_REFRESH_MIN_IDLE_HOURS = 24
+
+    # Maximum frequency of forced gossip refresh per channel (hours)
+    GOSSIP_REFRESH_COOLDOWN_HOURS = 24
+
+    # Fee nudge amount (should be minimal - economically negligible)
+    GOSSIP_REFRESH_NUDGE_PPM = 1
 
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
@@ -3883,6 +3908,133 @@ class HillClimbingFeeController:
                 )
 
         return adjustments
+
+    def _should_force_gossip_refresh(
+        self,
+        channel_id: str,
+        state: Union[ThompsonAIMDState, HillClimbState],
+        current_time: int
+    ) -> bool:
+        """
+        Check if channel needs a forced gossip refresh due to suspected freeze.
+        
+        Criteria:
+        1. Feature is enabled
+        2. 24+ hours since last fee broadcast (last_update)
+        3. 24+ hours since last forward (channel is idle)
+        4. 24+ hours since last gossip refresh (cooldown)
+        
+        Args:
+            channel_id: The channel short ID
+            state: The fee optimization state for this channel
+            current_time: Current unix timestamp
+            
+        Returns:
+            True if gossip refresh should be forced
+        """
+        if not self.ENABLE_GOSSIP_REFRESH:
+            return False
+        
+        # Check 1: Time since last broadcast
+        if state.last_update > 0:
+            hours_since_broadcast = (current_time - state.last_update) / 3600
+            if hours_since_broadcast < self.GOSSIP_REFRESH_MIN_BROADCAST_AGE_HOURS:
+                return False
+        else:
+            # Never broadcasted - should broadcast, but not via refresh mechanism
+            return False
+        
+        # Check 2: Time since last forward (channel activity)
+        last_forward_ts = self.database.get_last_forward_time(channel_id)
+        if last_forward_ts and last_forward_ts > 0:
+            hours_since_forward = (current_time - last_forward_ts) / 3600
+            if hours_since_forward < self.GOSSIP_REFRESH_MIN_IDLE_HOURS:
+                return False  # Channel is active, not frozen
+        # If no forward history, consider it idle (eligible for refresh)
+        
+        # Check 3: Cooldown since last refresh
+        if state.last_gossip_refresh > 0:
+            hours_since_refresh = (current_time - state.last_gossip_refresh) / 3600
+            if hours_since_refresh < self.GOSSIP_REFRESH_COOLDOWN_HOURS:
+                return False  # Already refreshed recently
+        
+        return True
+
+    def _create_gossip_refresh_adjustment(
+        self,
+        channel_id: str,
+        peer_id: str,
+        state: Union[ThompsonAIMDState, HillClimbState],
+        current_fee_ppm: int,
+        current_time: int
+    ) -> Optional[FeeAdjustment]:
+        """
+        Create a minimal fee adjustment to force gossip refresh.
+        
+        This applies a +1 ppm nudge that is economically negligible but
+        forces CLN to broadcast a fresh channel_update.
+        
+        Args:
+            channel_id: The channel short ID
+            peer_id: The peer node ID  
+            state: The fee optimization state
+            current_fee_ppm: Current fee in PPM
+            current_time: Current unix timestamp
+            
+        Returns:
+            FeeAdjustment with minimal nudge, or None if something went wrong
+        """
+        nudge_fee = current_fee_ppm + self.GOSSIP_REFRESH_NUDGE_PPM
+        
+        # Calculate diagnostic info for logging
+        hours_since_broadcast = (current_time - state.last_update) / 3600 if state.last_update > 0 else 999
+        
+        last_forward_ts = self.database.get_last_forward_time(channel_id)
+        if last_forward_ts and last_forward_ts > 0:
+            hours_since_forward = (current_time - last_forward_ts) / 3600
+        else:
+            hours_since_forward = 999
+        
+        self.plugin.log(
+            f"GOSSIP_REFRESH: {channel_id[:12]}... idle {hours_since_forward:.0f}h, "
+            f"no broadcast {hours_since_broadcast:.0f}h. "
+            f"Nudging fee {current_fee_ppm} -> {nudge_fee} ppm to refresh network visibility.",
+            level='info'
+        )
+        
+        # Update state tracking
+        state.last_gossip_refresh = current_time
+        state.last_fee_ppm = nudge_fee
+        state.last_broadcast_fee_ppm = nudge_fee
+        state.last_update = current_time
+        
+        # Save state
+        if isinstance(state, ThompsonAIMDState):
+            self._save_thompson_aimd_state(channel_id, state)
+        else:
+            self._save_hill_climb_state(channel_id, state)
+            
+            # If Thompson+AIMD is enabled, also update that state
+            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+                ts_state = self._thompson_aimd_states[channel_id]
+                ts_state.last_gossip_refresh = current_time
+                ts_state.last_fee_ppm = nudge_fee
+                ts_state.last_broadcast_fee_ppm = nudge_fee
+                ts_state.last_update = current_time
+                self._save_thompson_aimd_state(channel_id, ts_state)
+        
+        return FeeAdjustment(
+            channel_id=channel_id,
+            peer_id=peer_id,
+            new_fee_ppm=nudge_fee,
+            old_fee_ppm=current_fee_ppm,
+            reason="gossip_refresh",
+            details={
+                "hours_since_broadcast": hours_since_broadcast,
+                "hours_since_forward": hours_since_forward,
+                "nudge_amount": self.GOSSIP_REFRESH_NUDGE_PPM
+            }
+        )
     
     def _adjust_channel_fee(self, channel_id: str, peer_id: str,
                            state: Dict[str, Any],
@@ -5359,6 +5511,22 @@ class HillClimbingFeeController:
                 f"Skipping gossip; pausing observation.",
                 level='info'
             )
+            
+            # =========================================================================
+            # GOSSIP REFRESH CHECK: Force minimal fee change for frozen channels
+            # =========================================================================
+            # Even though hysteresis says skip, check if channel appears frozen
+            # and needs a gossip refresh to restore network visibility.
+            now = int(time.time())
+            if self._should_force_gossip_refresh(channel_id, hc_state, now):
+                return self._create_gossip_refresh_adjustment(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    state=hc_state,
+                    current_fee_ppm=current_fee_ppm,
+                    current_time=now
+                )
+            
             return None
 
         # Build reason string (with rate info)
