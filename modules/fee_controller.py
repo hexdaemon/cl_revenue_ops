@@ -2388,13 +2388,15 @@ class HillClimbingFeeController:
     MIN_CEILING_MULTIPLIER = 0.5      # Security: Ceiling can't go below 0.5x base
 
     # Improvement #2: Dynamic Observation Windows
-    # Use forward count instead of just time-based windows
-    # NOTE: Disabled by default - pure time-based windows are simpler and prevent
-    # channels from getting stuck at bad fees during quiet periods.
-    # The Hill Climbing algorithm already handles noisy signals via dampening.
-    ENABLE_DYNAMIC_WINDOWS = False    # Disabled: use time-based windows only
-    MIN_FORWARDS_FOR_SIGNAL = 3       # Only used if ENABLE_DYNAMIC_WINDOWS=True
-    MAX_OBSERVATION_HOURS = 6.0       # Only used if ENABLE_DYNAMIC_WINDOWS=True
+    # Use forward count in addition to time-based windows.
+    # Window closes when EITHER condition is met (OR logic):
+    #   - MIN_OBSERVATION_HOURS elapsed (time-based signal), OR
+    #   - MIN_FORWARDS_FOR_SIGNAL forwards observed (data-based signal)
+    # This prevents channels from getting stuck while still reacting quickly
+    # when routing data is available.
+    ENABLE_DYNAMIC_WINDOWS = True     # Enabled: use OR logic for time/forwards
+    MIN_FORWARDS_FOR_SIGNAL = 3       # Forwards threshold (proceed if met)
+    MAX_OBSERVATION_HOURS = 6.0       # Safety ceiling (unused with OR logic)
     # Note: MIN_OBSERVATION_HOURS already defined above (1.0)
 
     # Improvement #3: Historical Response Curve
@@ -4249,48 +4251,33 @@ class HillClimbingFeeController:
         hc_state.forward_count_since_update = forward_count
 
         if self.ENABLE_DYNAMIC_WINDOWS and hc_state.last_update > 0:
-            # Dynamic window logic:
-            # - Window closes when BOTH conditions met:
-            #   1. At least MIN_OBSERVATION_HOURS elapsed (security floor)
-            #   2. At least MIN_FORWARDS_FOR_SIGNAL forwards observed
-            # - Window MUST close if MAX_OBSERVATION_HOURS reached (security ceiling)
+            # Dynamic window logic (OR):
+            # - Window closes when EITHER condition is met:
+            #   1. At least MIN_OBSERVATION_HOURS elapsed (time signal), OR
+            #   2. At least MIN_FORWARDS_FOR_SIGNAL forwards observed (data signal)
+            # This prevents stagnant channels from waiting forever while still
+            # allowing quick reaction when routing data is available.
 
             time_ok = hours_elapsed >= self.MIN_OBSERVATION_HOURS
             forwards_ok = forward_count >= self.MIN_FORWARDS_FOR_SIGNAL
-            max_time_reached = hours_elapsed >= self.MAX_OBSERVATION_HOURS
 
-            if max_time_reached:
-                # Security: Force window close even without enough forwards
-                # This prevents starvation attack (adversary stops routing)
+            if time_ok or forwards_ok:
+                # Either condition met - proceed with adjustment
+                reason = "time" if time_ok else "forwards"
                 self.plugin.log(
-                    f"DYNAMIC_WINDOW: {channel_id[:12]}... max time reached "
-                    f"({hours_elapsed:.1f}h), closing window with {forward_count} forwards",
-                    level='debug'
-                )
-            elif not time_ok:
-                # Below minimum time - always wait
-                self.plugin.log(
-                    f"Skipping {channel_id[:12]}...: observation window too short "
-                    f"({hours_elapsed:.2f}h < {self.MIN_OBSERVATION_HOURS}h minimum)",
-                    level='debug'
-                )
-                return None
-            elif not forwards_ok:
-                # Have enough time but not enough forwards - wait for more data
-                # unless we've waited too long (caught by max_time_reached above)
-                self.plugin.log(
-                    f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting for more data "
-                    f"({forward_count}/{self.MIN_FORWARDS_FOR_SIGNAL} forwards, {hours_elapsed:.1f}h elapsed)",
-                    level='debug'
-                )
-                return None
-            else:
-                # Both conditions met - proceed
-                self.plugin.log(
-                    f"DYNAMIC_WINDOW: {channel_id[:12]}... window closed "
+                    f"DYNAMIC_WINDOW: {channel_id[:12]}... window closed via {reason} "
                     f"({forward_count} forwards in {hours_elapsed:.1f}h)",
                     level='debug'
                 )
+            else:
+                # Neither condition met yet - wait for more time or data
+                self.plugin.log(
+                    f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting "
+                    f"({forward_count}/{self.MIN_FORWARDS_FOR_SIGNAL} forwards, "
+                    f"{hours_elapsed:.1f}/{self.MIN_OBSERVATION_HOURS}h)",
+                    level='debug'
+                )
+                return None
         else:
             # Legacy behavior: time-only observation window
             if hours_elapsed < self.MIN_OBSERVATION_HOURS:
