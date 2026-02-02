@@ -1767,22 +1767,32 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         hours_since_update = (now - last_update) / 3600.0 if last_update > 0 else 0.0
 
         # Determine skip reason
+        # With ENABLE_DYNAMIC_WINDOWS=True and OR logic:
+        # Channel is ready if EITHER time >= min_obs_hours OR forwards >= min_forwards
         skip_reason = None
         status = "ready"
+
+        time_ok = hours_since_update >= min_obs_hours
+        forwards_ok = forward_count >= min_forwards
 
         if is_sleeping:
             mins_until_wake = (sleep_until - now) // 60
             skip_reason = f"SLEEPING (wake in {mins_until_wake} min)"
             status = "sleeping"
             result["summary"]["sleeping"] += 1
-        elif hours_since_update < 1.0:
-            skip_reason = f"WAITING_TIME ({hours_since_update:.2f}h < 1h min)"
-            status = "waiting_time"
+        elif enable_dyn_windows and (time_ok or forwards_ok):
+            # OR logic: either condition met = ready
+            status = "ready"
+            result["summary"]["ready"] += 1
+        elif not enable_dyn_windows and time_ok:
+            # Legacy: time-only check
+            status = "ready"
+            result["summary"]["ready"] += 1
+        elif not time_ok and not forwards_ok:
+            # Neither condition met - waiting for either
+            skip_reason = f"WAITING ({forward_count}/{min_forwards} fwds, {hours_since_update:.1f}/{min_obs_hours}h)"
+            status = "waiting"
             result["summary"]["waiting_time"] += 1
-        elif forward_count < min_forwards:
-            skip_reason = f"WAITING_FORWARDS ({forward_count}/{min_forwards} forwards)"
-            status = "waiting_forwards"
-            result["summary"]["waiting_forwards"] += 1
         else:
             status = "ready"
             result["summary"]["ready"] += 1
