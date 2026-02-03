@@ -36,8 +36,10 @@ find the optimal price point where volume * fee is maximized.
 import time
 import random
 import math
+import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple, Union, TYPE_CHECKING
+from enum import Enum
 
 from pyln.client import Plugin, RpcError
 
@@ -49,6 +51,100 @@ from .policy_manager import PolicyManager, FeeStrategy
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
     from .hive_bridge import HiveFeeIntelligenceBridge
+
+
+# =============================================================================
+# REASON CODES FOR EXPLAINABILITY
+# =============================================================================
+# Structured reason codes for fee adjustment decisions. These codes enable
+# debugging, auditing, and fleet-wide analysis of fee controller behavior.
+# =============================================================================
+
+class FeeReasonCode(Enum):
+    """
+    Structured reason codes for fee adjustment decisions.
+
+    Categories:
+    - Policy overrides: Static policies that bypass algorithmic decisions
+    - Algorithm decisions: Core Thompson Sampling / Hill Climbing outcomes
+    - Heuristic modifiers: Channel-aware adjustments to step size
+    - Skip reasons: Why a channel was not adjusted this cycle
+    """
+    # Policy overrides
+    POLICY_PASSIVE = "policy_passive"     # Peer has passive fee strategy
+    POLICY_STATIC = "policy_static"       # Peer has static fee target
+    POLICY_HIVE = "policy_hive"           # Fleet member with 0 ppm covenant
+
+    # Algorithm decisions
+    THOMPSON_SAMPLE = "thompson_sample"               # Normal Thompson posterior sample
+    THOMPSON_COLD_START = "thompson_cold_start"       # Insufficient data, using prior
+    THOMPSON_AIMD_DEFENSE = "thompson_aimd_defense"   # AIMD triggered fee increase
+    CONGESTION = "congestion"                         # Congestion-based fee surge
+    SCARCITY = "scarcity"                             # Low outbound liquidity premium
+
+    # Heuristic modifiers (applied on top of algorithm decision)
+    YOUNG_CHANNEL_CAP = "young_channel_cap"                   # Step capped for young channel
+    HIGH_VOLATILITY_REDUCE = "high_volatility_reduce"         # Step reduced due to fee volatility
+    HIGH_FAILURE_CONSERVATIVE = "high_failure_conservative"   # Step reduced due to high failure rate
+
+    # Skip reasons
+    SKIP_SLEEPING = "skip_sleeping"               # Hysteresis sleep mode active
+    SKIP_WAITING_TIME = "skip_waiting_time"       # Observation window too short
+    SKIP_WAITING_FORWARDS = "skip_waiting_forwards"  # Not enough forwards for signal
+    SKIP_FEE_UNCHANGED = "skip_fee_unchanged"     # Calculated fee equals current fee
+
+
+@dataclass
+class HeuristicModifiers:
+    """
+    Captures heuristic adjustments applied to fee step size.
+
+    Serializable to JSON for storage in fee_changes.heuristic_modifiers column.
+    """
+    young_channel: Optional[Dict[str, Any]] = None      # {age_days, original_step, capped_step}
+    high_volatility: Optional[Dict[str, Any]] = None    # {volatility, reduction_factor}
+    high_failure: Optional[Dict[str, Any]] = None       # {failure_rate, reduction_factor}
+
+    def to_json(self) -> str:
+        """Serialize to JSON string for database storage."""
+        data = {}
+        if self.young_channel:
+            data["young_channel"] = self.young_channel
+        if self.high_volatility:
+            data["high_volatility"] = self.high_volatility
+        if self.high_failure:
+            data["high_failure"] = self.high_failure
+        return json.dumps(data) if data else ""
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "HeuristicModifiers":
+        """Deserialize from JSON string."""
+        if not json_str:
+            return cls()
+        try:
+            data = json.loads(json_str)
+            return cls(
+                young_channel=data.get("young_channel"),
+                high_volatility=data.get("high_volatility"),
+                high_failure=data.get("high_failure")
+            )
+        except (json.JSONDecodeError, TypeError):
+            return cls()
+
+    def has_modifiers(self) -> bool:
+        """Check if any modifiers were applied."""
+        return bool(self.young_channel or self.high_volatility or self.high_failure)
+
+    def get_modifier_codes(self) -> List[FeeReasonCode]:
+        """Get list of modifier reason codes that were applied."""
+        codes = []
+        if self.young_channel:
+            codes.append(FeeReasonCode.YOUNG_CHANNEL_CAP)
+        if self.high_volatility:
+            codes.append(FeeReasonCode.HIGH_VOLATILITY_REDUCE)
+        if self.high_failure:
+            codes.append(FeeReasonCode.HIGH_FAILURE_CONSERVATIVE)
+        return codes
 
 
 # =============================================================================
@@ -2310,7 +2406,7 @@ def calculate_scarcity_multiplier(outbound_ratio: float, scarcity_threshold: flo
 class FeeAdjustment:
     """
     Record of a fee adjustment.
-    
+
     Attributes:
         channel_id: Channel that was adjusted
         peer_id: Peer node ID
@@ -2318,6 +2414,8 @@ class FeeAdjustment:
         new_fee_ppm: New fee after adjustment
         reason: Explanation of the adjustment
         hill_climb_values: Hill Climbing algorithm internal values
+        reason_code: Structured FeeReasonCode value (for explainability)
+        heuristic_modifiers: HeuristicModifiers applied (for explainability)
     """
     channel_id: str
     peer_id: str
@@ -2325,16 +2423,22 @@ class FeeAdjustment:
     new_fee_ppm: int
     reason: str
     hill_climb_values: Dict[str, Any]
-    
+    reason_code: str = FeeReasonCode.THOMPSON_SAMPLE.value  # Default reason
+    heuristic_modifiers: Optional[HeuristicModifiers] = None
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "channel_id": self.channel_id,
             "peer_id": self.peer_id,
             "old_fee_ppm": self.old_fee_ppm,
             "new_fee_ppm": self.new_fee_ppm,
             "reason": self.reason,
-            "hill_climb_values": self.hill_climb_values
+            "hill_climb_values": self.hill_climb_values,
+            "reason_code": self.reason_code
         }
+        if self.heuristic_modifiers:
+            result["heuristic_modifiers"] = self.heuristic_modifiers.to_json()
+        return result
 
 
 class HillClimbingFeeController:
@@ -5320,6 +5424,81 @@ class HillClimbingFeeController:
                 step_ppm = max(self.MIN_STEP_PPM, step_ppm // 2)
 
             # =================================================================
+            # HEURISTIC TUNING: Channel-aware step size modifiers
+            # =================================================================
+            # These heuristics reduce fee volatility and prevent over-optimization
+            # in channels where the signal-to-noise ratio is poor.
+            # Track modifiers for explainability.
+            # =================================================================
+            heuristic_modifiers = HeuristicModifiers()
+            original_step_ppm = step_ppm  # For logging
+
+            # Heuristic A: Young Channel Cap (<30 days)
+            # Young channels have insufficient data for confident fee optimization.
+            # Cap step size to prevent wild swings during establishment period.
+            YOUNG_CHANNEL_AGE_DAYS = 30
+            YOUNG_CHANNEL_MAX_STEP = 25
+
+            channel_age_days = self._get_channel_age_days(channel_id, channel_info)
+            if channel_age_days < YOUNG_CHANNEL_AGE_DAYS:
+                if step_ppm > YOUNG_CHANNEL_MAX_STEP:
+                    heuristic_modifiers.young_channel = {
+                        "age_days": channel_age_days,
+                        "original_step": step_ppm,
+                        "capped_step": YOUNG_CHANNEL_MAX_STEP
+                    }
+                    step_ppm = YOUNG_CHANNEL_MAX_STEP
+                    self.plugin.log(
+                        f"HEURISTIC: Young channel {channel_id[:12]}... (age={channel_age_days}d) "
+                        f"step capped {original_step_ppm}ppm -> {step_ppm}ppm",
+                        level='debug'
+                    )
+
+            # Heuristic B: High Volatility Reduction
+            # If fee has been changing direction frequently, reduce step size.
+            # High volatility = unstable market signal, be conservative.
+            HIGH_VOLATILITY_THRESHOLD = 0.5  # stddev/mean ratio
+            VOLATILITY_STEP_REDUCTION = 0.5
+
+            fee_volatility = self._get_fee_volatility(channel_id)
+            if fee_volatility > HIGH_VOLATILITY_THRESHOLD:
+                reduced_step = int(step_ppm * VOLATILITY_STEP_REDUCTION)
+                reduced_step = max(self.MIN_STEP_PPM, reduced_step)
+                if reduced_step < step_ppm:
+                    heuristic_modifiers.high_volatility = {
+                        "volatility": round(fee_volatility, 3),
+                        "reduction_factor": VOLATILITY_STEP_REDUCTION
+                    }
+                    step_ppm = reduced_step
+                    self.plugin.log(
+                        f"HEURISTIC: High volatility {channel_id[:12]}... (vol={fee_volatility:.2f}) "
+                        f"step reduced to {step_ppm}ppm",
+                        level='debug'
+                    )
+
+            # Heuristic C: High Failure Rate Conservative
+            # Channels with high routing failure rates may have unreliable fee signals.
+            # Be conservative to avoid thrashing.
+            HIGH_FAILURE_RATE_THRESHOLD = 0.3
+            FAILURE_CONSERVATIVE_BIAS = 0.8
+
+            failure_rate = self._get_channel_failure_rate(channel_id)
+            if failure_rate > HIGH_FAILURE_RATE_THRESHOLD:
+                reduced_step = int(step_ppm * FAILURE_CONSERVATIVE_BIAS)
+                reduced_step = max(self.MIN_STEP_PPM, reduced_step)
+                if reduced_step < step_ppm:
+                    heuristic_modifiers.high_failure = {
+                        "failure_rate": round(failure_rate, 3),
+                        "reduction_factor": FAILURE_CONSERVATIVE_BIAS
+                    }
+                    step_ppm = reduced_step
+                    self.plugin.log(
+                        f"HEURISTIC: High failure rate {channel_id[:12]}... (fail={failure_rate:.2f}) "
+                        f"step reduced to {step_ppm}ppm",
+                        level='debug'
+                    )
+
+            # =================================================================
             # PHASE 15: Pheromone-Biased Direction
             # Use historical routing success (pheromone levels) to influence
             # the step direction. Strong pheromone = we're near a good fee.
@@ -5584,8 +5763,24 @@ class HillClimbingFeeController:
             )
             return None
         
+        # Determine reason_code for this adjustment
+        if is_cold_start:
+            fee_reason_code = FeeReasonCode.THOMPSON_COLD_START.value
+        elif "aimd" in decision_reason.lower():
+            fee_reason_code = FeeReasonCode.THOMPSON_AIMD_DEFENSE.value
+        elif is_congested:
+            fee_reason_code = FeeReasonCode.CONGESTION.value
+        elif cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
+            fee_reason_code = FeeReasonCode.SCARCITY.value
+        else:
+            fee_reason_code = FeeReasonCode.THOMPSON_SAMPLE.value
+
         # Apply the fee change (Significant change -> Broadcast)
-        result = self.set_channel_fee(channel_id, new_fee_ppm, reason=reason)
+        result = self.set_channel_fee(
+            channel_id, new_fee_ppm, reason=reason,
+            reason_code=fee_reason_code,
+            heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None
+        )
         
         if result.get("success"):
             # Update state with new broadcast fee and refresh timer
@@ -5626,6 +5821,19 @@ class HillClimbingFeeController:
                         level='debug'
                     )
 
+            # Build structured log line (fee_reason_code already computed above)
+            modifiers_summary = ""
+            if heuristic_modifiers.has_modifiers():
+                modifier_codes = [m.value for m in heuristic_modifiers.get_modifier_codes()]
+                modifiers_summary = f"+{'+'.join(modifier_codes)}"
+
+            self.plugin.log(
+                f"FEE: {channel_id[:12]}... {current_fee_ppm}->{new_fee_ppm}ppm "
+                f"[{fee_reason_code}{modifiers_summary}] "
+                f"step:{original_step_ppm}->{step_ppm} | {decision_reason}",
+                level='info'
+            )
+
             return FeeAdjustment(
                 channel_id=channel_id,
                 peer_id=peer_id,
@@ -5642,13 +5850,17 @@ class HillClimbingFeeController:
                     "step_ppm": step_ppm,
                     "consecutive_same_direction": hc_state.consecutive_same_direction,
                     "volatility_reset": volatility_reset
-                }
+                },
+                reason_code=fee_reason_code,
+                heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None
             )
-        
+
         return None
     
     def set_channel_fee(self, channel_id: str, fee_ppm: int,
-                       reason: str = "manual", manual: bool = False) -> Dict[str, Any]:
+                       reason: str = "manual", manual: bool = False,
+                       reason_code: Optional[str] = None,
+                       heuristic_modifiers: Optional[HeuristicModifiers] = None) -> Dict[str, Any]:
         """
         Set the fee for a channel, handling clboss override.
 
@@ -5664,6 +5876,8 @@ class HillClimbingFeeController:
             fee_ppm: New fee in parts per million
             reason: Explanation for the change
             manual: True if manually triggered (vs automatic)
+            reason_code: Structured FeeReasonCode value (for explainability)
+            heuristic_modifiers: HeuristicModifiers applied (for explainability)
 
         Returns:
             Result dict with success status and details
@@ -5771,14 +5985,16 @@ class HillClimbingFeeController:
                 self.plugin.log(f"Fee verification failed: {verify_err}", level='warn')
                 # Don't fail on verification errors - fee may have been set correctly
 
-            # Step 3: Record the change
+            # Step 3: Record the change with explainability data
             self.database.record_fee_change(
                 channel_id=channel_id,
                 peer_id=peer_id,
                 old_fee_ppm=old_fee_ppm,
                 new_fee_ppm=fee_ppm,
                 reason=reason,
-                manual=manual
+                manual=manual,
+                reason_code=reason_code,
+                heuristic_modifiers=heuristic_modifiers.to_json() if heuristic_modifiers else None
             )
             
             result["success"] = True
@@ -6064,10 +6280,137 @@ class HillClimbingFeeController:
             v2_state_json=v2_json_str
         )
     
+    # =========================================================================
+    # Heuristic Helper Methods
+    # =========================================================================
+
+    def _get_channel_age_days(self, channel_id: str, channel_info: Dict[str, Any]) -> int:
+        """
+        Get channel age in days.
+
+        Args:
+            channel_id: Channel short ID
+            channel_info: Channel info dict (may contain funding_txid for lookup)
+
+        Returns:
+            Channel age in days (defaults to 365 if unknown)
+        """
+        try:
+            # Check if we have open timestamp in database
+            cost_record = self.database.get_channel_open_cost(channel_id)
+            if cost_record:
+                # The database stores the open timestamp
+                conn = self.database._get_connection()
+                row = conn.execute(
+                    "SELECT opened_at FROM channel_costs WHERE channel_id = ?",
+                    (channel_id,)
+                ).fetchone()
+                if row and row["opened_at"]:
+                    age_seconds = int(time.time()) - row["opened_at"]
+                    return max(0, age_seconds // 86400)
+
+            # Fallback: Try to get from channel_info if it has open timestamp
+            open_timestamp = channel_info.get("open_timestamp", 0)
+            if open_timestamp > 0:
+                age_seconds = int(time.time()) - open_timestamp
+                return max(0, age_seconds // 86400)
+
+            # If we can't determine age, assume mature channel (365 days)
+            # This prevents false positives on channels we can't date
+            return 365
+
+        except Exception as e:
+            self.plugin.log(f"Error getting channel age for {channel_id}: {e}", level='debug')
+            return 365  # Assume mature on error
+
+    def _get_fee_volatility(self, channel_id: str) -> float:
+        """
+        Calculate fee volatility as coefficient of variation (stddev/mean).
+
+        High volatility suggests unstable market conditions or poor signal quality.
+
+        Args:
+            channel_id: Channel short ID
+
+        Returns:
+            Volatility ratio (0.0 = no volatility, 1.0 = high volatility)
+        """
+        try:
+            # Get recent fee changes for this channel
+            fee_changes = self.database.get_recent_fee_changes(limit=20, channel_id=channel_id)
+
+            if len(fee_changes) < 5:
+                return 0.0  # Not enough data
+
+            # Extract fee values
+            fees = [fc.get("new_fee_ppm", 0) for fc in fee_changes]
+            fees = [f for f in fees if f > 0]
+
+            if len(fees) < 5:
+                return 0.0
+
+            # Calculate mean and standard deviation
+            mean_fee = sum(fees) / len(fees)
+            if mean_fee <= 0:
+                return 0.0
+
+            variance = sum((f - mean_fee) ** 2 for f in fees) / len(fees)
+            std_dev = variance ** 0.5
+
+            # Coefficient of variation
+            volatility = std_dev / mean_fee
+
+            return min(2.0, volatility)  # Cap at 2.0 to prevent extreme values
+
+        except Exception as e:
+            self.plugin.log(f"Error calculating fee volatility for {channel_id}: {e}", level='debug')
+            return 0.0
+
+    def _get_channel_failure_rate(self, channel_id: str) -> float:
+        """
+        Get routing failure rate for a channel.
+
+        High failure rate suggests the channel may have reliability issues
+        that affect fee signal quality.
+
+        Args:
+            channel_id: Channel short ID
+
+        Returns:
+            Failure rate (0.0 = no failures, 1.0 = all failures)
+        """
+        try:
+            # Check if we have failure tracking
+            fail_count, last_fail = self.database.get_failure_count(channel_id)
+
+            if fail_count == 0:
+                return 0.0
+
+            # Get forward count for this channel
+            forward_count = self.database.get_forward_count_since(
+                channel_id,
+                int(time.time()) - 86400 * 7  # Last 7 days
+            )
+
+            if forward_count == 0:
+                # No forwards but has failures = 100% failure rate
+                return 1.0 if fail_count > 0 else 0.0
+
+            # Calculate failure rate (failures / total attempts)
+            # Total attempts = forwards + failures
+            total_attempts = forward_count + fail_count
+            failure_rate = fail_count / total_attempts
+
+            return min(1.0, failure_rate)
+
+        except Exception as e:
+            self.plugin.log(f"Error getting failure rate for {channel_id}: {e}", level='debug')
+            return 0.0
+
     def _get_channels_info(self) -> Dict[str, Dict[str, Any]]:
         """
         Get current info for all channels.
-        
+
         Returns:
             Dict mapping channel_id to channel info
         """
