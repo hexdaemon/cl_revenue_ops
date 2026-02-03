@@ -4590,6 +4590,7 @@ class HillClimbingFeeController:
         new_fee_ppm = 0
         target_found = False
         is_cold_start = False  # Initialize here; may be set True in Hill Climbing branch
+        heuristic_modifiers = HeuristicModifiers()  # Initialize early; populated in Hill Climbing branch
 
         # Priority 1: Congestion (Emergency High Fee)
         if is_congested:
