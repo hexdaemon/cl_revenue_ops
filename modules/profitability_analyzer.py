@@ -265,6 +265,74 @@ class ChannelProfitability:
         }
 
 
+# =============================================================================
+# BLEEDER DETECTION (Enhanced)
+# =============================================================================
+# Bleeders are channels where rebalancing costs exceed the revenue they generate.
+# This module classifies channels into hard, soft, or none based on 7d and 30d
+# profitability windows to enable smarter rebalancing decisions.
+# =============================================================================
+
+@dataclass
+class BleederClassification:
+    """
+    Enhanced bleeder classification for a channel.
+
+    Bleeder Types:
+    - HARD: Rebalance cost > 2x revenue AND net_profit_30d < -1000 sats
+            These channels are structurally unprofitable and should NOT be rebalanced.
+    - SOFT: net_profit_7d < 0 BUT net_profit_30d > 0
+            These channels have short-term losses but long-term gains.
+            Reduce rebalancing but don't disable it.
+    - NONE: Channel is not bleeding (profitable or break-even)
+
+    Attributes:
+        channel_id: Channel short ID
+        peer_id: Peer node ID
+        classification: 'hard', 'soft', or 'none'
+        reason: Human-readable explanation of classification
+        rebalance_cost_30d: Total rebalancing cost in last 30 days (sats)
+        revenue_30d: Total routing revenue in last 30 days (sats)
+        net_profit_30d: revenue_30d - rebalance_cost_30d (sats)
+        net_profit_7d: Net profit in last 7 days (sats)
+        recommended_action: 'disable_rebalance', 'reduce_rebalance', or 'monitor'
+    """
+    channel_id: str
+    peer_id: str
+    classification: str  # 'hard', 'soft', 'none'
+    reason: str
+    rebalance_cost_30d: int
+    revenue_30d: int
+    net_profit_30d: int
+    net_profit_7d: int
+    recommended_action: str  # 'disable_rebalance', 'reduce_rebalance', 'monitor'
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "channel_id": self.channel_id,
+            "peer_id": self.peer_id,
+            "classification": self.classification,
+            "reason": self.reason,
+            "rebalance_cost_30d": self.rebalance_cost_30d,
+            "revenue_30d": self.revenue_30d,
+            "net_profit_30d": self.net_profit_30d,
+            "net_profit_7d": self.net_profit_7d,
+            "recommended_action": self.recommended_action
+        }
+
+    @property
+    def is_hard_bleeder(self) -> bool:
+        return self.classification == "hard"
+
+    @property
+    def is_soft_bleeder(self) -> bool:
+        return self.classification == "soft"
+
+    @property
+    def is_bleeder(self) -> bool:
+        return self.classification in ("hard", "soft")
+
+
 class ChannelProfitabilityAnalyzer:
     """
     Analyzes channel profitability for informed fee and rebalancing decisions.
@@ -1262,6 +1330,136 @@ class ChannelProfitabilityAnalyzer:
             self.plugin.log(f"Error identifying bleeders: {e}", level='error')
 
         return bleeders
+
+    def identify_bleeders_v2(self, window_days: int = 30) -> List[BleederClassification]:
+        """
+        Enhanced bleeder detection with hard/soft classification.
+
+        This method provides structured bleeder classifications for the rebalancer
+        to make smarter decisions about which channels to skip or reduce allocation.
+
+        Classification Criteria:
+        - HARD BLEEDER: rebalance_cost_30d > revenue_30d * 2 AND net_profit_30d < -1000
+          These channels are structurally unprofitable. Rebalancing is DISABLED.
+
+        - SOFT BLEEDER: net_profit_7d < 0 AND net_profit_30d > 0
+          These channels have short-term losses but long-term gains.
+          Rebalancing allocation is REDUCED (not disabled).
+
+        - NONE: Channel is not bleeding (profitable or break-even)
+          Normal rebalancing behavior applies.
+
+        Args:
+            window_days: Time window for 30-day analysis (default 30, minimum 7)
+
+        Returns:
+            List of BleederClassification objects for all channels
+        """
+        # Validate window_days (need at least 7 days for 7d comparison)
+        if window_days < 7:
+            window_days = 30
+
+        classifications = []
+
+        try:
+            # Get all active channels
+            channels = self._get_all_channels()
+
+            for channel_id, info in channels.items():
+                peer_id = info.get('peer_id', '')
+
+                # Get 30-day P&L
+                pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days)
+
+                # Get 7-day P&L for soft bleeder detection
+                pnl_7d = self.database.get_channel_full_pnl(channel_id, 7)
+
+                # Extract metrics
+                rebalance_cost_30d = pnl_30d['rebalance_cost_sats']
+                revenue_30d = pnl_30d['total_contribution_sats']
+                net_profit_30d = pnl_30d['net_pnl_sats']
+                net_profit_7d = pnl_7d['net_pnl_sats']
+
+                # Classify the channel
+                classification = "none"
+                reason = "Channel is profitable or break-even"
+                recommended_action = "monitor"
+
+                # Check for HARD BLEEDER first (most severe)
+                # Condition: rebal_cost > 2x revenue AND net_profit < -1000 sats
+                if (rebalance_cost_30d > revenue_30d * 2 and
+                        net_profit_30d < -1000):
+                    classification = "hard"
+                    reason = (f"Rebalance cost ({rebalance_cost_30d} sats) exceeds "
+                              f"2x revenue ({revenue_30d * 2} sats), net loss {net_profit_30d} sats")
+                    recommended_action = "disable_rebalance"
+
+                # Check for SOFT BLEEDER (short-term loss, long-term gain)
+                # Condition: 7d negative AND 30d positive
+                elif net_profit_7d < 0 and net_profit_30d > 0:
+                    classification = "soft"
+                    reason = (f"Short-term loss (7d: {net_profit_7d} sats) but "
+                              f"long-term gain (30d: {net_profit_30d} sats)")
+                    recommended_action = "reduce_rebalance"
+
+                # Check for sustained bleeding (both windows negative)
+                elif net_profit_30d < 0 and net_profit_7d < 0:
+                    # Both windows negative - check severity
+                    if abs(net_profit_30d) > 1000:
+                        classification = "hard"
+                        reason = (f"Sustained losses: 7d={net_profit_7d} sats, "
+                                  f"30d={net_profit_30d} sats")
+                        recommended_action = "disable_rebalance"
+                    else:
+                        classification = "soft"
+                        reason = (f"Minor sustained losses: 7d={net_profit_7d} sats, "
+                                  f"30d={net_profit_30d} sats")
+                        recommended_action = "reduce_rebalance"
+
+                classifications.append(BleederClassification(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    classification=classification,
+                    reason=reason,
+                    rebalance_cost_30d=rebalance_cost_30d,
+                    revenue_30d=revenue_30d,
+                    net_profit_30d=net_profit_30d,
+                    net_profit_7d=net_profit_7d,
+                    recommended_action=recommended_action
+                ))
+
+            # Log summary
+            hard_count = sum(1 for c in classifications if c.is_hard_bleeder)
+            soft_count = sum(1 for c in classifications if c.is_soft_bleeder)
+            if hard_count > 0 or soft_count > 0:
+                self.plugin.log(
+                    f"BLEEDER_DETECTION: {hard_count} hard, {soft_count} soft bleeders "
+                    f"out of {len(classifications)} channels",
+                    level='info'
+                )
+
+        except Exception as e:
+            self.plugin.log(f"Error in identify_bleeders_v2: {e}", level='error')
+
+        return classifications
+
+    def get_bleeder_status(self, channel_id: str) -> Optional[BleederClassification]:
+        """
+        Get bleeder classification for a single channel.
+
+        Convenience method for the rebalancer to check a specific channel.
+
+        Args:
+            channel_id: Channel short ID
+
+        Returns:
+            BleederClassification or None if channel not found
+        """
+        classifications = self.identify_bleeders_v2()
+        for c in classifications:
+            if c.channel_id == channel_id:
+                return c
+        return None
 
     def calculate_roc(self, window_days: int = 30) -> Dict[str, Any]:
         """

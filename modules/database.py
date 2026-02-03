@@ -706,6 +706,39 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # =================================================================
+        # EXPLAINABILITY MIGRATIONS: Reason codes and heuristic modifiers
+        # =================================================================
+        # These columns enable structured decision explanations for debugging,
+        # auditing, and fleet-wide analysis of fee and rebalance behavior.
+        # =================================================================
+
+        # fee_changes table: Add reason_code and heuristic_modifiers columns
+        try:
+            conn.execute("ALTER TABLE fee_changes ADD COLUMN reason_code TEXT")
+            self.plugin.log("Added reason_code column to fee_changes")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            conn.execute("ALTER TABLE fee_changes ADD COLUMN heuristic_modifiers TEXT")
+            self.plugin.log("Added heuristic_modifiers column to fee_changes")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # rebalance_history table: Add reason_code and bleeder_status columns
+        try:
+            conn.execute("ALTER TABLE rebalance_history ADD COLUMN reason_code TEXT")
+            self.plugin.log("Added reason_code column to rebalance_history")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            conn.execute("ALTER TABLE rebalance_history ADD COLUMN bleeder_status TEXT")
+            self.plugin.log("Added bleeder_status column to rebalance_history")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # v1.4 Migration: Migrate ignored_peers to peer_policies
         # This migrates legacy "ignored" peers to the new policy system
         self._migrate_ignored_peers_to_policies(conn)
@@ -1184,16 +1217,32 @@ class Database:
     # =========================================================================
     
     def record_fee_change(self, channel_id: str, peer_id: str, old_fee_ppm: int,
-                          new_fee_ppm: int, reason: str, manual: bool = False):
-        """Record a fee change for audit purposes."""
+                          new_fee_ppm: int, reason: str, manual: bool = False,
+                          reason_code: Optional[str] = None,
+                          heuristic_modifiers: Optional[str] = None):
+        """
+        Record a fee change for audit purposes.
+
+        Args:
+            channel_id: Channel short ID
+            peer_id: Peer node ID
+            old_fee_ppm: Previous fee in PPM
+            new_fee_ppm: New fee in PPM
+            reason: Human-readable reason string
+            manual: True if this was a manual change (not algorithmic)
+            reason_code: Structured FeeReasonCode value (for explainability)
+            heuristic_modifiers: JSON string of HeuristicModifiers (for explainability)
+        """
         conn = self._get_connection()
         now = int(time.time())
-        
+
         conn.execute("""
-            INSERT INTO fee_changes 
-            (channel_id, peer_id, old_fee_ppm, new_fee_ppm, reason, manual, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (channel_id, peer_id, old_fee_ppm, new_fee_ppm, reason, 1 if manual else 0, now))
+            INSERT INTO fee_changes
+            (channel_id, peer_id, old_fee_ppm, new_fee_ppm, reason, manual, timestamp,
+             reason_code, heuristic_modifiers)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (channel_id, peer_id, old_fee_ppm, new_fee_ppm, reason, 1 if manual else 0, now,
+              reason_code, heuristic_modifiers))
     
     def get_recent_fee_changes(self, limit: int = 10, channel_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get recent fee changes, optionally filtered by channel."""
@@ -1222,10 +1271,27 @@ class Database:
     def record_rebalance(self, from_channel: str, to_channel: str, amount_sats: int,
                          max_fee_sats: int, expected_profit_sats: int,
                          status: str = 'pending', **kwargs) -> int:
-        """Record a rebalance attempt and return its ID."""
+        """
+        Record a rebalance attempt and return its ID.
+
+        Args:
+            from_channel: Source channel SCID
+            to_channel: Destination channel SCID
+            amount_sats: Amount to rebalance in satoshis
+            max_fee_sats: Maximum fee budget in satoshis
+            expected_profit_sats: Expected profit from the rebalance
+            status: Initial status ('pending', 'success', 'failed')
+            **kwargs:
+                rebalance_type: Type of rebalance ('normal', 'diagnostic')
+                reason_code: Structured RebalanceReasonCode value (for explainability)
+                bleeder_status: Bleeder classification ('hard', 'soft', 'none')
+
+        Returns:
+            Database row ID for the rebalance record
+        """
         conn = self._get_connection()
         now = int(time.time())
-        
+
         params = {
             'from_channel': from_channel,
             'to_channel': to_channel,
@@ -1234,17 +1300,19 @@ class Database:
             'expected_profit_sats': expected_profit_sats,
             'status': status,
             'rebalance_type': kwargs.get('rebalance_type', 'normal'),
+            'reason_code': kwargs.get('reason_code'),
+            'bleeder_status': kwargs.get('bleeder_status'),
             'timestamp': now
         }
 
         cursor = conn.execute("""
-            INSERT INTO rebalance_history 
+            INSERT INTO rebalance_history
             (from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats,
-             status, rebalance_type, timestamp)
-            VALUES (:from_channel, :to_channel, :amount_sats, :max_fee_sats, :expected_profit_sats, 
-                    :status, :rebalance_type, :timestamp)
+             status, rebalance_type, reason_code, bleeder_status, timestamp)
+            VALUES (:from_channel, :to_channel, :amount_sats, :max_fee_sats, :expected_profit_sats,
+                    :status, :rebalance_type, :reason_code, :bleeder_status, :timestamp)
         """, params)
-        
+
         return cursor.lastrowid
     
     def update_rebalance_result(self, rebalance_id: int, status: str,

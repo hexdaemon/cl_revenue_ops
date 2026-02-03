@@ -46,6 +46,39 @@ class JobStatus(Enum):
     STOPPED = "stopped"
 
 
+# =============================================================================
+# REASON CODES FOR EXPLAINABILITY
+# =============================================================================
+# Structured reason codes for rebalance decisions. These codes enable
+# debugging, auditing, and fleet-wide analysis of rebalancer behavior.
+# =============================================================================
+
+class RebalanceReasonCode(Enum):
+    """
+    Structured reason codes for rebalance decisions.
+
+    Categories:
+    - Success codes: Why a rebalance was attempted
+    - Skip codes: Why a channel was skipped for rebalancing
+    """
+    # Success codes (rebalance was attempted)
+    EV_POSITIVE = "ev_positive"                   # Normal EV-positive rebalance
+
+    # Skip codes (rebalance was not attempted)
+    SKIP_HARD_BLEEDER = "skip_hard_bleeder"       # Channel is a hard bleeder (rebal_cost > 2x revenue)
+    SKIP_SOFT_BLEEDER = "skip_soft_bleeder"       # Channel is a soft bleeder (7d negative, 30d positive)
+    SKIP_NO_SOURCE = "skip_no_source"             # No profitable source channel found
+    SKIP_EV_NEGATIVE = "skip_ev_negative"         # Expected value is negative
+    SKIP_COOLDOWN = "skip_cooldown"               # Channel is in rebalance cooldown period
+    SKIP_POLICY_DISABLED = "skip_policy_disabled" # Rebalancing disabled by policy
+    SKIP_FUTILITY_BREAKER = "skip_futility_breaker"  # Too many consecutive failures
+    SKIP_ZOMBIE = "skip_zombie"                   # Channel classified as zombie
+    SKIP_UNDERWATER = "skip_underwater"           # Channel is underwater with negative marginal ROI
+    SKIP_SINK = "skip_sink"                       # Channel is a sink (filling for free)
+    SKIP_CONGESTED = "skip_congested"             # Channel is HTLC congested
+    SKIP_UNSTABLE_PEER = "skip_unstable_peer"     # Peer has low uptime
+
+
 @dataclass
 class RebalanceCandidate:
     """A candidate for rebalancing with multi-source support."""
@@ -68,18 +101,22 @@ class RebalanceCandidate:
     dest_flow_state: str
     dest_turnover_rate: float
     source_turnover_rate: float  # Turnover rate of the primary source
-    
+
+    # Explainability fields
+    reason_code: str = RebalanceReasonCode.EV_POSITIVE.value  # Why this rebalance was approved
+    bleeder_status: str = "none"  # 'hard', 'soft', or 'none'
+
     # Backwards compatibility property
     @property
     def from_channel(self) -> str:
         """Returns the primary (best) source channel for backwards compatibility."""
         return self.source_candidates[0] if self.source_candidates else ""
-    
+
     @property
     def from_peer_id(self) -> str:
         """Returns the primary source peer ID for backwards compatibility."""
         return self.primary_source_peer_id
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "source_candidates": self.source_candidates,
@@ -102,7 +139,9 @@ class RebalanceCandidate:
             "dest_flow_state": self.dest_flow_state,
             "dest_turnover_rate": round(self.dest_turnover_rate, 4),
             "source_turnover_rate": round(self.source_turnover_rate, 4),
-            "num_source_candidates": len(self.source_candidates)
+            "num_source_candidates": len(self.source_candidates),
+            "reason_code": self.reason_code,
+            "bleeder_status": self.bleeder_status
         }
 
 
@@ -1404,16 +1443,58 @@ class EVRebalancer:
                 )
                 return None
         
+        # Track bleeder status for explainability (default to "none")
+        dest_bleeder_status = "none"
+
         # Check profitability logic
         if self._profitability_analyzer:
             try:
                 prof = self._profitability_analyzer.analyze_channel(dest_channel)
-                if prof and prof.classification.value == "zombie": 
+                if prof and prof.classification.value == "zombie":
+                    self.plugin.log(
+                        f"REBAL_SKIP: {dest_channel[:12]}... [{RebalanceReasonCode.SKIP_ZOMBIE.value}]",
+                        level='debug'
+                    )
                     return None
                 if prof and prof.classification.value == "underwater" and prof.marginal_roi <= 0:
+                    self.plugin.log(
+                        f"REBAL_SKIP: {dest_channel[:12]}... [{RebalanceReasonCode.SKIP_UNDERWATER.value}] "
+                        f"marginal_roi={prof.marginal_roi:.2f}",
+                        level='debug'
+                    )
                     return None
-            except Exception: 
-                pass
+
+                # =============================================================
+                # BLEEDER DETECTION CHECK (Enhanced)
+                # =============================================================
+                # Check for bleeder status using the v2 detection
+                # - Hard bleeders: Skip entirely (rebalancing disabled)
+                # - Soft bleeders: Log but continue with reduced priority
+                # =============================================================
+                bleeder_check = self._profitability_analyzer.get_bleeder_status(dest_channel)
+                if bleeder_check:
+                    dest_bleeder_status = bleeder_check.classification
+
+                    if bleeder_check.is_hard_bleeder:
+                        self.plugin.log(
+                            f"REBAL_SKIP: {dest_channel[:12]}... [{RebalanceReasonCode.SKIP_HARD_BLEEDER.value}] "
+                            f"rebal_cost={bleeder_check.rebalance_cost_30d} > 2x revenue={bleeder_check.revenue_30d}, "
+                            f"net={bleeder_check.net_profit_30d}",
+                            level='info'
+                        )
+                        return None
+
+                    # Soft bleeders get logged but continue with normal flow
+                    # (amount reduction happens later in the flow)
+                    if bleeder_check.is_soft_bleeder:
+                        self.plugin.log(
+                            f"REBAL_WARN: {dest_channel[:12]}... soft bleeder detected - "
+                            f"7d={bleeder_check.net_profit_7d}, 30d={bleeder_check.net_profit_30d}",
+                            level='debug'
+                        )
+
+            except Exception as e:
+                self.plugin.log(f"Error checking profitability for {dest_channel}: {e}", level='debug')
 
         capacity = dest_info.get("capacity", 0)
         spendable = dest_info.get("spendable_sats", 0)
@@ -1751,7 +1832,9 @@ class EVRebalancer:
             liquidity_ratio=dest_ratio,
             dest_flow_state=dest_flow_state,
             dest_turnover_rate=dest_turnover_rate,
-            source_turnover_rate=source_turnover_rate
+            source_turnover_rate=source_turnover_rate,
+            reason_code=RebalanceReasonCode.EV_POSITIVE.value,
+            bleeder_status=dest_bleeder_status
         )
 
     def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
@@ -2347,7 +2430,9 @@ class EVRebalancer:
                 db_max_fee,
                 db_profit,
                 'pending',
-                rebalance_type=kwargs.get('rebalance_type', 'normal')
+                rebalance_type=kwargs.get('rebalance_type', 'normal'),
+                reason_code=candidate.reason_code,
+                bleeder_status=candidate.bleeder_status
             )
 
             # CRITICAL-01 FIX: Atomic budget reservation
