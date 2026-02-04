@@ -176,8 +176,10 @@ revenue-ops-hive-enabled=auto   # Auto-detect (default)
 | Python 3.8+ | Required | |
 | **sling plugin** | **Required** | Rebalancing engine |
 | bookkeeper plugin | Recommended | Accurate cost tracking |
-| CLBoss | Optional | Base node management |
+| CLBoss | **Included** | Base node management (enabled by default in Docker) |
 | cl-hive | Optional | Fleet coordination |
+
+> **Docker Note:** The [cl-hive-node](https://github.com/lightning-goats/cl-hive) Docker image includes CLBoss enabled by default. To disable, set `CLBOSS_ENABLED=false` in your environment.
 
 ### Install Steps
 
@@ -336,9 +338,13 @@ All options can be set in your CLN config file or via `revenue-config set`.
 
 ### CLBoss Integration
 
+CLBoss provides automated channel management including peer selection, channel opens, and base fee management. cl-revenue-ops integrates with CLBoss to coordinate fee decisions and avoid conflicts.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `revenue-ops-clboss-enabled` | `true` | Enable CLBoss integration |
+
+**Docker Image:** CLBoss is installed and enabled by default in the cl-hive-node Docker image. Set `CLBOSS_ENABLED=false` in your environment to disable it.
 
 ### RPC Settings
 
