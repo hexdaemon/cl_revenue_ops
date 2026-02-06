@@ -11,6 +11,14 @@ Goal:
 - Improve maintainability (reduce monolith functions; make decisions testable)
 - Improve operability (clear diagnostics, consistent reason codes, better logging)
 
+Status (2026-02-06):
+- Implemented the P0/P1 fixes in `modules/rebalancer.py` and added regression tests in `tests/test_rebalancer_module.py`.
+- Budget reservations are no longer leaked on dry-run or job start failure, and are released on exceptions when the job did not start.
+- Multi-source CLBoss unmanage now uses per-source peer IDs via `RebalanceCandidate.source_candidate_peer_ids`.
+- Manual rebalances bypass budget reservations (fees still recorded).
+- Job monitoring hoists `listfunds` and can treat Sling stat success signals as success even when balance deltas are masked.
+- `_get_last_hop_fee()` now returns ppm-only (base fee converted to ppm using `amount_msat`).
+
 
 ## Current Design (As Implemented)
 
@@ -228,4 +236,3 @@ Acceptance:
 1. Should `hive_rebalance_tolerance` apply only to hive-member destinations, or globally as a “keep depleted channels alive” control?
 2. Can Sling report the exact source used in multi-source jobs? If yes, we should persist it to `rebalance_history` for accurate learning.
 3. Do we want to reserve budget based on `max_budget_sats` (worst-case) or a smaller percentile budget with runtime abort at spend threshold (already partially implemented in `JobManager`)? The current design is conservative but reduces throughput when uncertainty is high.
-

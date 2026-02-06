@@ -106,6 +106,10 @@ class RebalanceCandidate:
     reason_code: str = RebalanceReasonCode.EV_POSITIVE.value  # Why this rebalance was approved
     bleeder_status: str = "none"  # 'hard', 'soft', or 'none'
 
+    # Multi-source peer IDs aligned with source_candidates (best-first).
+    # Optional for backward compatibility; when absent, callers may fall back to primary_source_peer_id.
+    source_candidate_peer_ids: List[str] = field(default_factory=list)
+
     # Backwards compatibility property
     @property
     def from_channel(self) -> str:
@@ -120,6 +124,7 @@ class RebalanceCandidate:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "source_candidates": self.source_candidates,
+            "source_candidate_peer_ids": self.source_candidate_peer_ids,
             "from_channel": self.from_channel,  # Primary source for backwards compat
             "to_channel": self.to_channel,
             "from_peer_id": self.primary_source_peer_id,
@@ -546,6 +551,9 @@ class JobManager:
         
         # Get sling stats for all jobs
         sling_stats = self._get_sling_stats()
+
+        # Hoist listfunds to avoid N+1 RPC calls (per-job balance checks).
+        local_balances = self._get_local_balances_map()
         
         # Copy keys to avoid modifying dict during iteration
         job_scids = list(self._active_jobs.keys())
@@ -565,8 +573,10 @@ class JobManager:
                 continue
             
             # Check current channel balance for progress
-            current_balance = self._get_channel_local_balance(job.scid_normalized)
-            amount_transferred = current_balance - job.initial_local_sats
+            current_balance = local_balances.get(job.scid_normalized)
+            if current_balance is None:
+                current_balance = self._get_channel_local_balance(job.scid_normalized)
+            balance_delta = current_balance - job.initial_local_sats
             
             # Get job-specific stats from sling
             job_stats = sling_stats.get(job.scid, {})
@@ -582,9 +592,28 @@ class JobManager:
                 summary["failed"] += 1
                 continue
             
-            # Check for success: any positive transfer means we've achieved something
-            if amount_transferred > 0:
+            # Check for success:
+            # - Prefer sling stats when they provide explicit success signals (less fragile than balance deltas,
+            #   which can be masked by concurrent forwarding).
+            # - Fallback to positive balance delta if stats don't expose success.
+            stats_success_amount = self._extract_success_amount_sats(job_stats)
+            stats_success_count = self._extract_success_count(job_stats)
+            if stats_success_amount is not None and stats_success_amount > 0:
+                amount_transferred = max(balance_delta, stats_success_amount)
                 self._handle_job_success(job, amount_transferred, job_stats)
+                summary["completed"] += 1
+                continue
+            if stats_success_count > 0:
+                amount_transferred = balance_delta
+                if amount_transferred <= 0:
+                    # We know at least one payment succeeded, but local balance may not reflect it due to
+                    # concurrent routing. Use the job's intended chunk as a conservative proxy.
+                    amount_transferred = max(1, int(job.target_amount_sats or 0))
+                self._handle_job_success(job, amount_transferred, job_stats)
+                summary["completed"] += 1
+                continue
+            if balance_delta > 0:
+                self._handle_job_success(job, balance_delta, job_stats)
                 summary["completed"] += 1
                 continue
             
@@ -598,11 +627,118 @@ class JobManager:
             summary["still_running"] += 1
             self.plugin.log(
                 f"Job {job.scid} running: {elapsed}s elapsed, "
-                f"transferred={amount_transferred} sats",
+                f"transferred={balance_delta} sats",
                 level='debug'
             )
         
         return summary
+
+    def _get_local_balances_map(self) -> Dict[str, int]:
+        """Return a map of normalized scid -> local balance sats (single listfunds call)."""
+        balances: Dict[str, int] = {}
+        try:
+            listfunds = self.plugin.rpc.listfunds()
+            for channel in listfunds.get("channels", []):
+                scid = channel.get("short_channel_id", "")
+                if not scid:
+                    continue
+                our_amount_msat = channel.get("our_amount_msat", 0)
+                if isinstance(our_amount_msat, str):
+                    our_amount_msat = int(our_amount_msat.replace("msat", ""))
+                balances[self._normalize_scid(scid)] = int(our_amount_msat) // 1000
+        except Exception as e:
+            self.plugin.log(f"Error preloading channel balances: {e}", level='debug')
+        return balances
+
+    def _parse_msat(self, v: Any) -> int:
+        if v is None:
+            return 0
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s.endswith("msat"):
+                s = s[:-4]
+            try:
+                return int(s)
+            except Exception:
+                return 0
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+    def _parse_sats(self, v: Any) -> int:
+        if v is None:
+            return 0
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s.endswith("sat"):
+                s = s[:-3]
+            try:
+                return int(s)
+            except Exception:
+                return 0
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+    def _extract_success_amount_sats(self, stats: Dict[str, Any]) -> Optional[int]:
+        """
+        Best-effort extraction of how much has been successfully transferred.
+
+        Sling stats schemas can vary by version. We look for a small set of plausible
+        keys and return None if we can't find a signal.
+        """
+        if not stats:
+            return None
+
+        # Try msat-based totals first.
+        for k in (
+            "success_total_msat",
+            "successful_total_msat",
+            "success_amount_msat",
+            "successful_amount_msat",
+            "amount_success_msat",
+            "sent_success_msat",
+            "total_sent_msat",
+        ):
+            if k in stats:
+                msat = self._parse_msat(stats.get(k))
+                if msat > 0:
+                    return msat // 1000
+
+        # Then sats-based totals.
+        for k in (
+            "success_total_sats",
+            "successful_total_sats",
+            "success_amount_sats",
+            "successful_amount_sats",
+            "amount_success_sats",
+            "total_sent_sats",
+        ):
+            if k in stats:
+                sats = self._parse_sats(stats.get(k))
+                if sats > 0:
+                    return sats
+
+        return None
+
+    def _extract_success_count(self, stats: Dict[str, Any]) -> int:
+        if not stats:
+            return 0
+        for k in (
+            "success_count",
+            "successful_payments",
+            "payments_successful",
+            "successes",
+            "completed_payments",
+            "completed",
+        ):
+            if k in stats:
+                n = self._parse_sats(stats.get(k))
+                if n > 0:
+                    return n
+        return 0
     
     def _get_sling_stats(self) -> Dict[str, Dict[str, Any]]:
         """Query sling-stats for all jobs and return as dict keyed by SCID."""
@@ -1229,7 +1365,7 @@ class EVRebalancer:
         candidates = []
 
         # Initialize ephemeral fee cache for this run (cleared at end)
-        self._fee_cache: Dict[str, Optional[int]] = {}
+        self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}
 
         # Thread-safe config snapshot for this rebalance cycle
         cfg = self.config.snapshot()
@@ -1694,15 +1830,20 @@ class EVRebalancer:
         weighted_opp_cost = primary_opp_cost
         spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
         
-        # Allow slightly negative spread up to configured tolerance.
-        # A depleted channel earns nothing — small loss on rebalance is worth it.
-        tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
-        if spread_ppm < -tolerance_ppm:
-            return None
+        # Allow slightly negative spread only for hive destinations (strategic).
+        # For non-hive peers we require non-negative spread to avoid consistent leakage.
+        if is_hive_destination:
+            tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(rebalance_amount, 1))
+            if spread_ppm < -tolerance_ppm:
+                return None
+        else:
+            if spread_ppm < 0:
+                return None
+            tolerance_ppm = 0
 
-        # When spread is negative (within tolerance), budget is the tolerance amount
+        # When spread is negative (within tolerance, hive only), budget is the tolerance amount
         # we're willing to spend. When positive, budget is the spread itself.
-        effective_spread_ppm = max(1, spread_ppm) if spread_ppm > 0 else tolerance_ppm
+        effective_spread_ppm = max(1, spread_ppm) if spread_ppm > 0 else max(1, tolerance_ppm)
         raw_budget_msat = (effective_spread_ppm * amount_msat) // 1_000_000
         # ZERO-TOLERANCE: Avoid a zero-sats budget due to integer truncation.
         # We clamp to at least 1 sat (1000 msat). This is conservative: it makes EV slightly worse,
@@ -1784,25 +1925,22 @@ class EVRebalancer:
             # - Thriving (0.75x): threshold becomes 133% -> require higher profit
             profit_threshold = int(profit_threshold / nnlb_multiplier)
 
-        # Allow negative profit (cost) up to tolerance to keep channels earning.
-        # A depleted channel earns nothing — small rebalance loss is worth it.
-        profit_threshold = max(profit_threshold, -(self.config.hive_rebalance_tolerance))
-
-        is_hive_transfer = False
-        if self.policy_manager:
-            dest_peer_id = dest_info.get("peer_id", "")
-            if dest_peer_id:
-                policy = self.policy_manager.get_policy(dest_peer_id)
-                if policy.strategy == FeeStrategy.HIVE:
-                    is_hive_transfer = True
+        is_hive_transfer = bool(is_hive_destination)
+        if is_hive_transfer:
+            # Allow negative profit (cost) up to tolerance for hive transfers (strategic).
+            # A depleted channel earns nothing — small rebalance loss is worth it for fleet coordination.
+            profit_threshold = max(profit_threshold, -(self.config.hive_rebalance_tolerance))
 
         # Check Profit against Dynamic Threshold
         if expected_profit < profit_threshold:
-            self.plugin.log(
-                f"REBALANCE SKIPPED: Profit {expected_profit} < Threshold {profit_threshold} "
-                f"(tolerance={self.config.hive_rebalance_tolerance})",
-                level='debug'
-            )
+            if is_hive_transfer:
+                msg = (
+                    f"REBALANCE SKIPPED: Profit {expected_profit} < Threshold {profit_threshold} "
+                    f"(tolerance={self.config.hive_rebalance_tolerance})"
+                )
+            else:
+                msg = f"REBALANCE SKIPPED: Profit {expected_profit} < Threshold {profit_threshold}"
+            self.plugin.log(msg, level='debug')
             return None
         
         # Log Success (Strategic override)
@@ -1834,7 +1972,8 @@ class EVRebalancer:
             dest_turnover_rate=dest_turnover_rate,
             source_turnover_rate=source_turnover_rate,
             reason_code=RebalanceReasonCode.EV_POSITIVE.value,
-            bleeder_status=dest_bleeder_status
+            bleeder_status=dest_bleeder_status,
+            source_candidate_peer_ids=[info.get("peer_id", "") for _, info, _, _ in source_candidates],
         )
 
     def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
@@ -1891,7 +2030,7 @@ class EVRebalancer:
         # =====================================================================
 
         hist_data = self.database.get_historical_inbound_fee_ppm(peer_id)
-        last_hop = self._get_last_hop_fee(peer_id)
+        last_hop = self._get_last_hop_fee(peer_id, amount_msat=amount_msat)
 
         if hist_data:
             confidence = hist_data['confidence']
@@ -1960,7 +2099,7 @@ class EVRebalancer:
         )
         return 1000
 
-    def _get_last_hop_fee(self, peer_id: str) -> Optional[int]:
+    def _get_last_hop_fee(self, peer_id: str, amount_msat: int = 100000000) -> Optional[int]:
         """
         Get the fee for the last hop from a peer to us.
         
@@ -1968,8 +2107,9 @@ class EVRebalancer:
         RPC calls within a single find_rebalance_candidates run.
         """
         # Check cache first (memoization for this run)
-        if hasattr(self, '_fee_cache') and peer_id in self._fee_cache:
-            return self._fee_cache[peer_id]
+        cache_key = (peer_id, int(amount_msat or 0))
+        if hasattr(self, '_fee_cache') and cache_key in self._fee_cache:
+            return self._fee_cache[cache_key]
         
         result = None
         try:
@@ -1979,14 +2119,18 @@ class EVRebalancer:
             channels = self.plugin.rpc.listchannels(source=peer_id)
             for ch in channels.get("channels", []):
                 if ch.get("destination") == our_id:
-                    result = ch.get("fee_per_millionth", 0) + (ch.get("base_fee_millisatoshi", 0) // 1000)
+                    ppm = int(ch.get("fee_per_millionth", 0) or 0)
+                    base_fee_msat = int(ch.get("base_fee_millisatoshi", 0) or 0)
+                    # Convert the base fee (msat) into a ppm-equivalent at amount_msat.
+                    base_ppm = int((base_fee_msat * 1_000_000) // max(int(amount_msat or 0), 1))
+                    result = ppm + base_ppm
                     break
         except Exception: 
             pass
         
         # Cache the result (even if None, to avoid re-querying)
         if hasattr(self, '_fee_cache'):
-            self._fee_cache[peer_id] = result
+            self._fee_cache[cache_key] = result
         
         return result
 
@@ -2181,10 +2325,13 @@ class EVRebalancer:
             # Calculate spread: what we earn minus what it costs
             spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
 
-            # Allow slightly negative spread to keep channels balanced and earning.
-            # A depleted channel earns nothing — small loss on rebalance is worth it.
-            tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
-            min_spread = -tolerance_ppm
+            # Allow slightly negative spread only for hive destinations (strategic).
+            # For non-hive peers we require non-negative spread to avoid consistent leakage.
+            if is_hive_destination:
+                tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
+                min_spread = -tolerance_ppm
+            else:
+                min_spread = 0
 
             # Only include sources meeting spread threshold
             if spread_ppm < min_spread:
@@ -2330,7 +2477,7 @@ class EVRebalancer:
         
         return channels
 
-    def execute_rebalance(self, candidate: RebalanceCandidate, **kwargs) -> Dict[str, Any]:
+    def execute_rebalance(self, candidate: RebalanceCandidate, enforce_budget: bool = True, **kwargs) -> Dict[str, Any]:
         """
         Execute a rebalance for the given candidate.
 
@@ -2390,38 +2537,46 @@ class EVRebalancer:
                 result["fleet_path_available"] = True
                 result["fleet_savings_pct"] = savings_pct
 
+        rebalance_id: Optional[int] = None
+        reserved_budget = False
+        job_started = False
         try:
-            # Ensure channels are unmanaged from clboss
-            # Unmanage ALL source candidates since Sling may use any of them
-            for source_scid in candidate.source_candidates:
-                # We only have peer_id for primary source, but clboss can work with just SCID
+            # Ensure channels are unmanaged from clboss.
+            # Unmanage ALL source candidates since Sling may use any of them.
+            source_peer_ids = getattr(candidate, "source_candidate_peer_ids", []) or []
+            seen_sources = set()
+            for i, source_scid in enumerate(candidate.source_candidates):
+                if source_scid in seen_sources:
+                    continue
+                seen_sources.add(source_scid)
+                peer_id = source_peer_ids[i] if i < len(source_peer_ids) and source_peer_ids[i] else candidate.primary_source_peer_id
                 self.clboss.ensure_unmanaged_for_channel(
-                    str(source_scid), str(candidate.primary_source_peer_id), 
+                    str(source_scid), str(peer_id),
                     ClbossTags.FEE_AND_BALANCE, self.database
                 )
             self.clboss.ensure_unmanaged_for_channel(
-                str(candidate.to_channel), str(candidate.to_peer_id), 
+                str(candidate.to_channel), str(candidate.to_peer_id),
                 ClbossTags.FEE_AND_BALANCE, self.database
             )
-            
-            # --- CRITICAL BUG FIX: Ensure all values are simple types for SQLite ---
+
             # Validation: Return error on empty/None channel IDs (HO-01)
             if not candidate.from_channel or not candidate.to_channel:
                 self.plugin.log(
                     f"Invalid channel IDs: from={candidate.from_channel}, to={candidate.to_channel}",
                     level='error'
                 )
+                del self._pending[candidate.to_channel]
                 return {
                     "success": False,
                     "error": "Invalid channel IDs - from_channel or to_channel is empty"
                 }
-            
+
             db_from_channel = str(candidate.from_channel)
             db_to_channel = str(candidate.to_channel)
             db_amount = int(candidate.amount_sats)
             db_max_fee = int(candidate.max_budget_sats)
             db_profit = int(candidate.expected_profit_sats)
-            
+
             # Record rebalance attempt in database using SAFE primitives
             rebalance_id = self.database.record_rebalance(
                 db_from_channel,
@@ -2435,55 +2590,63 @@ class EVRebalancer:
                 bleeder_status=candidate.bleeder_status
             )
 
-            # CRITICAL-01 FIX: Atomic budget reservation
-            # Reserve budget BEFORE starting the job to prevent concurrent overspend
-            now = int(time.time())
-            since_24h = now - 86400
-
-            # Calculate effective budget (same logic as _check_capital_controls)
-            effective_budget = cfg.daily_budget_sats
-            if cfg.enable_proportional_budget:
-                revenue_24h = self.database.get_total_routing_revenue(since_24h)
-                proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
-                effective_budget = max(cfg.daily_budget_sats, proportional_budget)
-
-            reserved, remaining = self.database.reserve_budget(
-                reservation_id=rebalance_id,
-                amount_sats=db_max_fee,
-                channel_id=db_to_channel,
-                budget_limit=effective_budget,
-                since_timestamp=since_24h
-            )
-
-            if not reserved:
-                self.database.update_rebalance_result(
-                    rebalance_id, 'failed',
-                    error_message=f"Budget exhausted: {remaining} sats remaining of {effective_budget}"
-                )
-                result["message"] = f"Budget exhausted: only {remaining} sats remaining"
-                self.plugin.log(
-                    f"CAPITAL CONTROL: Budget reservation failed for {db_to_channel}. "
-                    f"Remaining: {remaining} sats",
-                    level='warn'
-                )
-                return result
-
             if cfg.dry_run:
-                self.plugin.log(f"[DRY RUN] Would rebalance {candidate.amount_sats} sats "
-                              f"from {candidate.from_channel} to {candidate.to_channel}")
+                self.plugin.log(
+                    f"[DRY RUN] Would rebalance {candidate.amount_sats} sats "
+                    f"from {candidate.from_channel} to {candidate.to_channel}"
+                )
                 self.database.update_rebalance_result(
                     rebalance_id, 'success', 0, candidate.expected_profit_sats
                 )
+                del self._pending[candidate.to_channel]
                 return {"success": True, "message": "Dry run", "rebalance_id": rebalance_id}
+
+            if enforce_budget:
+                # CRITICAL-01 FIX: Atomic budget reservation
+                # Reserve budget BEFORE starting the job to prevent concurrent overspend.
+                now = int(time.time())
+                since_24h = now - 86400
+
+                # Calculate effective budget (same logic as _check_capital_controls)
+                effective_budget = cfg.daily_budget_sats
+                if cfg.enable_proportional_budget:
+                    revenue_24h = self.database.get_total_routing_revenue(since_24h)
+                    proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
+                    effective_budget = max(cfg.daily_budget_sats, proportional_budget)
+
+                reserved, remaining = self.database.reserve_budget(
+                    reservation_id=rebalance_id,
+                    amount_sats=db_max_fee,
+                    channel_id=db_to_channel,
+                    budget_limit=effective_budget,
+                    since_timestamp=since_24h
+                )
+                reserved_budget = bool(reserved)
+
+                if not reserved_budget:
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'failed',
+                        error_message=f"Budget exhausted: {remaining} sats remaining of {effective_budget}"
+                    )
+                    result["message"] = f"Budget exhausted: only {remaining} sats remaining"
+                    self.plugin.log(
+                        f"CAPITAL CONTROL: Budget reservation failed for {db_to_channel}. "
+                        f"Remaining: {remaining} sats",
+                        level='warn'
+                    )
+                    # Budget exhaustion is global; don't backoff a specific channel.
+                    del self._pending[candidate.to_channel]
+                    return result
 
             # Async execution via JobManager (sling background jobs)
             res = self.job_manager.start_job(candidate, rebalance_id)
-            
+
             if res.get("success"):
+                job_started = True
                 # Update DB status to pending_async
                 self.database.update_rebalance_result(rebalance_id, 'pending_async')
                 result.update({
-                    "success": True, 
+                    "success": True,
                     "message": "Async job started",
                     "rebalance_id": rebalance_id
                 })
@@ -2498,10 +2661,28 @@ class EVRebalancer:
                 )
                 result["message"] = f"Failed: {error}"
                 self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
+                if reserved_budget:
+                    self.database.release_budget_reservation(rebalance_id)
 
         except Exception as e:
             result["message"] = str(e)
             self.plugin.log(f"Execution error: {e}", level='error')
+            if rebalance_id is not None:
+                try:
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'failed', error_message=str(e)
+                    )
+                except Exception:
+                    pass
+            if reserved_budget and rebalance_id is not None and not job_started:
+                try:
+                    self.database.release_budget_reservation(rebalance_id)
+                except Exception:
+                    pass
+            try:
+                del self._pending[candidate.to_channel]
+            except Exception:
+                pass
         
         return result
 
@@ -2665,7 +2846,9 @@ class EVRebalancer:
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0
         )
-        result = self.execute_rebalance(cand, rebalance_type='manual')
+        # Manual rebalances are explicit operator actions; bypass budget reservations by design.
+        # Fees are still recorded in history and will reduce budget available for automated runs.
+        result = self.execute_rebalance(cand, rebalance_type='manual', enforce_budget=False)
 
         # Include capital controls warning in result (unless force=True)
         if not capital_ok and not force:
