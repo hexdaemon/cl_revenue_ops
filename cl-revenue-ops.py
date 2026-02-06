@@ -1905,8 +1905,9 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
             }
     
     try:
-        result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True)
-        return {"status": "success", "channel": channel_id, "new_fee_ppm": fee_ppm, **result}
+        result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True, enforce_limits=(not force))
+        applied_fee = result.get("fee_ppm", fee_ppm)
+        return {"status": "success", "channel": channel_id, "new_fee_ppm": applied_fee, **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 

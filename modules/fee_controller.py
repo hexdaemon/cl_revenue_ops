@@ -79,8 +79,11 @@ class FeeReasonCode(Enum):
     THOMPSON_SAMPLE = "thompson_sample"               # Normal Thompson posterior sample
     THOMPSON_COLD_START = "thompson_cold_start"       # Insufficient data, using prior
     THOMPSON_AIMD_DEFENSE = "thompson_aimd_defense"   # AIMD triggered fee increase
+    ZERO_FEE_PROBE = "zero_fee_probe"                 # Defibrillator 0-fee probe
+    ZERO_FEE_PROBE_SUCCESS = "zero_fee_probe_success" # Probe succeeded, exit to floor
     CONGESTION = "congestion"                         # Congestion-based fee surge
     SCARCITY = "scarcity"                             # Low outbound liquidity premium
+    GOSSIP_REFRESH = "gossip_refresh"                 # Minimal nudge to refresh channel_update
 
     # Heuristic modifiers (applied on top of algorithm decision)
     YOUNG_CHANNEL_CAP = "young_channel_cap"                   # Step capped for young channel
@@ -2650,6 +2653,11 @@ class HillClimbingFeeController:
     # Fee nudge amount (should be minimal - economically negligible)
     GOSSIP_REFRESH_NUDGE_PPM = 1
 
+    # Absolute safety bounds for operator overrides (force/manual). These are
+    # intentionally independent from configured min/max, which are economic policy.
+    ABS_MIN_FEE_PPM = 0
+    ABS_MAX_FEE_PPM = 100_000
+
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
@@ -3912,7 +3920,12 @@ class HillClimbingFeeController:
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
                         if current_fee != policy.fee_ppm_target:
                             try:
-                                self.set_channel_fee(channel_id, policy.fee_ppm_target, reason="Policy: STATIC")
+                                self.set_channel_fee(
+                                    channel_id,
+                                    policy.fee_ppm_target,
+                                    reason="Policy: STATIC",
+                                    reason_code=FeeReasonCode.POLICY_STATIC.value
+                                )
                                 adjustments.append(FeeAdjustment(
                                     channel_id=channel_id,
                                     peer_id=peer_id,
@@ -3936,7 +3949,14 @@ class HillClimbingFeeController:
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
                         if current_fee != hive_fee:
                             try:
-                                self.set_channel_fee(channel_id, hive_fee, reason="Policy: HIVE")
+                                # Hive fees may be 0 even when min_fee_ppm is higher.
+                                self.set_channel_fee(
+                                    channel_id,
+                                    hive_fee,
+                                    reason="Policy: HIVE",
+                                    reason_code=FeeReasonCode.POLICY_HIVE.value,
+                                    enforce_limits=False
+                                )
                                 adjustments.append(FeeAdjustment(
                                     channel_id=channel_id,
                                     peer_id=peer_id,
@@ -4075,7 +4095,7 @@ class HillClimbingFeeController:
         current_time: int
     ) -> Optional[FeeAdjustment]:
         """
-        Create a minimal fee adjustment to force gossip refresh.
+        Apply a minimal fee adjustment to force gossip refresh.
         
         This applies a +1 ppm nudge that is economically negligible but
         forces CLN to broadcast a fresh channel_update.
@@ -4088,9 +4108,24 @@ class HillClimbingFeeController:
             current_time: Current unix timestamp
             
         Returns:
-            FeeAdjustment with minimal nudge, or None if something went wrong
+            FeeAdjustment with minimal nudge (and executed on-chain),
+            or None if no safe nudge is possible
         """
-        nudge_fee = current_fee_ppm + self.GOSSIP_REFRESH_NUDGE_PPM
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        # Pick a nudge that will actually change the on-chain fee after clamping.
+        nudge_candidates = [
+            current_fee_ppm + self.GOSSIP_REFRESH_NUDGE_PPM,
+            current_fee_ppm - self.GOSSIP_REFRESH_NUDGE_PPM
+        ]
+        nudge_fee = None
+        for cand in nudge_candidates:
+            clamped = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, cand))
+            if clamped != current_fee_ppm:
+                nudge_fee = clamped
+                break
+        if nudge_fee is None:
+            return None
         
         # Calculate diagnostic info for logging
         hours_since_broadcast = (current_time - state.last_update) / 3600 if state.last_update > 0 else 999
@@ -4107,39 +4142,52 @@ class HillClimbingFeeController:
             f"Nudging fee {current_fee_ppm} -> {nudge_fee} ppm to refresh network visibility.",
             level='info'
         )
-        
-        # Update state tracking
+
+        # Execute the fee change (must be real to force CLN to gossip a new update).
+        result = self.set_channel_fee(
+            channel_id,
+            nudge_fee,
+            reason="gossip_refresh",
+            reason_code=FeeReasonCode.GOSSIP_REFRESH.value,
+            enforce_limits=True
+        )
+        if not result.get("success"):
+            return None
+
+        # Update and persist state timers.
         state.last_gossip_refresh = current_time
         state.last_fee_ppm = nudge_fee
         state.last_broadcast_fee_ppm = nudge_fee
         state.last_update = current_time
-        
-        # Save state
+        state.last_state = FeeReasonCode.GOSSIP_REFRESH.value
+
         if isinstance(state, ThompsonAIMDState):
             self._save_thompson_aimd_state(channel_id, state)
         else:
             self._save_hill_climb_state(channel_id, state)
-            
-            # If Thompson+AIMD is enabled, also update that state
-            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
-                ts_state = self._thompson_aimd_states[channel_id]
-                ts_state.last_gossip_refresh = current_time
-                ts_state.last_fee_ppm = nudge_fee
-                ts_state.last_broadcast_fee_ppm = nudge_fee
-                ts_state.last_update = current_time
-                self._save_thompson_aimd_state(channel_id, ts_state)
-        
+
+        # Keep Thompson state coherent too, if already present.
+        if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+            ts_state = self._thompson_aimd_states[channel_id]
+            ts_state.last_gossip_refresh = current_time
+            ts_state.last_fee_ppm = nudge_fee
+            ts_state.last_broadcast_fee_ppm = nudge_fee
+            ts_state.last_update = current_time
+            ts_state.last_state = FeeReasonCode.GOSSIP_REFRESH.value
+            self._save_thompson_aimd_state(channel_id, ts_state)
+
         return FeeAdjustment(
             channel_id=channel_id,
             peer_id=peer_id,
             new_fee_ppm=nudge_fee,
             old_fee_ppm=current_fee_ppm,
             reason="gossip_refresh",
-            details={
+            hill_climb_values={
                 "hours_since_broadcast": hours_since_broadcast,
                 "hours_since_forward": hours_since_forward,
                 "nudge_amount": self.GOSSIP_REFRESH_NUDGE_PPM
-            }
+            },
+            reason_code=FeeReasonCode.GOSSIP_REFRESH.value
         )
     
     def _adjust_channel_fee(self, channel_id: str, peer_id: str,
@@ -4181,6 +4229,10 @@ class HillClimbingFeeController:
         if cfg is None:
             cfg = self.config.snapshot()
 
+        # Used for structured logs. Hill Climb sets this before applying modifiers;
+        # Thompson uses step_ppm as the absolute fee delta, so original==step.
+        original_step_ppm = 0
+
         # =====================================================================
         # HIVE PEER SAFETY CHECK (Phase 7)
         # =====================================================================
@@ -4198,29 +4250,32 @@ class HillClimbingFeeController:
                     f"has fee {raw_chain_fee}, enforcing {hive_fee} PPM",
                     level='info'
                 )
+                # Must be executed on-chain; returning a FeeAdjustment object alone
+                # does not change the channel policy.
+                result = self.set_channel_fee(
+                    channel_id,
+                    hive_fee,
+                    reason="HIVE_SAFETY",
+                    reason_code=FeeReasonCode.POLICY_HIVE.value,
+                    enforce_limits=False
+                )
+                if not result.get("success"):
+                    return None
                 return FeeAdjustment(
                     channel_id=channel_id,
                     peer_id=peer_id,
                     old_fee_ppm=raw_chain_fee,
                     new_fee_ppm=hive_fee,
-                    reason="HIVE_SAFETY: Fleet member requires 0 fee",
-                    hill_climb_values={"policy": "hive_safety"}
+                    reason="HIVE_SAFETY: Fleet member fee enforced",
+                    hill_climb_values={"policy": "hive_safety"},
+                    reason_code=FeeReasonCode.POLICY_HIVE.value
                 )
             # Fee is correct, no adjustment needed
             return None
 
         # Detect critical state (Phase 5.5)
         is_congested = (state and state.get("state") == "congested")
-        
-        # Get current fee
-        raw_chain_fee = channel_info.get("fee_proportional_millionths", 0)
-        current_fee_ppm = raw_chain_fee
-        if current_fee_ppm == 0:
-            current_fee_ppm = cfg.min_fee_ppm  # Initialize if not set
 
-        # Load Hill Climbing state (Issue #32: pass actual fee for desync detection)
-        hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=raw_chain_fee)
-        
         # =====================================================================
         # ZERO-FEE PROBE: Defibrillator Override (Phase 8.1)
         # =====================================================================
@@ -4228,6 +4283,17 @@ class HillClimbingFeeController:
         is_under_probe = (probe_flag is not None)
         
         now = int(time.time())
+
+        # Get current fee
+        raw_chain_fee = channel_info.get("fee_proportional_millionths", 0)
+        current_fee_ppm = raw_chain_fee
+        # If CLN reports 0 and we're not intentionally running a 0-fee policy,
+        # treat it as "unset" and seed to min_fee for sensible initialization.
+        if current_fee_ppm == 0 and not is_under_probe:
+            current_fee_ppm = cfg.min_fee_ppm
+
+        # Load Hill Climbing state (Issue #32: pass actual fee for desync detection)
+        hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=raw_chain_fee)
         
         # Decision for target fee (The Alpha Sequence)
         # NOTE: FIRE_SALE logic removed in v2.2.3
@@ -4611,24 +4677,44 @@ class HillClimbingFeeController:
             else:
                 v_since = self.database.get_volume_since(channel_id, hc_state.last_update)
             
-            h_elapsed = (now - hc_state.last_update) / 3600.0 if hc_state.last_update > 0 else 1.0
-            rev_sats = (v_since * current_fee_ppm) // 1_000_000
-            curr_rev_rate = rev_sats / h_elapsed if h_elapsed > 0 else 0.0
-            
-            if curr_rev_rate > 0.0:
-                # WAKE UP: Success!
-                self.database.clear_channel_probe(channel_id)
+            probe_forward_count = self.database.get_forward_count_since(channel_id, hc_state.last_update)
+
+            # Success criteria: any forwards/volume observed while probing. We cannot
+            # use revenue-rate here because fee may be 0 by design.
+            probe_success = (v_since > 0) or (probe_forward_count > 0)
+
+            if probe_success:
+                # Exit probe immediately and re-establish a non-zero fee floor.
+                # Leaving channels at 0 fee until the next cycle can leak revenue.
+                try:
+                    self.database.clear_channel_probe(channel_id)
+                except Exception:
+                    # Probe flag is best-effort; failure shouldn't block fee correction.
+                    pass
+
+                new_fee_ppm = max(floor_ppm, cfg.min_fee_ppm)
+                decision_reason = "ZERO_FEE_PROBE_SUCCESS"
+                new_direction = 1 if new_fee_ppm > current_fee_ppm else (-1 if new_fee_ppm < current_fee_ppm else 0)
+                step_ppm = abs(new_fee_ppm - current_fee_ppm)
+                original_step_ppm = step_ppm
+                volatility_reset = False
+                rate_change = 0.0
+                previous_rate = hc_state.last_revenue_rate
+                target_found = True
+
                 self.plugin.log(
-                    f"DEFIBRILLATOR SUCCESS: Channel {channel_id} routed under 0-fee probe. Resuming Hill Climber.",
+                    f"DEFIBRILLATOR SUCCESS: Channel {channel_id[:12]}... observed "
+                    f"{probe_forward_count} forwards / {v_since} sats during 0-fee probe. "
+                    f"Exiting probe to floor {new_fee_ppm} ppm.",
                     level='info'
                 )
-                is_under_probe = False  # Continue to standard Hill Climbing this cycle
             else:
-                # Still probing
-                new_fee_ppm = 0  # Force 0 PPM
+                # Still probing: force 0 PPM
+                new_fee_ppm = 0
                 decision_reason = "ZERO_FEE_PROBE"
                 new_direction = hc_state.trend_direction
                 step_ppm = hc_state.step_ppm
+                original_step_ppm = step_ppm
                 volatility_reset = False
                 rate_change = 0.0
                 previous_rate = hc_state.last_revenue_rate
@@ -5221,6 +5307,7 @@ class HillClimbingFeeController:
             # =====================================================================
             new_direction = 1 if new_fee_ppm > current_fee_ppm else (-1 if new_fee_ppm < current_fee_ppm else 0)
             step_ppm = abs(new_fee_ppm - current_fee_ppm)  # For logging compatibility
+            original_step_ppm = step_ppm  # Thompson: no heuristic step modifiers
 
             # Mark target as found
             target_found = True
@@ -5678,6 +5765,21 @@ class HillClimbingFeeController:
                 f"Skipping gossip; pausing observation.",
                 level='info'
             )
+
+            # Persist Thompson state changes too (posterior updates, AIMD outcomes, etc).
+            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+                try:
+                    ts_state = self._thompson_aimd_states[channel_id]
+                    ts_state.last_fee_ppm = new_fee_ppm
+                    ts_state.last_revenue_rate = current_revenue_rate
+                    ts_state.last_state = decision_reason
+                    # IMPORTANT: Do NOT update ts_state.last_update here (Observation Pause)
+                    self._save_thompson_aimd_state(channel_id, ts_state)
+                except Exception as e:
+                    self.plugin.log(
+                        f"HYSTERESIS: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
+                        level='debug'
+                    )
             
             # =========================================================================
             # GOSSIP REFRESH CHECK: Force minimal fee change for frozen channels
@@ -5765,7 +5867,11 @@ class HillClimbingFeeController:
             return None
         
         # Determine reason_code for this adjustment
-        if is_cold_start:
+        if decision_reason == "ZERO_FEE_PROBE":
+            fee_reason_code = FeeReasonCode.ZERO_FEE_PROBE.value
+        elif decision_reason == "ZERO_FEE_PROBE_SUCCESS":
+            fee_reason_code = FeeReasonCode.ZERO_FEE_PROBE_SUCCESS.value
+        elif is_cold_start:
             fee_reason_code = FeeReasonCode.THOMPSON_COLD_START.value
         elif "aimd" in decision_reason.lower():
             fee_reason_code = FeeReasonCode.THOMPSON_AIMD_DEFENSE.value
@@ -5780,7 +5886,8 @@ class HillClimbingFeeController:
         result = self.set_channel_fee(
             channel_id, new_fee_ppm, reason=reason,
             reason_code=fee_reason_code,
-            heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None
+            heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None,
+            enforce_limits=(fee_reason_code not in (FeeReasonCode.ZERO_FEE_PROBE.value, FeeReasonCode.POLICY_HIVE.value))
         )
         
         if result.get("success"):
@@ -5861,7 +5968,8 @@ class HillClimbingFeeController:
     def set_channel_fee(self, channel_id: str, fee_ppm: int,
                        reason: str = "manual", manual: bool = False,
                        reason_code: Optional[str] = None,
-                       heuristic_modifiers: Optional[HeuristicModifiers] = None) -> Dict[str, Any]:
+                       heuristic_modifiers: Optional[HeuristicModifiers] = None,
+                       enforce_limits: bool = True) -> Dict[str, Any]:
         """
         Set the fee for a channel, handling clboss override.
 
@@ -5887,11 +5995,21 @@ class HillClimbingFeeController:
         # This is the last line of defense against runaway fees
         cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
         original_fee_ppm = fee_ppm
-        fee_ppm = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, fee_ppm))
+        # Absolute safety clamp always applies.
+        fee_ppm = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, int(fee_ppm)))
+        # Economic policy clamp applies unless explicitly bypassed (force/manual overrides,
+        # hive 0-fee covenant, etc).
+        if enforce_limits:
+            fee_ppm = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, fee_ppm))
         if fee_ppm != original_fee_ppm:
+            clamp_note = (
+                f"(limits: {cfg.min_fee_ppm}-{cfg.max_fee_ppm} PPM)"
+                if enforce_limits else
+                f"(absolute: {self.ABS_MIN_FEE_PPM}-{self.ABS_MAX_FEE_PPM} PPM; economic limits bypassed)"
+            )
             self.plugin.log(
                 f"FEE_LIMIT: Clamped fee for {channel_id[:16]}... from {original_fee_ppm} "
-                f"to {fee_ppm} (limits: {cfg.min_fee_ppm}-{cfg.max_fee_ppm} PPM)",
+                f"to {fee_ppm} {clamp_note}",
                 level='warn'
             )
 
@@ -5915,6 +6033,13 @@ class HillClimbingFeeController:
                     f"MANUAL_WAKE: Channel {channel_id[:12]}... woken due to manual fee change",
                     level='info'
                 )
+        if manual and channel_id in self._thompson_aimd_states:
+            ts_state = self._thompson_aimd_states[channel_id]
+            if ts_state.is_sleeping:
+                ts_state.is_sleeping = False
+                ts_state.sleep_until = 0
+                ts_state.stable_cycles = 0
+                self._save_thompson_aimd_state(channel_id, ts_state)
 
         try:
             # Get channel info to find peer ID and current fee
@@ -5997,6 +6122,43 @@ class HillClimbingFeeController:
                 reason_code=reason_code,
                 heuristic_modifiers=heuristic_modifiers.to_json() if heuristic_modifiers else None
             )
+
+            # Keep optimizer state coherent for manual/policy/gossip-refresh changes
+            # (algorithm-driven changes update their own state post-call).
+            should_sync_state = manual or reason_code in (
+                FeeReasonCode.POLICY_STATIC.value,
+                FeeReasonCode.POLICY_HIVE.value,
+                FeeReasonCode.ZERO_FEE_PROBE.value,
+                FeeReasonCode.GOSSIP_REFRESH.value
+            )
+            if should_sync_state:
+                now = int(time.time())
+                try:
+                    hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=fee_ppm)
+                    hc_state.is_sleeping = False
+                    hc_state.sleep_until = 0
+                    hc_state.stable_cycles = 0
+                    hc_state.last_fee_ppm = fee_ppm
+                    hc_state.last_broadcast_fee_ppm = fee_ppm
+                    hc_state.last_update = now
+                    hc_state.last_state = reason_code or "manual"
+                    self._save_hill_climb_state(channel_id, hc_state)
+                except Exception as e:
+                    self.plugin.log(f"STATE_SYNC: Failed to update hill state for {channel_id}: {e}", level="debug")
+
+                if self.ENABLE_THOMPSON_AIMD:
+                    try:
+                        ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
+                        ts_state.is_sleeping = False
+                        ts_state.sleep_until = 0
+                        ts_state.stable_cycles = 0
+                        ts_state.last_fee_ppm = fee_ppm
+                        ts_state.last_broadcast_fee_ppm = fee_ppm
+                        ts_state.last_update = now
+                        ts_state.last_state = reason_code or "manual"
+                        self._save_thompson_aimd_state(channel_id, ts_state)
+                    except Exception as e:
+                        self.plugin.log(f"STATE_SYNC: Failed to update Thompson state for {channel_id}: {e}", level="debug")
             
             result["success"] = True
             result["old_fee_ppm"] = old_fee_ppm
