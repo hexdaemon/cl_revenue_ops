@@ -455,8 +455,12 @@ class ChannelProfitabilityAnalyzer:
 
             # Report health and liquidity to cl-hive for fleet coordination
             # INFORMATION ONLY - no fund transfers between nodes
-            self._report_health_to_hive()
-            self._report_liquidity_state_to_hive()
+            # Non-critical: failures here should not invalidate the analysis
+            try:
+                self._report_health_to_hive()
+                self._report_liquidity_state_to_hive()
+            except Exception as e:
+                self.plugin.log(f"Hive reporting failed (non-critical): {e}", level='debug')
 
         except Exception as e:
             self.plugin.log(f"Error in profitability analysis: {e}", level='error')
@@ -1292,36 +1296,42 @@ class ChannelProfitabilityAnalyzer:
             channels = self._get_all_channels()
 
             for channel_id, info in channels.items():
-                # Get FULL P&L including inbound contribution
-                pnl = self.database.get_channel_full_pnl(channel_id, window_days)
+                try:
+                    # Get FULL P&L including inbound contribution
+                    pnl = self.database.get_channel_full_pnl(channel_id, window_days)
 
-                # Total activity = exit forwards + sourced forwards
-                total_activity = pnl['direct_forward_count'] + pnl['sourced_forward_count']
+                    # Total activity = exit forwards + sourced forwards
+                    total_activity = pnl.get('direct_forward_count', 0) + pnl.get('sourced_forward_count', 0)
 
-                # Check for bleeder condition: net < 0 AND has activity
-                # Now uses total_contribution which includes sourced fee value
-                if pnl['net_pnl_sats'] < 0 and total_activity > 0:
-                    bleeders.append({
-                        'channel_id': channel_id,
-                        'peer_id': info.get('peer_id', ''),
-                        'capacity_sats': info.get('capacity', 0),
-                        # Direct revenue (as exit channel)
-                        'direct_revenue_sats': pnl['direct_revenue_sats'],
-                        # Inbound contribution (fees enabled by sourcing volume)
-                        'sourced_fee_contribution_sats': pnl['sourced_fee_contribution_sats'],
-                        'sourced_volume_sats': pnl['sourced_volume_sats'],
-                        # Combined metrics
-                        'total_contribution_sats': pnl['total_contribution_sats'],
-                        'rebalance_cost_sats': pnl['rebalance_cost_sats'],
-                        'net_pnl_sats': pnl['net_pnl_sats'],
-                        'direct_forward_count': pnl['direct_forward_count'],
-                        'sourced_forward_count': pnl['sourced_forward_count'],
-                        'total_forward_count': total_activity,
-                        'loss_per_forward': abs(pnl['net_pnl_sats']) // max(total_activity, 1),
-                        # Legacy fields for backward compatibility
-                        'revenue_sats': pnl['direct_revenue_sats'],
-                        'forward_count': pnl['direct_forward_count']
-                    })
+                    # Check for bleeder condition: net < 0 AND has activity
+                    # Now uses total_contribution which includes sourced fee value
+                    net_pnl = pnl.get('net_pnl_sats', 0)
+                    if net_pnl < 0 and total_activity > 0:
+                        bleeders.append({
+                            'channel_id': channel_id,
+                            'peer_id': info.get('peer_id', ''),
+                            'capacity_sats': info.get('capacity', 0),
+                            # Direct revenue (as exit channel)
+                            'direct_revenue_sats': pnl.get('direct_revenue_sats', 0),
+                            # Inbound contribution (fees enabled by sourcing volume)
+                            'sourced_fee_contribution_sats': pnl.get('sourced_fee_contribution_sats', 0),
+                            'sourced_volume_sats': pnl.get('sourced_volume_sats', 0),
+                            # Combined metrics
+                            'total_contribution_sats': pnl.get('total_contribution_sats', 0),
+                            'rebalance_cost_sats': pnl.get('rebalance_cost_sats', 0),
+                            'net_pnl_sats': net_pnl,
+                            'direct_forward_count': pnl.get('direct_forward_count', 0),
+                            'sourced_forward_count': pnl.get('sourced_forward_count', 0),
+                            'total_forward_count': total_activity,
+                            'loss_per_forward': abs(net_pnl) // max(total_activity, 1),
+                            # Legacy fields for backward compatibility
+                            'revenue_sats': pnl.get('direct_revenue_sats', 0),
+                            'forward_count': pnl.get('direct_forward_count', 0)
+                        })
+                except Exception as e:
+                    self.plugin.log(
+                        f"Error getting P&L for channel {channel_id}: {e}", level='debug'
+                    )
 
             # Sort by loss (most negative first)
             bleeders.sort(key=lambda x: x['net_pnl_sats'])
@@ -1366,67 +1376,72 @@ class ChannelProfitabilityAnalyzer:
             channels = self._get_all_channels()
 
             for channel_id, info in channels.items():
-                peer_id = info.get('peer_id', '')
+                try:
+                    peer_id = info.get('peer_id', '')
 
-                # Get 30-day P&L
-                pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days)
+                    # Get 30-day P&L
+                    pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days)
 
-                # Get 7-day P&L for soft bleeder detection
-                pnl_7d = self.database.get_channel_full_pnl(channel_id, 7)
+                    # Get 7-day P&L for soft bleeder detection
+                    pnl_7d = self.database.get_channel_full_pnl(channel_id, 7)
 
-                # Extract metrics
-                rebalance_cost_30d = pnl_30d['rebalance_cost_sats']
-                revenue_30d = pnl_30d['total_contribution_sats']
-                net_profit_30d = pnl_30d['net_pnl_sats']
-                net_profit_7d = pnl_7d['net_pnl_sats']
+                    # Extract metrics
+                    rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
+                    revenue_30d = pnl_30d.get('total_contribution_sats', 0)
+                    net_profit_30d = pnl_30d.get('net_pnl_sats', 0)
+                    net_profit_7d = pnl_7d.get('net_pnl_sats', 0)
 
-                # Classify the channel
-                classification = "none"
-                reason = "Channel is profitable or break-even"
-                recommended_action = "monitor"
+                    # Classify the channel
+                    classification = "none"
+                    reason = "Channel is profitable or break-even"
+                    recommended_action = "monitor"
 
-                # Check for HARD BLEEDER first (most severe)
-                # Condition: rebal_cost > 2x revenue AND net_profit < -1000 sats
-                if (rebalance_cost_30d > revenue_30d * 2 and
-                        net_profit_30d < -1000):
-                    classification = "hard"
-                    reason = (f"Rebalance cost ({rebalance_cost_30d} sats) exceeds "
-                              f"2x revenue ({revenue_30d * 2} sats), net loss {net_profit_30d} sats")
-                    recommended_action = "disable_rebalance"
-
-                # Check for SOFT BLEEDER (short-term loss, long-term gain)
-                # Condition: 7d negative AND 30d positive
-                elif net_profit_7d < 0 and net_profit_30d > 0:
-                    classification = "soft"
-                    reason = (f"Short-term loss (7d: {net_profit_7d} sats) but "
-                              f"long-term gain (30d: {net_profit_30d} sats)")
-                    recommended_action = "reduce_rebalance"
-
-                # Check for sustained bleeding (both windows negative)
-                elif net_profit_30d < 0 and net_profit_7d < 0:
-                    # Both windows negative - check severity
-                    if abs(net_profit_30d) > 1000:
+                    # Check for HARD BLEEDER first (most severe)
+                    # Condition: rebal_cost > 2x revenue AND net_profit < -1000 sats
+                    if (rebalance_cost_30d > revenue_30d * 2 and
+                            net_profit_30d < -1000):
                         classification = "hard"
-                        reason = (f"Sustained losses: 7d={net_profit_7d} sats, "
-                                  f"30d={net_profit_30d} sats")
+                        reason = (f"Rebalance cost ({rebalance_cost_30d} sats) exceeds "
+                                  f"2x revenue ({revenue_30d * 2} sats), net loss {net_profit_30d} sats")
                         recommended_action = "disable_rebalance"
-                    else:
+
+                    # Check for SOFT BLEEDER (short-term loss, long-term gain)
+                    # Condition: 7d negative AND 30d positive
+                    elif net_profit_7d < 0 and net_profit_30d > 0:
                         classification = "soft"
-                        reason = (f"Minor sustained losses: 7d={net_profit_7d} sats, "
-                                  f"30d={net_profit_30d} sats")
+                        reason = (f"Short-term loss (7d: {net_profit_7d} sats) but "
+                                  f"long-term gain (30d: {net_profit_30d} sats)")
                         recommended_action = "reduce_rebalance"
 
-                classifications.append(BleederClassification(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    classification=classification,
-                    reason=reason,
-                    rebalance_cost_30d=rebalance_cost_30d,
-                    revenue_30d=revenue_30d,
-                    net_profit_30d=net_profit_30d,
-                    net_profit_7d=net_profit_7d,
-                    recommended_action=recommended_action
-                ))
+                    # Check for sustained bleeding (both windows negative)
+                    elif net_profit_30d < 0 and net_profit_7d < 0:
+                        # Both windows negative - check severity
+                        if abs(net_profit_30d) > 1000:
+                            classification = "hard"
+                            reason = (f"Sustained losses: 7d={net_profit_7d} sats, "
+                                      f"30d={net_profit_30d} sats")
+                            recommended_action = "disable_rebalance"
+                        else:
+                            classification = "soft"
+                            reason = (f"Minor sustained losses: 7d={net_profit_7d} sats, "
+                                      f"30d={net_profit_30d} sats")
+                            recommended_action = "reduce_rebalance"
+
+                    classifications.append(BleederClassification(
+                        channel_id=channel_id,
+                        peer_id=peer_id,
+                        classification=classification,
+                        reason=reason,
+                        rebalance_cost_30d=rebalance_cost_30d,
+                        revenue_30d=revenue_30d,
+                        net_profit_30d=net_profit_30d,
+                        net_profit_7d=net_profit_7d,
+                        recommended_action=recommended_action
+                    ))
+                except Exception as e:
+                    self.plugin.log(
+                        f"Error classifying bleeder for channel {channel_id}: {e}", level='debug'
+                    )
 
             # Log summary
             hard_count = sum(1 for c in classifications if c.is_hard_bleeder)
