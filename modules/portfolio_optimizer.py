@@ -333,10 +333,7 @@ class PortfolioOptimizer:
             if not scid:
                 continue
             channel_info[scid] = ch
-            local = ch.get("to_us_msat", 0)
-            if isinstance(local, str):
-                local = int(local.replace("msat", ""))
-            local_sats = local // 1000
+            local_sats = _safe_msat_to_sats(ch.get("to_us_msat", 0))
             total_local_sats += local_sats
 
         # Filter forwards to window and group by channel
@@ -460,17 +457,17 @@ class PortfolioOptimizer:
 
             bucket_idx = (ts - window_start) // interval_secs
 
-            # Get fee earned (safely handle string or int msat values)
+            # Get fee earned — use float division for sub-sat precision
             fee_msat = fwd.get("fee_msat") or fwd.get("fee", 0)
-            fee_sats = _safe_msat_to_sats(fee_msat) if fee_msat else 0
-            # For sub-sat precision, also handle as float
-            if isinstance(fee_msat, (int, float)):
-                fee_sats = fee_msat / 1000
-            elif isinstance(fee_msat, str):
+            if isinstance(fee_msat, str):
                 try:
                     fee_sats = int(fee_msat.replace("msat", "").strip()) / 1000
                 except (ValueError, AttributeError):
                     fee_sats = 0
+            elif isinstance(fee_msat, (int, float)):
+                fee_sats = fee_msat / 1000
+            else:
+                fee_sats = 0
 
             if bucket_idx not in buckets:
                 buckets[bucket_idx] = 0.0
@@ -485,7 +482,7 @@ class PortfolioOptimizer:
         # Calculate statistics
         n = len(rates)
         if n < 2:
-            return rates[0] if rates else 0.0, 0.0, n
+            return (rates[0] if rates else 0.0), 0.0, n
 
         mean_rate = sum(rates) / n
         variance = sum((r - mean_rate) ** 2 for r in rates) / (n - 1)
@@ -586,7 +583,12 @@ class PortfolioOptimizer:
 
             fee = fwd.get("fee_msat") or fwd.get("fee", 0)
             if isinstance(fee, str):
-                fee = int(fee.replace("msat", ""))
+                try:
+                    fee = int(fee.replace("msat", "").strip())
+                except (ValueError, AttributeError):
+                    fee = 0
+            elif not isinstance(fee, (int, float)):
+                fee = 0
             fee_sats = fee / 1000
 
             if bucket_idx not in channel_series[out_scid]:
@@ -847,13 +849,19 @@ class PortfolioOptimizer:
         """
         Project weights onto simplex with bounds.
 
-        Ensures: sum(w) = 1, MIN_ALLOCATION <= w <= MAX_ALLOCATION
+        Ensures: sum(w) = 1, effective_min <= w <= effective_max
         """
         n = len(weights)
 
+        # Relax bounds when n makes the original constraints infeasible:
+        #   n <= floor(1/MAX) → max must be >= 1/n
+        #   n >= ceil(1/MIN)  → min must be <= 1/n
+        effective_max = max(MAX_SINGLE_ALLOCATION, 1.0 / n)
+        effective_min = min(MIN_SINGLE_ALLOCATION, 1.0 / n)
+
         # Clip to bounds
         weights = [
-            max(MIN_SINGLE_ALLOCATION, min(MAX_SINGLE_ALLOCATION, w))
+            max(effective_min, min(effective_max, w))
             for w in weights
         ]
 
@@ -869,11 +877,11 @@ class PortfolioOptimizer:
             needs_adjustment = False
 
             for i in range(n):
-                if weights[i] < MIN_SINGLE_ALLOCATION:
-                    weights[i] = MIN_SINGLE_ALLOCATION
+                if weights[i] < effective_min:
+                    weights[i] = effective_min
                     needs_adjustment = True
-                elif weights[i] > MAX_SINGLE_ALLOCATION:
-                    weights[i] = MAX_SINGLE_ALLOCATION
+                elif weights[i] > effective_max:
+                    weights[i] = effective_max
                     needs_adjustment = True
 
             if not needs_adjustment:
