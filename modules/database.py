@@ -2471,9 +2471,8 @@ class Database:
                     # sqlite3 cursor.rowcount is 1 for inserted, 0 for ignored
                     if getattr(cur, "rowcount", 0) == 1:
                         inserted += 1
-                except Exception:
-                    # Skip invalid records
-                    pass
+                except Exception as e:
+                    self.plugin.log(f"bulk_insert_forwards: skipped invalid record: {e}", level='debug')
 
             return inserted
 
@@ -4039,7 +4038,10 @@ class Database:
         # Atomic aggregation + deletion to avoid double-counting if interrupted.
         # If we update lifetime_aggregates but fail before deleting forwards, we'd
         # count the same forwards again later. Using a transaction prevents this.
-        with conn:
+        # NOTE: We use explicit BEGIN/COMMIT because isolation_level=None
+        # (autocommit) makes `with conn:` a no-op for transaction control.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
             # Count rows before deletion for logging
             flow_count = conn.execute(
                 "SELECT COUNT(*) as cnt FROM flow_history WHERE timestamp < ?", (cutoff,)
@@ -4122,6 +4124,14 @@ class Database:
             # SNAPSHOT CLEANUP: Keep 1 year of financial snapshots for trend analysis
             snapshot_cutoff = now - (365 * 86400)
             conn.execute("DELETE FROM financial_snapshots WHERE timestamp < ?", (snapshot_cutoff,))
+
+            conn.execute("COMMIT")
+        except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            self.plugin.log(f"cleanup_old_data transaction failed: {e}", level='error')
 
         # VACUUM to reclaim disk space after pruning
         # SQLite DELETE only marks pages as free; VACUUM actually shrinks the file.
