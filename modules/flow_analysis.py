@@ -135,6 +135,7 @@ class KalmanFlowState:
     covariance: float = 0.0
     last_update: int = 0
     innovation_variance: float = 0.01  # Running estimate of prediction errors
+    last_innovation: float = 0.0  # Most recent prediction error
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -144,7 +145,8 @@ class KalmanFlowState:
             "variance_velocity": self.variance_velocity,
             "covariance": self.covariance,
             "last_update": self.last_update,
-            "innovation_variance": self.innovation_variance
+            "innovation_variance": self.innovation_variance,
+            "last_innovation": self.last_innovation
         }
 
     @classmethod
@@ -156,7 +158,8 @@ class KalmanFlowState:
             variance_velocity=d.get("variance_velocity", KALMAN_INITIAL_VARIANCE),
             covariance=d.get("covariance", 0.0),
             last_update=d.get("last_update", 0),
-            innovation_variance=d.get("innovation_variance", 0.01)
+            innovation_variance=d.get("innovation_variance", 0.01),
+            last_innovation=d.get("last_innovation", 0.0)
         )
 
 
@@ -258,7 +261,7 @@ class KalmanFlowFilter:
         self.state.flow_velocity += k1 * innovation
 
         # Covariance update: P = (I - K*H) * P
-        # This is the Joseph form for numerical stability
+        # Standard form with positive-definiteness clamps below
         p00 = self.state.variance_ratio
         p01 = self.state.covariance
         p11 = self.state.variance_velocity
@@ -271,6 +274,8 @@ class KalmanFlowFilter:
         self.state.variance_ratio = max(1e-6, self.state.variance_ratio)
         self.state.variance_velocity = max(1e-6, self.state.variance_velocity)
 
+        # Store innovation for regime change detection
+        self.state.last_innovation = innovation
         # Update innovation variance (exponential moving average)
         self.state.innovation_variance = 0.9 * self.state.innovation_variance + 0.1 * innovation * innovation
 
@@ -284,10 +289,11 @@ class KalmanFlowFilter:
 
     def is_regime_change(self, threshold: float = 2.0) -> bool:
         """
-        Detect if recent innovations suggest a regime change.
+        Detect if the latest innovation suggests a regime change.
 
-        A regime change is detected when the innovation (prediction error)
-        is significantly larger than expected based on the innovation variance.
+        Uses standard Kalman innovation monitoring: a regime change is flagged
+        when the latest prediction error is significantly larger than the
+        running average of past prediction errors.
 
         Args:
             threshold: Number of standard deviations for detection
@@ -296,8 +302,7 @@ class KalmanFlowFilter:
             True if regime change detected
         """
         expected_innovation_std = math.sqrt(max(0.001, self.state.innovation_variance))
-        # Compare recent update's contribution to expected
-        return self.state.variance_ratio > threshold * expected_innovation_std
+        return abs(self.state.last_innovation) > threshold * expected_innovation_std
 
 
 class ChannelState(Enum):
@@ -705,10 +710,10 @@ class FlowAnalyzer:
         net_flows = []
         volumes = []
         for bucket in daily_buckets:
-            net = bucket['out'] - bucket['in']
-            vol = bucket['out'] + bucket['in']
-            net_flows.append(net)
-            volumes.append(vol)
+            b_out = bucket.get('out', 0) or 0
+            b_in = bucket.get('in', 0) or 0
+            net_flows.append(b_out - b_in)
+            volumes.append(b_out + b_in)
 
         mean_volume = sum(volumes) / len(volumes) if volumes else 1
         if mean_volume < 1000:  # Less than 1k sats average = low activity
@@ -995,6 +1000,25 @@ class FlowAnalyzer:
             metrics.kalman_uncertainty = kalman_uncertainty
             metrics.kalman_regime_change = regime_change
 
+        # Persist state so single-channel analysis is reflected in get_channel_state()
+        self.database.update_channel_state(
+            channel_id=channel_id,
+            peer_id=peer_id,
+            state=metrics.state.value,
+            flow_ratio=metrics.flow_ratio,
+            sats_in=total_in,
+            sats_out=total_out,
+            capacity=capacity,
+            confidence=metrics.confidence,
+            velocity=metrics.velocity,
+            flow_multiplier=metrics.flow_multiplier,
+            ema_decay=adaptive_decay,
+            forward_count=forward_count,
+            kalman_flow_ratio=metrics.kalman_flow_ratio,
+            kalman_velocity=metrics.kalman_velocity,
+            kalman_uncertainty=metrics.kalman_uncertainty
+        )
+
         return metrics
 
     def _calculate_metrics(
@@ -1028,9 +1052,9 @@ class FlowAnalyzer:
         """
         has_flow_data = sats_in > 0 or sats_out > 0
 
-        # Calculate flow ratio from EMA data
+        # Calculate flow ratio from EMA data, clamped to [-1, 1]
         if capacity > 0:
-            flow_ratio = (ema_out - ema_in) / capacity
+            flow_ratio = max(-1.0, min(1.0, (ema_out - ema_in) / capacity))
         else:
             flow_ratio = 0.0
 
