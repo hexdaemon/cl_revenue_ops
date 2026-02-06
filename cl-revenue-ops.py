@@ -60,6 +60,7 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 #   - Replaces EMA with Kalman filter for optimal state estimation
 #   - Faster regime change detection via innovation monitoring
@@ -75,7 +76,7 @@ from modules.utils import normalize_scid, parse_msat
 #   - Stigmergic modulation for exploration/exploitation
 #   - P2 fleet integration: elasticity sharing, curve aggregation,
 #     regime coordination, competition avoidance, profitability weighting
-PLUGIN_VERSION = "2.1.0"
+PLUGIN_VERSION = "2.2.4"
 
 
 # =============================================================================
