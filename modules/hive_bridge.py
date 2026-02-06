@@ -2726,18 +2726,19 @@ class HiveFeeIntelligenceBridge:
         depletion_risk = prediction.get("depletion_risk", 0)
         saturation_risk = prediction.get("saturation_risk", 0)
         hours_to_critical = prediction.get("hours_to_critical")
+        htc_str = f"{hours_to_critical:.0f}" if hours_to_critical is not None else "?"
 
         if urgency in ["critical", "urgent"]:
             # Need to rebalance now regardless
             result["should_rebalance"] = True
-            result["reason"] = f"Critical: {urgency} urgency, {hours_to_critical:.0f}h to critical"
+            result["reason"] = f"Critical: {urgency} urgency, {htc_str}h to critical"
             result["urgency"] = urgency
             result["recommended_amount_pct"] = 0.3 if depletion_risk > saturation_risk else -0.3
 
         elif urgency == "preemptive":
             # Ideal window for preemptive rebalancing
             result["should_rebalance"] = True
-            result["reason"] = f"Preemptive window: {hours_to_critical:.0f}h to critical"
+            result["reason"] = f"Preemptive window: {htc_str}h to critical"
             result["urgency"] = "preemptive"
             result["recommended_amount_pct"] = 0.25 if depletion_risk > saturation_risk else -0.25
             result["cost_advantage"] = "Rebalancing now vs urgently saves ~20-40% in fees"
@@ -2788,7 +2789,7 @@ class HiveFeeIntelligenceBridge:
                 "reason": "Peak outbound hour (85% intensity, +10%)"
             }
         """
-        if not self._hive_available or self._circuit.is_open:
+        if self._is_circuit_open() or not self.is_available():
             return None
 
         try:
@@ -2805,7 +2806,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to query time fee adjustment: {e}", level="debug")
-            self._circuit.record_failure()
+            self._record_failure()
             return None
 
     def query_time_fee_status(self) -> Optional[Dict[str, Any]]:
@@ -2832,7 +2833,7 @@ class HiveFeeIntelligenceBridge:
                 }
             }
         """
-        if not self._hive_available or self._circuit.is_open:
+        if self._is_circuit_open() or not self.is_available():
             return None
 
         try:
@@ -2846,7 +2847,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to query time fee status: {e}", level="debug")
-            self._circuit.record_failure()
+            self._record_failure()
             return None
 
     def query_channel_peak_hours(
@@ -2875,7 +2876,7 @@ class HiveFeeIntelligenceBridge:
                 }
             ]
         """
-        if not self._hive_available or self._circuit.is_open:
+        if self._is_circuit_open() or not self.is_available():
             return None
 
         try:
@@ -2891,7 +2892,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to query peak hours: {e}", level="debug")
-            self._circuit.record_failure()
+            self._record_failure()
             return None
 
     def should_use_time_adjusted_fee(
@@ -2982,19 +2983,16 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Dict with MCF status or None if unavailable
         """
-        if not self.is_available():
-            return None
-
-        if self._circuit.is_open:
+        if self._is_circuit_open() or not self.is_available():
             return None
 
         try:
             result = self.plugin.rpc.call("hive-mcf-status")
-            self._circuit.record_success()
+            self._record_success()
             return result
 
         except Exception as e:
-            self._circuit.record_failure()
+            self._record_failure()
             self._log(f"Error querying MCF status: {e}", level="debug")
             return None
 
@@ -3008,19 +3006,16 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Dict with assignments or None if unavailable
         """
-        if not self.is_available():
-            return None
-
-        if self._circuit.is_open:
+        if self._is_circuit_open() or not self.is_available():
             return None
 
         try:
             result = self.plugin.rpc.call("hive-mcf-assignments")
-            self._circuit.record_success()
+            self._record_success()
             return result
 
         except Exception as e:
-            self._circuit.record_failure()
+            self._record_failure()
             self._log(f"Error querying MCF assignments: {e}", level="debug")
             return None
 
@@ -3044,10 +3039,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Dict with path recommendation or None if unavailable
         """
-        if not self.is_available():
-            return None
-
-        if self._circuit.is_open:
+        if self._is_circuit_open() or not self.is_available():
             return None
 
         try:
@@ -3057,11 +3049,11 @@ class HiveFeeIntelligenceBridge:
                 to_channel=to_channel,
                 amount_sats=amount_sats
             )
-            self._circuit.record_success()
+            self._record_success()
             return result
 
         except Exception as e:
-            self._circuit.record_failure()
+            self._record_failure()
             self._log(f"Error querying MCF optimized path: {e}", level="debug")
             return None
 
@@ -3089,10 +3081,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             True if report was accepted
         """
-        if not self.is_available():
-            return False
-
-        if self._circuit.is_open:
+        if self._is_circuit_open() or not self.is_available():
             return False
 
         try:
@@ -3105,11 +3094,11 @@ class HiveFeeIntelligenceBridge:
                 actual_cost_sats=actual_cost_sats,
                 failure_reason=failure_reason
             )
-            self._circuit.record_success()
+            self._record_success()
             return result.get("success", False)
 
         except Exception as e:
-            self._circuit.record_failure()
+            self._record_failure()
             self._log(f"Error reporting MCF completion: {e}", level="debug")
             return False
 
@@ -3150,10 +3139,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Claimed assignment dict or None if claim failed
         """
-        if not self.is_available():
-            return None
-
-        if self._circuit.is_open:
+        if self._is_circuit_open() or not self.is_available():
             return None
 
         try:
@@ -3165,14 +3151,14 @@ class HiveFeeIntelligenceBridge:
             else:
                 result = self.plugin.rpc.call("hive-claim-mcf-assignment")
 
-            self._circuit.record_success()
+            self._record_success()
 
             if result.get("success"):
                 return result.get("assignment")
             return None
 
         except Exception as e:
-            self._circuit.record_failure()
+            self._record_failure()
             self._log(f"Error claiming MCF assignment: {e}", level="debug")
             return None
 
