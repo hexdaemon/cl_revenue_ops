@@ -508,6 +508,19 @@ class Database:
                 PRIMARY KEY (channel_id, date)
             )
         """)
+
+        # Daily aggregated entry-side forwarding stats (Profitability v2.0)
+        # Preserves "in_channel" contribution metrics when raw forwards are pruned.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_forwarding_stats_inbound (
+                channel_id TEXT NOT NULL,
+                date INTEGER NOT NULL,  -- Unix timestamp of midnight (UTC)
+                total_in_msat INTEGER NOT NULL DEFAULT 0,
+                total_fee_msat INTEGER NOT NULL DEFAULT 0,
+                forward_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (channel_id, date)
+            )
+        """)
         
         # Budget reservations table for atomic budget management (CRITICAL-01 fix)
         # Prevents race conditions where multiple concurrent jobs can overspend
@@ -1417,7 +1430,8 @@ class Database:
         Get total routing revenue (fees earned) since a given timestamp.
         
         Used for Revenue-Proportional Budget calculation.
-        Sums fee_msat from the forwards table since the timestamp.
+        Sums fee_msat from the forwards table since the timestamp, plus
+        rolled-up daily aggregates from pruned forwards.
         
         Args:
             since_timestamp: Unix timestamp to start summing from
@@ -1426,14 +1440,24 @@ class Database:
             Total routing fees earned in sats (0 if none)
         """
         conn = self._get_connection()
+        since_day = (int(since_timestamp) // 86400) * 86400
+
         row = conn.execute("""
-            SELECT COALESCE(SUM(fee_msat), 0) as total_fees_msat
-            FROM forwards
-            WHERE timestamp >= ?
-        """, (since_timestamp,)).fetchone()
-        
+            SELECT
+                (
+                    SELECT COALESCE(SUM(fee_msat), 0)
+                    FROM forwards
+                    WHERE timestamp >= ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_fee_msat), 0)
+                    FROM daily_forwarding_stats
+                    WHERE date >= ?
+                ) AS total_fees_msat
+        """, (since_timestamp, since_day)).fetchone()
+
         # Convert msat to sats
-        return (row['total_fees_msat'] // 1000) if row else 0
+        return int((row['total_fees_msat'] or 0) // 1000) if row else 0
 
     # =========================================================================
     # Phase 8: Financial Snapshots for P&L Dashboard
@@ -1549,14 +1573,37 @@ class Database:
         """
         conn = self._get_connection()
         since = int(time.time()) - (window_days * 86400)
+        since_day = (since // 86400) * 86400
 
         # Revenue from this channel (as outbound)
         rev_row = conn.execute("""
-            SELECT COALESCE(SUM(fee_msat), 0) as revenue_msat,
-                   COUNT(*) as forward_count
-            FROM forwards
-            WHERE out_channel = ? AND timestamp >= ?
-        """, (channel_id, since)).fetchone()
+            SELECT
+                (
+                    SELECT COALESCE(SUM(fee_msat), 0)
+                    FROM forwards
+                    WHERE out_channel = ? AND timestamp >= ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_fee_msat), 0)
+                    FROM daily_forwarding_stats
+                    WHERE channel_id = ? AND date >= ?
+                ) AS revenue_msat,
+                (
+                    SELECT COALESCE(COUNT(*), 0)
+                    FROM forwards
+                    WHERE out_channel = ? AND timestamp >= ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(forward_count), 0)
+                    FROM daily_forwarding_stats
+                    WHERE channel_id = ? AND date >= ?
+                ) AS forward_count
+        """, (
+            channel_id, since,
+            channel_id, since_day,
+            channel_id, since,
+            channel_id, since_day,
+        )).fetchone()
 
         # Rebalance costs for this channel
         cost_row = conn.execute("""
@@ -1601,15 +1648,49 @@ class Database:
         """
         conn = self._get_connection()
         since = int(time.time()) - (window_days * 86400)
+        since_day = (since // 86400) * 86400
 
         # Get inbound contribution (where this channel was the entry point)
         inbound_row = conn.execute("""
-            SELECT COALESCE(SUM(in_msat), 0) as sourced_volume_msat,
-                   COALESCE(SUM(fee_msat), 0) as sourced_fee_msat,
-                   COUNT(*) as sourced_forward_count
-            FROM forwards
-            WHERE in_channel = ? AND timestamp >= ?
-        """, (channel_id, since)).fetchone()
+            SELECT
+                (
+                    SELECT COALESCE(SUM(in_msat), 0)
+                    FROM forwards
+                    WHERE in_channel = ? AND timestamp >= ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_in_msat), 0)
+                    FROM daily_forwarding_stats_inbound
+                    WHERE channel_id = ? AND date >= ?
+                ) AS sourced_volume_msat,
+                (
+                    SELECT COALESCE(SUM(fee_msat), 0)
+                    FROM forwards
+                    WHERE in_channel = ? AND timestamp >= ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_fee_msat), 0)
+                    FROM daily_forwarding_stats_inbound
+                    WHERE channel_id = ? AND date >= ?
+                ) AS sourced_fee_msat,
+                (
+                    SELECT COALESCE(COUNT(*), 0)
+                    FROM forwards
+                    WHERE in_channel = ? AND timestamp >= ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(forward_count), 0)
+                    FROM daily_forwarding_stats_inbound
+                    WHERE channel_id = ? AND date >= ?
+                ) AS sourced_forward_count
+        """, (
+            channel_id, since,
+            channel_id, since_day,
+            channel_id, since,
+            channel_id, since_day,
+            channel_id, since,
+            channel_id, since_day,
+        )).fetchone()
 
         sourced_volume_sats = (inbound_row['sourced_volume_msat'] // 1000) if inbound_row else 0
         sourced_fee_sats = (inbound_row['sourced_fee_msat'] // 1000) if inbound_row else 0
@@ -1670,6 +1751,221 @@ class Database:
             'revenue_sats': direct_pnl['revenue_sats'],
             'forward_count': direct_pnl['forward_count']
         }
+
+    def get_last_forward_time_any_direction(self, channel_id: str) -> Optional[int]:
+        """
+        Get the timestamp of the most recent forward involving a channel.
+
+        Considers both roles:
+        - out_channel (exit)
+        - in_channel (entry)
+
+        Also considers rolled-up daily stats when raw forwards were pruned.
+        Daily stats don't preserve time-of-day, so we approximate the most recent
+        activity within a day as (midnight + 86399).
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT MAX(ts) as last_ts
+            FROM (
+                SELECT MAX(timestamp) as ts
+                FROM forwards
+                WHERE out_channel = ? OR in_channel = ?
+                UNION ALL
+                SELECT MAX(date) + 86399 as ts
+                FROM daily_forwarding_stats
+                WHERE channel_id = ? AND forward_count > 0
+                UNION ALL
+                SELECT MAX(date) + 86399 as ts
+                FROM daily_forwarding_stats_inbound
+                WHERE channel_id = ? AND forward_count > 0
+            )
+        """, (channel_id, channel_id, channel_id, channel_id)).fetchone()
+
+        return int(row["last_ts"]) if row and row["last_ts"] else None
+
+    def get_channel_revenue_totals(self, channel_id: str) -> Dict[str, int]:
+        """
+        Get all-time routing metrics for a channel (since plugin started tracking).
+
+        Combines:
+        - Raw forwards (recent, not yet pruned)
+        - Rolled-up daily_forwarding_stats (exit-side)
+        - Rolled-up daily_forwarding_stats_inbound (entry-side)
+
+        Returns a dict with values in sats and counts as integers.
+        """
+        conn = self._get_connection()
+
+        exit_row = conn.execute("""
+            SELECT
+                (
+                    SELECT COALESCE(SUM(fee_msat), 0)
+                    FROM forwards
+                    WHERE out_channel = ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_fee_msat), 0)
+                    FROM daily_forwarding_stats
+                    WHERE channel_id = ?
+                ) AS fee_msat,
+                (
+                    SELECT COALESCE(SUM(out_msat), 0)
+                    FROM forwards
+                    WHERE out_channel = ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_out_msat), 0)
+                    FROM daily_forwarding_stats
+                    WHERE channel_id = ?
+                ) AS out_msat,
+                (
+                    SELECT COALESCE(COUNT(*), 0)
+                    FROM forwards
+                    WHERE out_channel = ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(forward_count), 0)
+                    FROM daily_forwarding_stats
+                    WHERE channel_id = ?
+                ) AS forward_count
+        """, (channel_id, channel_id, channel_id, channel_id, channel_id, channel_id)).fetchone()
+
+        inbound_row = conn.execute("""
+            SELECT
+                (
+                    SELECT COALESCE(SUM(in_msat), 0)
+                    FROM forwards
+                    WHERE in_channel = ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_in_msat), 0)
+                    FROM daily_forwarding_stats_inbound
+                    WHERE channel_id = ?
+                ) AS in_msat,
+                (
+                    SELECT COALESCE(SUM(fee_msat), 0)
+                    FROM forwards
+                    WHERE in_channel = ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_fee_msat), 0)
+                    FROM daily_forwarding_stats_inbound
+                    WHERE channel_id = ?
+                ) AS fee_msat,
+                (
+                    SELECT COALESCE(COUNT(*), 0)
+                    FROM forwards
+                    WHERE in_channel = ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(forward_count), 0)
+                    FROM daily_forwarding_stats_inbound
+                    WHERE channel_id = ?
+                ) AS forward_count
+        """, (channel_id, channel_id, channel_id, channel_id, channel_id, channel_id)).fetchone()
+
+        return {
+            "fees_earned_sats": int((exit_row["fee_msat"] or 0) // 1000) if exit_row else 0,
+            "volume_routed_sats": int((exit_row["out_msat"] or 0) // 1000) if exit_row else 0,
+            "forward_count": int(exit_row["forward_count"] or 0) if exit_row else 0,
+            "sourced_volume_sats": int((inbound_row["in_msat"] or 0) // 1000) if inbound_row else 0,
+            "sourced_fee_contribution_sats": int((inbound_row["fee_msat"] or 0) // 1000) if inbound_row else 0,
+            "sourced_forward_count": int(inbound_row["forward_count"] or 0) if inbound_row else 0,
+        }
+
+    def get_all_channels_revenue_totals(self) -> Dict[str, Dict[str, int]]:
+        """
+        Get all-time routing metrics for all channels (since plugin started tracking).
+
+        Returns:
+            Dict[channel_id] -> dict with:
+              fees_earned_sats, volume_routed_sats, forward_count,
+              sourced_volume_sats, sourced_fee_contribution_sats, sourced_forward_count
+        """
+        conn = self._get_connection()
+
+        revenue: Dict[str, Dict[str, int]] = {}
+
+        # Exit-side aggregation (out_channel)
+        exit_rows = conn.execute("""
+            SELECT channel_id,
+                   COALESCE(SUM(fee_msat), 0) as fee_msat,
+                   COALESCE(SUM(out_msat), 0) as out_msat,
+                   COALESCE(SUM(cnt), 0) as forward_count
+            FROM (
+                SELECT out_channel as channel_id,
+                       SUM(fee_msat) as fee_msat,
+                       SUM(out_msat) as out_msat,
+                       COUNT(*) as cnt
+                FROM forwards
+                GROUP BY out_channel
+                UNION ALL
+                SELECT channel_id as channel_id,
+                       SUM(total_fee_msat) as fee_msat,
+                       SUM(total_out_msat) as out_msat,
+                       SUM(forward_count) as cnt
+                FROM daily_forwarding_stats
+                GROUP BY channel_id
+            )
+            GROUP BY channel_id
+        """).fetchall()
+
+        for r in exit_rows:
+            cid = r["channel_id"]
+            if not cid:
+                continue
+            revenue[cid] = {
+                "fees_earned_sats": int((r["fee_msat"] or 0) // 1000),
+                "volume_routed_sats": int((r["out_msat"] or 0) // 1000),
+                "forward_count": int(r["forward_count"] or 0),
+                "sourced_volume_sats": 0,
+                "sourced_fee_contribution_sats": 0,
+                "sourced_forward_count": 0,
+            }
+
+        # Entry-side aggregation (in_channel)
+        inbound_rows = conn.execute("""
+            SELECT channel_id,
+                   COALESCE(SUM(in_msat), 0) as in_msat,
+                   COALESCE(SUM(fee_msat), 0) as fee_msat,
+                   COALESCE(SUM(cnt), 0) as forward_count
+            FROM (
+                SELECT in_channel as channel_id,
+                       SUM(in_msat) as in_msat,
+                       SUM(fee_msat) as fee_msat,
+                       COUNT(*) as cnt
+                FROM forwards
+                GROUP BY in_channel
+                UNION ALL
+                SELECT channel_id as channel_id,
+                       SUM(total_in_msat) as in_msat,
+                       SUM(total_fee_msat) as fee_msat,
+                       SUM(forward_count) as cnt
+                FROM daily_forwarding_stats_inbound
+                GROUP BY channel_id
+            )
+            GROUP BY channel_id
+        """).fetchall()
+
+        for r in inbound_rows:
+            cid = r["channel_id"]
+            if not cid:
+                continue
+            if cid not in revenue:
+                revenue[cid] = {
+                    "fees_earned_sats": 0,
+                    "volume_routed_sats": 0,
+                    "forward_count": 0,
+                    "sourced_volume_sats": 0,
+                    "sourced_fee_contribution_sats": 0,
+                    "sourced_forward_count": 0,
+                }
+            revenue[cid]["sourced_volume_sats"] = int((r["in_msat"] or 0) // 1000)
+            revenue[cid]["sourced_fee_contribution_sats"] = int((r["fee_msat"] or 0) // 1000)
+            revenue[cid]["sourced_forward_count"] = int(r["forward_count"] or 0)
+
+        return revenue
 
     # =========================================================================
     # Atomic Budget Reservation System (CRITICAL-01 fix)
@@ -3785,6 +4081,30 @@ class Database:
                             total_fee_msat = total_fee_msat + excluded.total_fee_msat,
                             forward_count = forward_count + excluded.forward_count
                     """, (r['out_channel'], r['day_ts'], r['sum_in'], r['sum_out'], r['sum_fee'], r['count']))
+
+                # Also preserve entry-side contribution metrics (in_channel aggregation).
+                inbound_rows = conn.execute("""
+                    SELECT
+                        in_channel,
+                        (timestamp / 86400) * 86400 as day_ts,
+                        COALESCE(SUM(in_msat), 0) as sum_in,
+                        COALESCE(SUM(fee_msat), 0) as sum_fee,
+                        COUNT(*) as count
+                    FROM forwards
+                    WHERE timestamp < ?
+                    GROUP BY in_channel, day_ts
+                """, (cutoff,)).fetchall()
+
+                for r in inbound_rows:
+                    conn.execute("""
+                        INSERT INTO daily_forwarding_stats_inbound
+                        (channel_id, date, total_in_msat, total_fee_msat, forward_count)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(channel_id, date) DO UPDATE SET
+                            total_in_msat = total_in_msat + excluded.total_in_msat,
+                            total_fee_msat = total_fee_msat + excluded.total_fee_msat,
+                            forward_count = forward_count + excluded.forward_count
+                    """, (r['in_channel'], r['day_ts'], r['sum_in'], r['sum_fee'], r['count']))
                 
                 # We NO LONGER update lifetime_aggregates for new data, 
                 # but we leave the table alone as it contains legacy history.
