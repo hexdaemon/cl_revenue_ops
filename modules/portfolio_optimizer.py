@@ -314,7 +314,7 @@ class PortfolioOptimizer:
 
         Args:
             channels: List of channel info dicts from listpeerchannels
-            forwards: List of forward records from listforwards/bookkeeper
+            forwards: List of forward records (raw or bucketed), typically sourced from the local DB
             flow_states: Optional Kalman flow states per channel
 
         Returns:
@@ -391,11 +391,23 @@ class PortfolioOptimizer:
             avg_size = 0
             freq = 0.0
             if fwds:
-                sizes = [_safe_msat_to_sats(f.get("out_msat", 0)) for f in fwds]
-                sizes = [s for s in sizes if s > 0]  # Filter out invalid entries
-                avg_size = sum(sizes) // len(sizes) if sizes else 0
+                total_count = 0
+                total_out_sats = 0
+                for f in fwds:
+                    c = f.get("count", 1) or 0
+                    try:
+                        c = int(c)
+                    except Exception:
+                        c = 0
+                    if c <= 0:
+                        c = 1
+                    out_sats = _safe_msat_to_sats(f.get("out_msat", 0))
+                    if out_sats > 0:
+                        total_out_sats += out_sats
+                        total_count += c
+                avg_size = (total_out_sats // total_count) if total_count > 0 else 0
                 hours = (now - window_start) / 3600
-                freq = len(fwds) / hours if hours > 0 else 0
+                freq = (total_count / hours) if hours > 0 else 0
 
             stats[scid] = ChannelStatistics(
                 channel_id=scid,
@@ -493,21 +505,38 @@ class PortfolioOptimizer:
         if not forwards:
             return ChannelRole.UNKNOWN
 
-        # Check forward size distribution (safely handle msat values)
-        sizes = [_safe_msat_to_sats(fwd.get("out_msat", 0)) for fwd in forwards]
-        sizes = [s for s in sizes if s > 0]  # Filter invalid entries
+        # Check forward size distribution (safely handle msat values).
+        #
+        # Forwards may be raw per-event records OR bucketed aggregates from SQLite:
+        # bucketed rows include a `count` field with the number of forwards in the bucket.
+        total_count = 0
+        total_out_sats = 0
+        for fwd in forwards:
+            c = fwd.get("count", 1) or 0
+            try:
+                c = int(c)
+            except Exception:
+                c = 0
+            if c <= 0:
+                c = 1
 
-        if not sizes:
+            out_sats = _safe_msat_to_sats(fwd.get("out_msat", 0))
+            if out_sats <= 0:
+                continue
+            total_out_sats += out_sats
+            total_count += c
+
+        if total_count <= 0:
             return ChannelRole.UNKNOWN
 
-        avg_size = sum(sizes) / len(sizes)
+        avg_size = total_out_sats / total_count
 
         # Large average forwards suggest exchange
         if avg_size > 500000:  # > 500k sats average
             return ChannelRole.EXCHANGE
 
         # Many small forwards suggest merchant
-        if avg_size < 50000 and len(sizes) > 20:  # < 50k sats, many forwards
+        if avg_size < 50000 and total_count > 20:  # < 50k sats, many forwards
             return ChannelRole.MERCHANT
 
         # Otherwise routing node
@@ -1075,7 +1104,7 @@ class PortfolioOptimizer:
 
         Args:
             channels: Channel list from listpeerchannels
-            forwards: Forward list from listforwards/bookkeeper
+            forwards: Forward list (raw or bucketed), typically sourced from the local DB
             flow_states: Optional Kalman flow states
             risk_aversion: Risk aversion parameter (higher = more conservative)
 

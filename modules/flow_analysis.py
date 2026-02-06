@@ -19,9 +19,12 @@ v2.0 IMPROVEMENTS:
 - Flow Velocity Tracking: Detect acceleration/deceleration of flow
 - Adaptive EMA Decay: Faster decay for volatile channels
 
-Data Sources:
-1. bookkeeper plugin (preferred) - provides accounting-grade data
-2. listforwards RPC - fallback if bookkeeper unavailable
+Data Sources (steady state):
+1. Local `forwards` SQLite table populated by `forward_event`
+2. One-time startup hydration via `listforwards` to backfill gaps during downtime
+
+Bookkeeper is used elsewhere for on-chain cost attribution, but flow analysis itself
+does not require it.
 """
 
 import time
@@ -411,7 +414,7 @@ class FlowAnalyzer:
     Analyzes routing flow to classify channels as Source/Sink/Balanced.
     
     Flow Analysis Logic:
-    1. Query bookkeeper or listforwards for historical routing data
+    1. Query local SQLite forwards table (hydrated once on startup if needed)
     2. Calculate net flow for each channel using Exponential Moving Average (EMA)
     3. Compute FlowRatio = (EMA_Out - EMA_In) / Capacity
     4. Classify based on thresholds:
@@ -755,9 +758,8 @@ class FlowAnalyzer:
         
         self.plugin.log(f"Analyzing flow for {len(channels)} channels")
         
-        # Get flow data from listforwards (most reliable source with correct channel IDs)
-        # UPDATED: Now returns daily buckets for EMA calculation
-        flow_data_daily = self._get_daily_flow_from_listforwards()
+        # Get flow data from local forwards table (daily buckets for EMA calculation).
+        flow_data_daily = self._get_daily_flow_from_db()
         
         # Analyze each channel
         for channel in channels:
@@ -934,7 +936,7 @@ class FlowAnalyzer:
         our_balance = spendable_msat // 1000
 
         # Get daily flow data
-        flow_data_daily = self._get_daily_flow_from_listforwards(channel_id)
+        flow_data_daily = self._get_daily_flow_from_db(channel_id)
         channel_daily = flow_data_daily.get(channel_id, [])
 
         # v2.0: Calculate adaptive decay for this channel
@@ -1105,16 +1107,13 @@ class FlowAnalyzer:
             previous_ratio_timestamp=previous_ratio_ts
         )
     
-    def _get_daily_flow_from_listforwards(self, channel_id: Optional[str] = None) -> Dict[str, List[Dict[str, int]]]:
+    def _get_daily_flow_from_db(self, channel_id: Optional[str] = None) -> Dict[str, List[Dict[str, int]]]:
         """
-        Get daily flow buckets from local database.
-        
-        TODO #19: "Double-Dip" Fix - Uses local SQLite instead of listforwards RPC.
-        The forwards table is populated by the forward_event hook in real-time,
-        and hydrated on startup to fill any gaps while the plugin was offline.
-        
-        This eliminates the heaviest RPC call in the plugin, reducing CPU usage
-        by ~90% during flow analysis cycles on high-volume nodes.
+        Get daily flow buckets from the local forwards table (SQLite).
+
+        The forwards table is populated by the `forward_event` subscribe hook in real-time,
+        and hydrated on startup (one-time) to fill gaps while the plugin was offline.
+        Flow analysis does not use `listforwards` RPC in steady state.
         
         Instead of summing everything, this buckets data by day (0 = today, 1 = yesterday, etc.)
         to support EMA calculation.

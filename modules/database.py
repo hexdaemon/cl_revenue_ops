@@ -22,6 +22,8 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
+from .utils import normalize_scid
+
 
 class Database:
     """
@@ -2148,8 +2150,8 @@ class Database:
 
             for fwd in forwards:
                 try:
-                    in_chan = (fwd.get('in_channel', '') or '').replace(':', 'x')
-                    out_chan = (fwd.get('out_channel', '') or '').replace(':', 'x')
+                    in_chan = normalize_scid(fwd.get('in_channel', '') or '')
+                    out_chan = normalize_scid(fwd.get('out_channel', '') or '')
                     ts = int(fwd.get('received_time', 0) or 0)
                     rt = int(fwd.get('resolved_time', 0) or 0)
                     res_dur = float(fwd.get('resolution_time', 0) or 0)
@@ -2186,9 +2188,6 @@ class Database:
         This replaces the listforwards RPC call for flow analysis, providing
         the same data structure but from local SQLite aggregation.
 
-        TODO #19: This eliminates the heaviest RPC call in the plugin,
-        reducing CPU usage by ~90% during flow analysis cycles.
-
         v2.0: Now also returns count and last_ts per bucket for confidence calculation.
 
         Args:
@@ -2206,62 +2205,168 @@ class Database:
 
         flow_data: Dict[str, list] = {}
 
-        # Build query based on whether we're filtering by channel
-        if channel_id:
-            query = """
-                SELECT in_channel, out_channel, in_msat, out_msat, timestamp
-                FROM forwards
-                WHERE timestamp >= ? AND (in_channel = ? OR out_channel = ?)
-            """
-            params = (start_time, channel_id, channel_id)
-        else:
-            query = """
-                SELECT in_channel, out_channel, in_msat, out_msat, timestamp
-                FROM forwards
-                WHERE timestamp >= ?
-            """
-            params = (start_time,)
-
-        rows = conn.execute(query, params).fetchall()
-
         def init_bucket():
             """Initialize a single day bucket with v2.0 fields."""
             return {'in': 0, 'out': 0, 'count': 0, 'last_ts': 0}
 
+        # SQL aggregation (keeps flow analysis CPU/memory bounded on high-volume nodes).
+        #
+        # Each forward contributes to two channels:
+        # - in_channel: add to 'in'
+        # - out_channel: add to 'out'
+        #
+        # We UNION the two projections and then group.
+        if channel_id:
+            # Filter to a single channel efficiently (avoid scanning other channel_ids).
+            query = """
+                WITH flow AS (
+                    SELECT
+                        in_channel AS channel_id,
+                        CAST((? - timestamp) / 86400 AS INTEGER) AS age_days,
+                        SUM(in_msat) AS in_msat,
+                        0 AS out_msat,
+                        COUNT(*) AS cnt,
+                        MAX(timestamp) AS last_ts
+                    FROM forwards
+                    WHERE timestamp >= ? AND in_channel = ?
+                    GROUP BY in_channel, age_days
+
+                    UNION ALL
+
+                    SELECT
+                        out_channel AS channel_id,
+                        CAST((? - timestamp) / 86400 AS INTEGER) AS age_days,
+                        0 AS in_msat,
+                        SUM(out_msat) AS out_msat,
+                        COUNT(*) AS cnt,
+                        MAX(timestamp) AS last_ts
+                    FROM forwards
+                    WHERE timestamp >= ? AND out_channel = ?
+                    GROUP BY out_channel, age_days
+                )
+                SELECT
+                    channel_id,
+                    age_days,
+                    SUM(in_msat) AS in_msat,
+                    SUM(out_msat) AS out_msat,
+                    SUM(cnt) AS count,
+                    MAX(last_ts) AS last_ts
+                FROM flow
+                WHERE age_days >= 0 AND age_days < ?
+                GROUP BY channel_id, age_days
+            """
+            params = (now, start_time, channel_id, now, start_time, channel_id, window_days)
+        else:
+            query = """
+                WITH flow AS (
+                    SELECT
+                        in_channel AS channel_id,
+                        CAST((? - timestamp) / 86400 AS INTEGER) AS age_days,
+                        SUM(in_msat) AS in_msat,
+                        0 AS out_msat,
+                        COUNT(*) AS cnt,
+                        MAX(timestamp) AS last_ts
+                    FROM forwards
+                    WHERE timestamp >= ?
+                    GROUP BY in_channel, age_days
+
+                    UNION ALL
+
+                    SELECT
+                        out_channel AS channel_id,
+                        CAST((? - timestamp) / 86400 AS INTEGER) AS age_days,
+                        0 AS in_msat,
+                        SUM(out_msat) AS out_msat,
+                        COUNT(*) AS cnt,
+                        MAX(timestamp) AS last_ts
+                    FROM forwards
+                    WHERE timestamp >= ?
+                    GROUP BY out_channel, age_days
+                )
+                SELECT
+                    channel_id,
+                    age_days,
+                    SUM(in_msat) AS in_msat,
+                    SUM(out_msat) AS out_msat,
+                    SUM(cnt) AS count,
+                    MAX(last_ts) AS last_ts
+                FROM flow
+                WHERE age_days >= 0 AND age_days < ?
+                GROUP BY channel_id, age_days
+            """
+            params = (now, start_time, now, start_time, window_days)
+
+        rows = conn.execute(query, params).fetchall()
         for row in rows:
-            in_channel = row['in_channel']
-            out_channel = row['out_channel']
-            in_msat = row['in_msat'] or 0
-            out_msat = row['out_msat'] or 0
-            timestamp = row['timestamp']
-
-            # Calculate age in days (0 = today/last 24h)
-            age_days = int((now - timestamp) // 86400)
-            if age_days >= window_days:
+            cid = row["channel_id"]
+            if not cid:
                 continue
-
-            # Initialize bucket lists if needed (v2.0: with count and last_ts)
-            if in_channel and in_channel not in flow_data:
-                flow_data[in_channel] = [init_bucket() for _ in range(window_days)]
-            if out_channel and out_channel not in flow_data:
-                flow_data[out_channel] = [init_bucket() for _ in range(window_days)]
-
-            # Add to appropriate day bucket (convert msat to sats)
-            if in_channel:
-                bucket = flow_data[in_channel][age_days]
-                bucket['in'] += in_msat // 1000
-                bucket['count'] += 1
-                if timestamp > bucket['last_ts']:
-                    bucket['last_ts'] = timestamp
-
-            if out_channel:
-                bucket = flow_data[out_channel][age_days]
-                bucket['out'] += out_msat // 1000
-                bucket['count'] += 1
-                if timestamp > bucket['last_ts']:
-                    bucket['last_ts'] = timestamp
+            age_days = int(row["age_days"])
+            if age_days < 0 or age_days >= window_days:
+                continue
+            if cid not in flow_data:
+                flow_data[cid] = [init_bucket() for _ in range(window_days)]
+            bucket = flow_data[cid][age_days]
+            bucket["in"] += int(row["in_msat"] or 0) // 1000
+            bucket["out"] += int(row["out_msat"] or 0) // 1000
+            bucket["count"] += int(row["count"] or 0)
+            last_ts = int(row["last_ts"] or 0)
+            if last_ts > bucket["last_ts"]:
+                bucket["last_ts"] = last_ts
 
         return flow_data
+
+    def get_portfolio_forward_buckets(
+        self,
+        since_timestamp: int,
+        interval_hours: int = 4,
+        out_channels: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return bucketed forward data suitable for PortfolioOptimizer.
+
+        This avoids `listforwards` RPC and keeps result size bounded by aggregating
+        at a fixed time interval.
+
+        Returned records include:
+        - out_channel
+        - received_time (bucket start timestamp)
+        - fee_msat (sum)
+        - out_msat (sum)
+        - count (number of forwards in the bucket)
+        """
+        conn = self._get_connection()
+        interval_secs = max(1, int(interval_hours)) * 3600
+
+        params: List[Any] = [interval_secs, since_timestamp]
+        out_filter = ""
+        if out_channels:
+            placeholders = ",".join("?" for _ in out_channels)
+            out_filter = f" AND out_channel IN ({placeholders})"
+            params.extend(list(out_channels))
+
+        rows = conn.execute(f"""
+            SELECT
+                out_channel,
+                (timestamp / ?) * ? AS bucket_ts,
+                COALESCE(SUM(fee_msat), 0) AS fee_msat,
+                COALESCE(SUM(out_msat), 0) AS out_msat,
+                COUNT(*) AS count
+            FROM forwards
+            WHERE timestamp >= ? {out_filter}
+            GROUP BY out_channel, bucket_ts
+        """, params[:1] + params[:1] + params[1:]).fetchall()
+
+        result: List[Dict[str, Any]] = []
+        for r in rows:
+            result.append({
+                "out_channel": r["out_channel"],
+                "received_time": int(r["bucket_ts"] or 0),
+                "fee_msat": int(r["fee_msat"] or 0),
+                "out_msat": int(r["out_msat"] or 0),
+                "count": int(r["count"] or 0),
+            })
+        return result
     
     
     def record_forward(self, in_channel: str, out_channel: str,
