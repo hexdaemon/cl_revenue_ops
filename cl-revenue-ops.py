@@ -20,7 +20,8 @@ This allows us to:
 
 Dependencies:
 - pyln-client: Core Lightning plugin framework
-- bookkeeper plugin (built-in): Historical routing data
+- bookkeeper plugin (built-in): On-chain cost attribution (opens/closes/splices) and accounting-grade events
+- Local forwards table (SQLite): Routing history for flow analysis (hydrated once on startup)
 - External rebalancer (sling): Executes rebalance payments
 
 Author: Lightning Goats Team
@@ -53,11 +54,13 @@ from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
 from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
 from modules.hive_bridge import HiveFeeIntelligenceBridge
+from modules.utils import normalize_scid, parse_msat
 
 
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 #   - Replaces EMA with Kalman filter for optimal state estimation
 #   - Faster regime change detection via innovation monitoring
@@ -73,7 +76,7 @@ from modules.hive_bridge import HiveFeeIntelligenceBridge
 #   - Stigmergic modulation for exploration/exploitation
 #   - P2 fleet integration: elasticity sharing, curve aggregation,
 #     regime coordination, competition avoidance, profitability weighting
-PLUGIN_VERSION = "2.1.0"
+PLUGIN_VERSION = "2.2.4"
 
 
 # =============================================================================
@@ -912,8 +915,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         bookkeeper_found = any("bookkeeper" in name for name in active_plugins)
         if not bookkeeper_found:
             plugin.log(
-                "Dependency 'bookkeeper' not found. Using 'listforwards' fallback for flow analysis. "
-                "Enable bookkeeper for accurate cost tracking.",
+                "Dependency 'bookkeeper' not found. Flow analysis uses the local forwards table (hydrated once at startup). "
+                "Bookkeeper is still recommended for accurate on-chain cost tracking (opens/closes/splices).",
                 level='info'
             )
         else:
@@ -1093,6 +1096,44 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hive_bridge=hive_bridge
     )
     rebalancer.set_profitability_analyzer(profitability_analyzer)
+
+    # =========================================================================
+    # Hive Settlement / Yield Reporting (Issue #42)
+    # =========================================================================
+    # cl-hive supports settlement based on net yield (revenue - costs). We report
+    # routing revenue and operating costs periodically so the fleet can settle
+    # fairly across members with different rebalance spend profiles.
+    YIELD_REPORT_WINDOW_DAYS = 30
+    YIELD_REPORT_INTERVAL_SECONDS = 6 * 3600  # report at most every 6 hours
+    last_yield_report_time = 0
+
+    def _maybe_report_yield_and_costs() -> None:
+        nonlocal last_yield_report_time
+        if not hive_bridge:
+            return
+        try:
+            if not hive_bridge.is_available():
+                return
+        except Exception:
+            return
+
+        now = int(time.time())
+        if last_yield_report_time and (now - last_yield_report_time) < YIELD_REPORT_INTERVAL_SECONDS:
+            return
+
+        try:
+            tlv = profitability_analyzer.get_tlv().get("tlv_sats", 0)
+            pnl = profitability_analyzer.get_pnl_summary(window_days=YIELD_REPORT_WINDOW_DAYS)
+            hive_bridge.report_yield_and_costs(
+                tlv_sats=int(tlv or 0),
+                operating_costs_sats=int(pnl.get("opex_sats", 0) or 0),
+                routing_revenue_sats=int(pnl.get("gross_revenue_sats", 0) or 0),
+                rebalance_costs_sats=int(pnl.get("rebalance_cost_sats", 0) or 0),
+                period_days=YIELD_REPORT_WINDOW_DAYS,
+            )
+            last_yield_report_time = now
+        except Exception as e:
+            plugin.log(f"Hive yield/cost report failed (non-fatal): {e}", level="debug")
     
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
@@ -1138,21 +1179,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         if shutdown_event.wait(60):
             plugin.log("Fee adjustment loop cancelled during startup delay")
             return
-        
+
         while not shutdown_event.is_set():
             try:
                 plugin.log("Running scheduled fee adjustment...")
                 run_fee_adjustment()
+                _maybe_report_yield_and_costs()
             except (RPCTimeoutError, RPCBreakerOpen) as e:
                 plugin.log(f"RPC degraded in fee adjustment: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
                 plugin.log(f"Error in fee adjustment: {e}", level='error')
-            
+
             # Calculate +/- 20% jitter
             jitter_seconds = int(config.fee_interval * 0.2)
             sleep_time = config.fee_interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
-            
+
             # Interruptible sleep: wait for timeout OR shutdown signal
             if shutdown_event.wait(sleep_time):
                 plugin.log("Fee adjustment loop stopping due to shutdown signal")
@@ -1905,8 +1947,9 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
             }
     
     try:
-        result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True)
-        return {"status": "success", "channel": channel_id, "new_fee_ppm": fee_ppm, **result}
+        result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True, enforce_limits=(not force))
+        applied_fee = result.get("fee_ppm", fee_ppm)
+        return {"status": "success", "channel": channel_id, "new_fee_ppm": applied_fee, **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -2844,27 +2887,21 @@ def revenue_portfolio(
         # Get channel data
         channels = safe_plugin.rpc.listpeerchannels().get("channels", [])
 
-        # Get forwards from last 14 days
+        # Get forwards from local SQLite table (bucketed).
+        # This avoids calling listforwards, which can be expensive on large nodes.
         import time
         now = int(time.time())
         cutoff = now - (14 * 86400)
-
-        # Try bookkeeper first, fall back to listforwards
-        try:
-            income = safe_plugin.rpc.call("bkpr-listincome", {"consolidate_fees": False})
-            forwards = []
-            for event in income.get("income_events", []):
-                if event.get("tag") == "routed":
-                    forwards.append({
-                        "out_channel": event.get("outpoint", "").split(":")[0] if ":" in event.get("outpoint", "") else event.get("account", ""),
-                        "received_time": event.get("timestamp", 0),
-                        "fee_msat": event.get("credit_msat", 0),
-                        "out_msat": event.get("debit_msat", 0)
-                    })
-        except Exception:
-            # Fall back to listforwards
-            fwd_result = safe_plugin.rpc.listforwards(status="settled")
-            forwards = fwd_result.get("forwards", [])
+        out_scids = [
+            (ch.get("short_channel_id") or ch.get("channel_id"))
+            for ch in channels
+            if (ch.get("short_channel_id") or ch.get("channel_id"))
+        ]
+        forwards = database.get_portfolio_forward_buckets(
+            since_timestamp=cutoff,
+            interval_hours=4,
+            out_channels=out_scids
+        )
 
         # Get Kalman flow states if available
         flow_states = {}
@@ -2958,24 +2995,20 @@ def revenue_portfolio_rebalance(
         # Get channel data
         channels = safe_plugin.rpc.listpeerchannels().get("channels", [])
 
-        # Get forwards
+        # Get forwards from local SQLite table (bucketed).
         import time
         now = int(time.time())
-
-        try:
-            income = safe_plugin.rpc.call("bkpr-listincome", {"consolidate_fees": False})
-            forwards = []
-            for event in income.get("income_events", []):
-                if event.get("tag") == "routed":
-                    forwards.append({
-                        "out_channel": event.get("outpoint", "").split(":")[0] if ":" in event.get("outpoint", "") else event.get("account", ""),
-                        "received_time": event.get("timestamp", 0),
-                        "fee_msat": event.get("credit_msat", 0),
-                        "out_msat": event.get("debit_msat", 0)
-                    })
-        except Exception:
-            fwd_result = safe_plugin.rpc.listforwards(status="settled")
-            forwards = fwd_result.get("forwards", [])
+        cutoff = now - (14 * 86400)
+        out_scids = [
+            (ch.get("short_channel_id") or ch.get("channel_id"))
+            for ch in channels
+            if (ch.get("short_channel_id") or ch.get("channel_id"))
+        ]
+        forwards = database.get_portfolio_forward_buckets(
+            since_timestamp=cutoff,
+            interval_hours=4,
+            out_channels=out_scids
+        )
 
         optimizer = PortfolioOptimizer(
             database=database,
@@ -3087,7 +3120,7 @@ def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
         try:
             channels = safe_plugin.rpc.call("listpeerchannels")
             for ch in channels.get('channels', []):
-                scid = ch.get('short_channel_id', '').replace(':', 'x')
+                scid = normalize_scid(ch.get('short_channel_id', ''))
                 if scid:
                     open_ids.add(scid)
         except Exception as e:
@@ -3110,7 +3143,7 @@ def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
         try:
             closed_list = safe_plugin.rpc.call("listclosedchannels")
             for ch in closed_list.get('closedchannels', []):
-                scid = ch.get('short_channel_id', '').replace(':', 'x')
+                scid = normalize_scid(ch.get('short_channel_id', ''))
                 if scid:
                     closed_info[scid] = ch
         except Exception as e:
@@ -3232,8 +3265,8 @@ def on_htlc_accepted(onion: Dict, htlc: Dict, plugin: Plugin, **kwargs) -> Dict[
     We can use this to track live routing activity and update our flow metrics
     in real-time rather than waiting for periodic analysis.
     
-    For now, we just let it pass through - the periodic analysis from bookkeeper
-    is sufficient for initial implementation.
+    For now, we just let it pass through. Periodic flow analysis is computed from
+    the local forwards table (and hydrated on startup if needed).
     """
     # Just continue - we don't want to interfere with routing
     return {"result": "continue"}
@@ -3253,10 +3286,12 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
         peer_id (node pubkey) or None if not found
     """
     global _scid_to_peer_cache
-    
+
+    scid_norm = normalize_scid(scid)
+
     # Check cache first
-    if scid in _scid_to_peer_cache:
-        return _scid_to_peer_cache[scid]
+    if scid_norm in _scid_to_peer_cache:
+        return _scid_to_peer_cache[scid_norm]
     
     # Cache miss - refresh cache from listpeerchannels
     # Use safe_plugin for thread-safe RPC access
@@ -3266,10 +3301,10 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
             channel_scid = channel.get("short_channel_id") or channel.get("channel_id")
             peer_id = channel.get("peer_id")
             if channel_scid and peer_id:
-                _scid_to_peer_cache[channel_scid] = peer_id
-        
+                _scid_to_peer_cache[normalize_scid(channel_scid)] = peer_id
+
         # Try again after refresh
-        return _scid_to_peer_cache.get(scid)
+        return _scid_to_peer_cache.get(scid_norm)
     except RpcError as e:
         plugin.log(f"Error resolving SCID {scid} to peer: {e}", level='warn')
         return None
@@ -3280,24 +3315,7 @@ def _parse_msat(msat_val: Any) -> int:
     Safely convert msat values to integers.
     Handles '1000msat' strings, raw integers, Millisatoshi objects, and plain numeric strings.
     """
-    if msat_val is None:
-        return 0
-    if hasattr(msat_val, 'millisatoshis'):
-        return int(msat_val.millisatoshis)
-    if isinstance(msat_val, int):
-        return msat_val
-    if isinstance(msat_val, str):
-        # Strip suffix if present
-        if msat_val.endswith('msat'):
-            clean_val = msat_val[:-4]
-        else:
-            clean_val = msat_val
-            
-        try:
-            return int(clean_val)
-        except ValueError:
-            return 0
-    return 0
+    return parse_msat(msat_val)
 
 
 @plugin.subscribe("forward_event")
@@ -3315,33 +3333,25 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         return
     
     status = forward_event.get("status")
-    in_channel = forward_event.get("in_channel")
-    
-    # Normalize SCID: replace colons with 'x' for consistency
-    if in_channel:
-        in_channel = in_channel.replace(':', 'x')
-    
+    in_channel = normalize_scid(forward_event.get("in_channel")) if forward_event.get("in_channel") else None
+
     # Track peer reputation for all forward outcomes
     if in_channel:
         peer_id = _resolve_scid_to_peer(in_channel)
         if peer_id:
             if status == "settled":
-                # Success - increment success count
                 database.update_peer_reputation(peer_id, is_success=True)
             elif status in ("failed", "local_failed"):
-                # Failure - increment failure count
                 database.update_peer_reputation(peer_id, is_success=False)
 
                 # Report failure to cl-hive for pheromone evaporation (Yield Optimization Phase 2)
-                # Failed forwards cause pheromone to evaporate, triggering fee exploration
                 if hive_bridge:
                     try:
                         out_channel = forward_event.get("out_channel")
+                        out_channel = normalize_scid(out_channel) if out_channel else None
                         if out_channel:
-                            out_channel = out_channel.replace(':', 'x')
                             out_peer_id = _resolve_scid_to_peer(out_channel)
                             if out_peer_id:
-                                # Report failure with 0 amount to trigger evaporation
                                 hive_bridge.report_routing_outcome(
                                     channel_id=out_channel,
                                     peer_id=out_peer_id,
@@ -3349,7 +3359,7 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
                                     success=False,
                                     amount_sats=0,
                                     source=peer_id,
-                                    destination=out_peer_id
+                                    destination=out_peer_id,
                                 )
                     except Exception as e:
                         plugin.log(f"FORWARD_EVENT: Hive failure report failed: {e}", level="debug")
@@ -3357,24 +3367,30 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     # Record successful forwards for flow metrics
     if status == "settled":
         out_channel = forward_event.get("out_channel")
-        if out_channel:
-            out_channel = out_channel.replace(':', 'x')
-            
+        out_channel = normalize_scid(out_channel) if out_channel else None
+
         # CLN v23.05+ uses in_msat/out_msat/fee_msat; older versions used *_msatoshi
         in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
         out_msat = _parse_msat(forward_event.get("out_msat", forward_event.get("out_msatoshi", 0)))
         fee_msat = _parse_msat(forward_event.get("fee_msat", forward_event.get("fee_msatoshi", 0)))
-        
+
         # Calculate resolution duration (Risk Premium tracking)
-        # durations in CLN are usually in seconds (float)
-        received_time = forward_event.get("received_time", 0)
-        resolved_time = forward_event.get("resolved_time", 0)
+        received_time = int(forward_event.get("received_time", 0) or 0)
+        resolved_time = int(forward_event.get("resolved_time", 0) or 0)
         resolution_duration = resolved_time - received_time if resolved_time > 0 else 0
-        
-        database.record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat, int(received_time or 0), int(resolved_time or 0), resolution_duration)
+
+        database.record_forward(
+            in_channel or "",
+            out_channel or "",
+            in_msat,
+            out_msat,
+            fee_msat,
+            received_time,
+            resolved_time,
+            resolution_duration,
+        )
 
         # Report routing outcome to cl-hive for stigmergic learning (Yield Optimization Phase 2)
-        # This enables pheromone-based fee learning and fleet coordination
         if hive_bridge and out_channel:
             try:
                 out_peer_id = _resolve_scid_to_peer(out_channel)
@@ -3389,11 +3405,10 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
                         fee_ppm=fee_ppm,
                         success=True,
                         amount_sats=amount_sats,
-                        source=in_peer_id,  # Where payment came from
-                        destination=out_peer_id  # Where it went
+                        source=in_peer_id,
+                        destination=out_peer_id,
                     )
             except Exception as e:
-                # Don't let hive reporting failures affect core functionality
                 plugin.log(f"FORWARD_EVENT: Hive routing outcome report failed: {e}", level="debug")
 
 
@@ -3503,7 +3518,7 @@ def on_channel_state_changed(plugin: Plugin, **kwargs):
         return
 
     # Normalize channel_id format
-    channel_id = channel_id.replace(':', 'x')
+    channel_id = normalize_scid(channel_id)
 
     # =========================================================================
     # Channel Open Detection (Hive Integration)
@@ -3863,7 +3878,7 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
             try:
                 channels = safe_plugin.rpc.call("listpeerchannels", {"id": peer_id})
                 for ch in channels.get('channels', []):
-                    scid = ch.get('short_channel_id', '').replace(':', 'x')
+                    scid = normalize_scid(ch.get('short_channel_id', ''))
                     if scid == channel_id:
                         opener = ch.get('opener', 'unknown')
                         break
@@ -3878,7 +3893,7 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
         try:
             channels = safe_plugin.rpc.call("listpeerchannels", {"id": peer_id})
             for ch in channels.get('channels', []):
-                scid = ch.get('short_channel_id', '').replace(':', 'x')
+                scid = normalize_scid(ch.get('short_channel_id', ''))
                 if scid == channel_id:
                     capacity_sats = ch.get('total_msat', 0) // 1000
                     our_funding_sats = ch.get('funding', {}).get('local_funds_msat', 0) // 1000
@@ -4042,7 +4057,7 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
             try:
                 closed = safe_plugin.rpc.call("listclosedchannels")
                 for ch in closed.get('closedchannels', []):
-                    if ch.get('short_channel_id', '').replace(':', 'x') == channel_id:
+                    if normalize_scid(ch.get('short_channel_id', '')) == channel_id:
                         capacity_sats = ch.get('total_msat', 0) // 1000
                         if not peer_id:
                             peer_id = ch.get('peer_id')
@@ -4148,7 +4163,7 @@ def _handle_splice_completion(channel_id: str, peer_id: Optional[str]) -> None:
                 try:
                     peers = safe_plugin.rpc.listpeerchannels()
                     for ch in peers.get('channels', []):
-                        scid = ch.get('short_channel_id', '').replace(':', 'x')
+                        scid = normalize_scid(ch.get('short_channel_id', ''))
                         if scid == channel_id:
                             new_capacity = ch.get('total_msat', 0) // 1000
                             if not peer_id:

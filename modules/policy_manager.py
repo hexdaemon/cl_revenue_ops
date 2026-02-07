@@ -336,10 +336,30 @@ class PolicyManager:
             # Old schema without v2.0 columns - use defaults
             pass
 
+        try:
+            strategy = FeeStrategy(row['strategy'])
+        except ValueError:
+            self.plugin.log(
+                f"PolicyManager: Invalid strategy '{row['strategy']}' for peer "
+                f"{row['peer_id'][:12]}..., defaulting to dynamic",
+                level='unusual'
+            )
+            strategy = FeeStrategy.DYNAMIC
+
+        try:
+            rebalance_mode = RebalanceMode(row['rebalance_mode'])
+        except ValueError:
+            self.plugin.log(
+                f"PolicyManager: Invalid rebalance_mode '{row['rebalance_mode']}' for peer "
+                f"{row['peer_id'][:12]}..., defaulting to enabled",
+                level='unusual'
+            )
+            rebalance_mode = RebalanceMode.ENABLED
+
         return PeerPolicy(
             peer_id=row['peer_id'],
-            strategy=FeeStrategy(row['strategy']),
-            rebalance_mode=RebalanceMode(row['rebalance_mode']),
+            strategy=strategy,
+            rebalance_mode=rebalance_mode,
             fee_ppm_target=row['fee_ppm_target'],
             tags=tags if isinstance(tags, list) else [],
             updated_at=row['updated_at'],
@@ -466,7 +486,7 @@ class PolicyManager:
             row = conn.execute(
                 "SELECT MAX(updated_at) as max_ts FROM peer_policies"
             ).fetchone()
-            return row['max_ts'] or 0 if row else 0
+            return (row['max_ts'] or 0) if row else 0
         except Exception as e:
             self.plugin.log(
                 f"PolicyManager: Error getting last change timestamp: {e}",
@@ -672,12 +692,12 @@ class PolicyManager:
     def get_all_policies(self) -> List[PeerPolicy]:
         """
         Get all explicitly configured policies.
-        
+
         Returns:
-            List of PeerPolicy objects
+            List of non-expired PeerPolicy objects
         """
         self._load_cache()
-        return list(self._cache.values())
+        return [p for p in self._cache.values() if not p.is_expired()]
     
     # =========================================================================
     # Tag Management
@@ -731,28 +751,28 @@ class PolicyManager:
     def get_peers_by_tag(self, tag: str) -> List[PeerPolicy]:
         """
         Get all peers with a specific tag.
-        
+
         Args:
             tag: Tag string to search for
-            
+
         Returns:
-            List of PeerPolicy objects with the tag
+            List of non-expired PeerPolicy objects with the tag
         """
         self._load_cache()
-        return [p for p in self._cache.values() if p.has_tag(tag)]
-    
+        return [p for p in self._cache.values() if p.has_tag(tag) and not p.is_expired()]
+
     def get_peers_by_strategy(self, strategy: FeeStrategy) -> List[PeerPolicy]:
         """
         Get all peers with a specific fee strategy.
-        
+
         Args:
             strategy: FeeStrategy enum value
-            
+
         Returns:
-            List of PeerPolicy objects with that strategy
+            List of non-expired PeerPolicy objects with that strategy
         """
         self._load_cache()
-        return [p for p in self._cache.values() if p.strategy == strategy]
+        return [p for p in self._cache.values() if p.strategy == strategy and not p.is_expired()]
     
     # =========================================================================
     # Convenience Methods for Logic Cores

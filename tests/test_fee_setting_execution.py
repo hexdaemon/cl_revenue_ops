@@ -1,0 +1,312 @@
+import sys
+import os
+import time
+from unittest.mock import MagicMock
+
+import pytest
+
+# Ensure project root is importable (matches other tests)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _listpeerchannels_payload(channel_id: str, peer_id: str, fee_ppm: int = 100):
+    return {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "short_channel_id": channel_id,
+                "peer_id": peer_id,
+                "spendable_msat": 500_000_000,
+                "receivable_msat": 500_000_000,
+                "total_msat": 1_000_000_000,
+                "updates": {
+                    "local": {
+                        "fee_base_msat": 0,
+                        "fee_proportional_millionths": fee_ppm
+                    }
+                }
+            }
+        ]
+    }
+
+
+def _fee_strategy_state_dict():
+    # Minimal dict for _get_hill_climb_state/_get_thompson_aimd_state loaders.
+    return {
+        "last_revenue_rate": 0.0,
+        "last_fee_ppm": 0,
+        "trend_direction": 1,
+        "step_ppm": 50,
+        "last_update": 0,
+        "consecutive_same_direction": 0,
+        "is_sleeping": 0,
+        "sleep_until": 0,
+        "stable_cycles": 0,
+        "last_broadcast_fee_ppm": 0,
+        "last_state": "balanced",
+        "forward_count_since_update": 0,
+        "last_volume_sats": 0,
+        "v2_state_json": "{}",
+    }
+
+
+class TestSetChannelFeeLimits:
+    def test_set_channel_fee_enforces_limits_by_default(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel.return_value = True
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        # State loaders/savers
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+
+        fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=True)
+
+        # Should clamp up to min_fee_ppm
+        mock_plugin.rpc.setchannel.assert_called()
+        _, feebase_msat, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        assert feebase_msat == 0
+        assert applied_fee == 10
+
+    def test_set_channel_fee_can_bypass_limits_for_force(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel.return_value = True
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+
+        fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=False)
+
+        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        assert applied_fee == 1
+
+    def test_set_channel_fee_allows_zero_for_hive_policy(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController, FeeReasonCode
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel.return_value = True
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+
+        fc.set_channel_fee(
+            channel_id,
+            0,
+            reason="Policy: HIVE",
+            reason_code=FeeReasonCode.POLICY_HIVE.value,
+            enforce_limits=False
+        )
+
+        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        assert applied_fee == 0
+
+
+class TestGossipRefreshExecution:
+    def test_gossip_refresh_executes_setchannel_and_returns_fee_adjustment(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController, HillClimbState, FeeReasonCode
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel.return_value = True
+
+        # set_channel_fee verifies on-chain fee by calling listpeerchannels again.
+        # Simulate that the fee actually changes after setchannel.
+        mock_plugin.rpc.listpeerchannels.side_effect = [
+            _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100),  # initial read
+            _listpeerchannels_payload(channel_id, peer_id, fee_ppm=101),  # verify read
+            _listpeerchannels_payload(channel_id, peer_id, fee_ppm=101),  # (possible) second verify
+        ]
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 86400 * 2
+
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+
+        # Provide a real-ish state and ensure the fee change will be applied.
+        st = HillClimbState(
+            last_update=int(time.time()) - 86400 * 2,
+            last_broadcast_fee_ppm=100,
+            last_fee_ppm=100,
+            last_gossip_refresh=0
+        )
+
+        adj = fc._create_gossip_refresh_adjustment(
+            channel_id=channel_id,
+            peer_id=peer_id,
+            state=st,
+            current_fee_ppm=100,
+            current_time=int(time.time())
+        )
+
+        assert adj is not None
+        assert adj.reason_code == FeeReasonCode.GOSSIP_REFRESH.value
+        assert adj.new_fee_ppm in (99, 101)
+        mock_plugin.rpc.setchannel.assert_called()
+
+
+class TestZeroFeeProbeEndToEnd:
+    def test_zero_fee_probe_sets_fee_to_zero_bypassing_min_fee(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController, FeeReasonCode
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False, enable_reputation=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel.return_value = True
+
+        # set_channel_fee verifies with listpeerchannels after setchannel.
+        fee_holder = {"fee": 100}
+        mock_plugin.rpc.setchannel = MagicMock(side_effect=lambda _cid, _base, fee: fee_holder.__setitem__("fee", fee))
+        mock_plugin.rpc.listpeerchannels = MagicMock(side_effect=lambda: _listpeerchannels_payload(channel_id, peer_id, fee_ppm=fee_holder["fee"]))
+
+        # Minimal DB stubs used by _adjust_channel_fee
+        db_state = _fee_strategy_state_dict()
+        db_state["last_update"] = int(time.time()) - 7200
+        mock_database.get_fee_strategy_state.return_value = db_state
+        mock_database.update_fee_strategy_state = MagicMock()
+        mock_database.record_fee_change = MagicMock()
+
+        mock_database.get_channel_probe.return_value = {"started": int(time.time()) - 7200}
+        mock_database.clear_channel_probe = MagicMock()
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_peer_latency_stats.return_value = {"avg": 0.0, "std": 0.0}
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_recent_fee_changes.return_value = []
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 86400 * 10
+        mock_database.get_channel_cost_history.return_value = []
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+        # Keep the test focused on probe behavior (avoid Thompson path complexity).
+        fc.ENABLE_THOMPSON_AIMD = False
+        fc.ENABLE_DYNAMIC_WINDOWS = False
+        fc.ENABLE_SATURATION_FLOOR = False
+        fc.ENABLE_BALANCE_FLOOR = False
+        fc.ENABLE_REBALANCE_FLOOR = False
+        fc.ENABLE_FLOW_CEILING = False
+
+        channel_info = {
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "capacity": 1_000_000,
+            "spendable_msat": 500_000_000,
+            "receivable_msat": 500_000_000,
+            "fee_base_msat": 0,
+            "fee_proportional_millionths": 100,
+            "opener": "local",
+        }
+        flow_state = {"state": "balanced", "forward_count": 0, "sats_out": 0}
+
+        adj = fc._adjust_channel_fee(channel_id, peer_id, flow_state, channel_info, chain_costs=None, cfg=cfg.snapshot())
+        assert adj is not None
+        assert adj.reason_code == FeeReasonCode.ZERO_FEE_PROBE.value
+
+        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        assert applied_fee == 0
+
+    def test_zero_fee_probe_success_exits_to_floor_and_clears_probe(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController, FeeReasonCode
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False, enable_reputation=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel.return_value = True
+
+        # Fee is currently 0 (probe already active), and we observed volume -> success.
+        fee_holder = {"fee": 0}
+        mock_plugin.rpc.setchannel = MagicMock(side_effect=lambda _cid, _base, fee: fee_holder.__setitem__("fee", fee))
+        mock_plugin.rpc.listpeerchannels = MagicMock(side_effect=lambda: _listpeerchannels_payload(channel_id, peer_id, fee_ppm=fee_holder["fee"]))
+
+        db_state = _fee_strategy_state_dict()
+        db_state["last_update"] = int(time.time()) - 7200
+        db_state["last_broadcast_fee_ppm"] = 0
+        mock_database.get_fee_strategy_state.return_value = db_state
+        mock_database.update_fee_strategy_state = MagicMock()
+        mock_database.record_fee_change = MagicMock()
+
+        mock_database.get_channel_probe.return_value = {"started": int(time.time()) - 7200}
+        mock_database.clear_channel_probe = MagicMock()
+        mock_database.get_volume_since.return_value = 100_000  # any >0 means probe success
+        mock_database.get_forward_count_since.return_value = 1
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_peer_latency_stats.return_value = {"avg": 0.0, "std": 0.0}
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_recent_fee_changes.return_value = []
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 3600
+        mock_database.get_channel_cost_history.return_value = []
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+        fc.ENABLE_THOMPSON_AIMD = False
+        fc.ENABLE_DYNAMIC_WINDOWS = False
+        fc.ENABLE_SATURATION_FLOOR = False
+        fc.ENABLE_BALANCE_FLOOR = False
+        fc.ENABLE_REBALANCE_FLOOR = False
+        fc.ENABLE_FLOW_CEILING = False
+
+        channel_info = {
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "capacity": 1_000_000,
+            "spendable_msat": 500_000_000,
+            "receivable_msat": 500_000_000,
+            "fee_base_msat": 0,
+            "fee_proportional_millionths": 0,
+            "opener": "local",
+        }
+        flow_state = {"state": "balanced", "forward_count": 0, "sats_out": 0}
+
+        adj = fc._adjust_channel_fee(channel_id, peer_id, flow_state, channel_info, chain_costs=None, cfg=cfg.snapshot())
+        assert adj is not None
+        assert adj.reason_code == FeeReasonCode.ZERO_FEE_PROBE_SUCCESS.value
+        assert adj.new_fee_ppm >= 10
+
+        mock_database.clear_channel_probe.assert_called()
+        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        assert applied_fee == adj.new_fee_ppm

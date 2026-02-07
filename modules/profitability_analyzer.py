@@ -404,8 +404,8 @@ class ChannelProfitabilityAnalyzer:
         """
         Analyze profitability for all channels.
 
-        This method is optimized to batch fetch revenue data with a single
-        RPC call to listforwards, avoiding N+1 query overhead.
+        This method is optimized to batch fetch revenue data from the local
+        database, avoiding N+1 per-channel RPC calls.
 
         Uses a lock to prevent concurrent analysis stampede - if another thread
         is already analyzing, returns the existing cache instead of duplicating work.
@@ -455,8 +455,12 @@ class ChannelProfitabilityAnalyzer:
 
             # Report health and liquidity to cl-hive for fleet coordination
             # INFORMATION ONLY - no fund transfers between nodes
-            self._report_health_to_hive()
-            self._report_liquidity_state_to_hive()
+            # Non-critical: failures here should not invalidate the analysis
+            try:
+                self._report_health_to_hive()
+                self._report_liquidity_state_to_hive()
+            except Exception as e:
+                self.plugin.log(f"Hive reporting failed (non-critical): {e}", level='debug')
 
         except Exception as e:
             self.plugin.log(f"Error in profitability analysis: {e}", level='error')
@@ -1292,36 +1296,42 @@ class ChannelProfitabilityAnalyzer:
             channels = self._get_all_channels()
 
             for channel_id, info in channels.items():
-                # Get FULL P&L including inbound contribution
-                pnl = self.database.get_channel_full_pnl(channel_id, window_days)
+                try:
+                    # Get FULL P&L including inbound contribution
+                    pnl = self.database.get_channel_full_pnl(channel_id, window_days)
 
-                # Total activity = exit forwards + sourced forwards
-                total_activity = pnl['direct_forward_count'] + pnl['sourced_forward_count']
+                    # Total activity = exit forwards + sourced forwards
+                    total_activity = pnl.get('direct_forward_count', 0) + pnl.get('sourced_forward_count', 0)
 
-                # Check for bleeder condition: net < 0 AND has activity
-                # Now uses total_contribution which includes sourced fee value
-                if pnl['net_pnl_sats'] < 0 and total_activity > 0:
-                    bleeders.append({
-                        'channel_id': channel_id,
-                        'peer_id': info.get('peer_id', ''),
-                        'capacity_sats': info.get('capacity', 0),
-                        # Direct revenue (as exit channel)
-                        'direct_revenue_sats': pnl['direct_revenue_sats'],
-                        # Inbound contribution (fees enabled by sourcing volume)
-                        'sourced_fee_contribution_sats': pnl['sourced_fee_contribution_sats'],
-                        'sourced_volume_sats': pnl['sourced_volume_sats'],
-                        # Combined metrics
-                        'total_contribution_sats': pnl['total_contribution_sats'],
-                        'rebalance_cost_sats': pnl['rebalance_cost_sats'],
-                        'net_pnl_sats': pnl['net_pnl_sats'],
-                        'direct_forward_count': pnl['direct_forward_count'],
-                        'sourced_forward_count': pnl['sourced_forward_count'],
-                        'total_forward_count': total_activity,
-                        'loss_per_forward': abs(pnl['net_pnl_sats']) // max(total_activity, 1),
-                        # Legacy fields for backward compatibility
-                        'revenue_sats': pnl['direct_revenue_sats'],
-                        'forward_count': pnl['direct_forward_count']
-                    })
+                    # Check for bleeder condition: net < 0 AND has activity
+                    # Now uses total_contribution which includes sourced fee value
+                    net_pnl = pnl.get('net_pnl_sats', 0)
+                    if net_pnl < 0 and total_activity > 0:
+                        bleeders.append({
+                            'channel_id': channel_id,
+                            'peer_id': info.get('peer_id', ''),
+                            'capacity_sats': info.get('capacity', 0),
+                            # Direct revenue (as exit channel)
+                            'direct_revenue_sats': pnl.get('direct_revenue_sats', 0),
+                            # Inbound contribution (fees enabled by sourcing volume)
+                            'sourced_fee_contribution_sats': pnl.get('sourced_fee_contribution_sats', 0),
+                            'sourced_volume_sats': pnl.get('sourced_volume_sats', 0),
+                            # Combined metrics
+                            'total_contribution_sats': pnl.get('total_contribution_sats', 0),
+                            'rebalance_cost_sats': pnl.get('rebalance_cost_sats', 0),
+                            'net_pnl_sats': net_pnl,
+                            'direct_forward_count': pnl.get('direct_forward_count', 0),
+                            'sourced_forward_count': pnl.get('sourced_forward_count', 0),
+                            'total_forward_count': total_activity,
+                            'loss_per_forward': abs(net_pnl) // max(total_activity, 1),
+                            # Legacy fields for backward compatibility
+                            'revenue_sats': pnl.get('direct_revenue_sats', 0),
+                            'forward_count': pnl.get('direct_forward_count', 0)
+                        })
+                except Exception as e:
+                    self.plugin.log(
+                        f"Error getting P&L for channel {channel_id}: {e}", level='debug'
+                    )
 
             # Sort by loss (most negative first)
             bleeders.sort(key=lambda x: x['net_pnl_sats'])
@@ -1366,67 +1376,72 @@ class ChannelProfitabilityAnalyzer:
             channels = self._get_all_channels()
 
             for channel_id, info in channels.items():
-                peer_id = info.get('peer_id', '')
+                try:
+                    peer_id = info.get('peer_id', '')
 
-                # Get 30-day P&L
-                pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days)
+                    # Get 30-day P&L
+                    pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days)
 
-                # Get 7-day P&L for soft bleeder detection
-                pnl_7d = self.database.get_channel_full_pnl(channel_id, 7)
+                    # Get 7-day P&L for soft bleeder detection
+                    pnl_7d = self.database.get_channel_full_pnl(channel_id, 7)
 
-                # Extract metrics
-                rebalance_cost_30d = pnl_30d['rebalance_cost_sats']
-                revenue_30d = pnl_30d['total_contribution_sats']
-                net_profit_30d = pnl_30d['net_pnl_sats']
-                net_profit_7d = pnl_7d['net_pnl_sats']
+                    # Extract metrics
+                    rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
+                    revenue_30d = pnl_30d.get('total_contribution_sats', 0)
+                    net_profit_30d = pnl_30d.get('net_pnl_sats', 0)
+                    net_profit_7d = pnl_7d.get('net_pnl_sats', 0)
 
-                # Classify the channel
-                classification = "none"
-                reason = "Channel is profitable or break-even"
-                recommended_action = "monitor"
+                    # Classify the channel
+                    classification = "none"
+                    reason = "Channel is profitable or break-even"
+                    recommended_action = "monitor"
 
-                # Check for HARD BLEEDER first (most severe)
-                # Condition: rebal_cost > 2x revenue AND net_profit < -1000 sats
-                if (rebalance_cost_30d > revenue_30d * 2 and
-                        net_profit_30d < -1000):
-                    classification = "hard"
-                    reason = (f"Rebalance cost ({rebalance_cost_30d} sats) exceeds "
-                              f"2x revenue ({revenue_30d * 2} sats), net loss {net_profit_30d} sats")
-                    recommended_action = "disable_rebalance"
-
-                # Check for SOFT BLEEDER (short-term loss, long-term gain)
-                # Condition: 7d negative AND 30d positive
-                elif net_profit_7d < 0 and net_profit_30d > 0:
-                    classification = "soft"
-                    reason = (f"Short-term loss (7d: {net_profit_7d} sats) but "
-                              f"long-term gain (30d: {net_profit_30d} sats)")
-                    recommended_action = "reduce_rebalance"
-
-                # Check for sustained bleeding (both windows negative)
-                elif net_profit_30d < 0 and net_profit_7d < 0:
-                    # Both windows negative - check severity
-                    if abs(net_profit_30d) > 1000:
+                    # Check for HARD BLEEDER first (most severe)
+                    # Condition: rebal_cost > 2x revenue AND net_profit < -1000 sats
+                    if (rebalance_cost_30d > revenue_30d * 2 and
+                            net_profit_30d < -1000):
                         classification = "hard"
-                        reason = (f"Sustained losses: 7d={net_profit_7d} sats, "
-                                  f"30d={net_profit_30d} sats")
+                        reason = (f"Rebalance cost ({rebalance_cost_30d} sats) exceeds "
+                                  f"2x revenue ({revenue_30d * 2} sats), net loss {net_profit_30d} sats")
                         recommended_action = "disable_rebalance"
-                    else:
+
+                    # Check for SOFT BLEEDER (short-term loss, long-term gain)
+                    # Condition: 7d negative AND 30d positive
+                    elif net_profit_7d < 0 and net_profit_30d > 0:
                         classification = "soft"
-                        reason = (f"Minor sustained losses: 7d={net_profit_7d} sats, "
-                                  f"30d={net_profit_30d} sats")
+                        reason = (f"Short-term loss (7d: {net_profit_7d} sats) but "
+                                  f"long-term gain (30d: {net_profit_30d} sats)")
                         recommended_action = "reduce_rebalance"
 
-                classifications.append(BleederClassification(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    classification=classification,
-                    reason=reason,
-                    rebalance_cost_30d=rebalance_cost_30d,
-                    revenue_30d=revenue_30d,
-                    net_profit_30d=net_profit_30d,
-                    net_profit_7d=net_profit_7d,
-                    recommended_action=recommended_action
-                ))
+                    # Check for sustained bleeding (both windows negative)
+                    elif net_profit_30d < 0 and net_profit_7d < 0:
+                        # Both windows negative - check severity
+                        if abs(net_profit_30d) > 1000:
+                            classification = "hard"
+                            reason = (f"Sustained losses: 7d={net_profit_7d} sats, "
+                                      f"30d={net_profit_30d} sats")
+                            recommended_action = "disable_rebalance"
+                        else:
+                            classification = "soft"
+                            reason = (f"Minor sustained losses: 7d={net_profit_7d} sats, "
+                                      f"30d={net_profit_30d} sats")
+                            recommended_action = "reduce_rebalance"
+
+                    classifications.append(BleederClassification(
+                        channel_id=channel_id,
+                        peer_id=peer_id,
+                        classification=classification,
+                        reason=reason,
+                        rebalance_cost_30d=rebalance_cost_30d,
+                        revenue_30d=revenue_30d,
+                        net_profit_30d=net_profit_30d,
+                        net_profit_7d=net_profit_7d,
+                        recommended_action=recommended_action
+                    ))
+                except Exception as e:
+                    self.plugin.log(
+                        f"Error classifying bleeder for channel {channel_id}: {e}", level='debug'
+                    )
 
             # Log summary
             hard_count = sum(1 for c in classifications if c.is_hard_bleeder)
@@ -2159,75 +2174,34 @@ class ChannelProfitabilityAnalyzer:
     
     def _get_all_revenue_data(self) -> Dict[str, ChannelRevenue]:
         """
-        Batch fetch revenue data for all channels with a single RPC call.
+        Batch fetch revenue data for all channels from the local database.
 
-        This method calls listforwards(status="settled") once and aggregates:
+        Aggregates:
         - Exit metrics: fees_earned and volume_routed by out_channel
         - Entry metrics: sourced_volume and sourced_fee_contribution by in_channel
 
-        This provides a complete picture of channel value, including channels
-        that primarily source inbound volume rather than earn exit fees.
+        Uses the forwards table for recent data and daily rollups for pruned
+        history (see Database.cleanup_old_data()).
 
         Returns:
             Dict mapping channel_id to ChannelRevenue with both exit and entry metrics
         """
-        revenue_map: Dict[str, Dict[str, int]] = {}
-
-        def init_channel(channel_id: str) -> None:
-            """Initialize channel entry with all metrics."""
-            if channel_id not in revenue_map:
-                revenue_map[channel_id] = {
-                    "fees_earned": 0,
-                    "volume_routed": 0,
-                    "forward_count": 0,
-                    "sourced_volume": 0,
-                    "sourced_fee_contribution": 0,
-                    "sourced_forward_count": 0
-                }
-
         try:
-            # Single RPC call to fetch ALL settled forwards
-            result = self.plugin.rpc.listforwards(status="settled")
-
-            for forward in result.get("forwards", []):
-                out_channel = forward.get("out_channel")
-                in_channel = forward.get("in_channel")
-                fee_msat = self._parse_msat(forward.get("fee_msat", 0))
-                out_msat = self._parse_msat(forward.get("out_msat", 0))
-                in_msat = self._parse_msat(forward.get("in_msat", 0))
-
-                # Track EXIT metrics (out_channel earns the fee)
-                if out_channel:
-                    init_channel(out_channel)
-                    revenue_map[out_channel]["fees_earned"] += fee_msat // 1000
-                    revenue_map[out_channel]["volume_routed"] += out_msat // 1000
-                    revenue_map[out_channel]["forward_count"] += 1
-
-                # Track ENTRY metrics (in_channel sourced the volume)
-                # The fee was enabled by the in_channel providing the route
-                if in_channel:
-                    init_channel(in_channel)
-                    revenue_map[in_channel]["sourced_volume"] += in_msat // 1000
-                    revenue_map[in_channel]["sourced_fee_contribution"] += fee_msat // 1000
-                    revenue_map[in_channel]["sourced_forward_count"] += 1
-
+            totals = self.database.get_all_channels_revenue_totals()
         except Exception as e:
-            self.plugin.log(
-                f"Error batch fetching revenue data: {e}",
-                level='warn'
-            )
+            self.plugin.log(f"Error batch fetching revenue data from DB: {e}", level="warn")
+            totals = {}
 
-        # Convert to ChannelRevenue objects
         result_map: Dict[str, ChannelRevenue] = {}
-        for channel_id, data in revenue_map.items():
+        for channel_id, data in totals.items():
             result_map[channel_id] = ChannelRevenue(
                 channel_id=channel_id,
-                fees_earned_sats=data["fees_earned"],
-                volume_routed_sats=data["volume_routed"],
-                forward_count=data["forward_count"],
-                sourced_volume_sats=data["sourced_volume"],
-                sourced_fee_contribution_sats=data["sourced_fee_contribution"],
-                sourced_forward_count=data["sourced_forward_count"]
+                fees_earned_sats=int(data.get("fees_earned_sats", 0) or 0),
+                volume_routed_sats=int(data.get("volume_routed_sats", 0) or 0),
+                forward_count=int(data.get("forward_count", 0) or 0),
+                sourced_volume_sats=int(data.get("sourced_volume_sats", 0) or 0),
+                sourced_fee_contribution_sats=int(data.get("sourced_fee_contribution_sats", 0) or 0),
+                sourced_forward_count=int(data.get("sourced_forward_count", 0) or 0),
             )
 
         return result_map
@@ -2240,72 +2214,22 @@ class ChannelProfitabilityAnalyzer:
         - Exit metrics: fees earned when channel is out_channel
         - Entry metrics: volume sourced when channel is in_channel
 
-        Note: For batch operations, use _get_all_revenue_data() instead to
-        avoid N+1 query overhead. This method is retained for single-channel
-        lookups where batch fetching would be wasteful.
+        Note: For batch operations, use _get_all_revenue_data() instead.
         """
-        # Exit metrics (channel as out_channel)
-        fees_earned = 0
-        volume_routed = 0
-        forward_count = 0
-        # Entry metrics (channel as in_channel)
-        sourced_volume = 0
-        sourced_fee_contribution = 0
-        sourced_forward_count = 0
-
         try:
-            # Get forwards where we earned fees (out_channel = this channel)
-            result = self.plugin.rpc.listforwards(
-                out_channel=channel_id,
-                status="settled"
-            )
-
-            for forward in result.get("forwards", []):
-                fee_msat = self._parse_msat(forward.get("fee_msat", 0))
-                fees_earned += fee_msat // 1000
-
-                out_msat = self._parse_msat(forward.get("out_msat", 0))
-                volume_routed += out_msat // 1000
-
-                forward_count += 1
-
+            totals = self.database.get_channel_revenue_totals(channel_id)
         except Exception as e:
-            self.plugin.log(
-                f"Error getting exit revenue for {channel_id}: {e}",
-                level='warn'
-            )
-
-        try:
-            # Get forwards where we sourced volume (in_channel = this channel)
-            result = self.plugin.rpc.listforwards(
-                in_channel=channel_id,
-                status="settled"
-            )
-
-            for forward in result.get("forwards", []):
-                in_msat = self._parse_msat(forward.get("in_msat", 0))
-                sourced_volume += in_msat // 1000
-
-                # The fee was enabled by this channel sourcing the forward
-                fee_msat = self._parse_msat(forward.get("fee_msat", 0))
-                sourced_fee_contribution += fee_msat // 1000
-
-                sourced_forward_count += 1
-
-        except Exception as e:
-            self.plugin.log(
-                f"Error getting inbound contribution for {channel_id}: {e}",
-                level='warn'
-            )
+            self.plugin.log(f"Error getting revenue totals from DB for {channel_id}: {e}", level="warn")
+            totals = {}
 
         return ChannelRevenue(
             channel_id=channel_id,
-            fees_earned_sats=fees_earned,
-            volume_routed_sats=volume_routed,
-            forward_count=forward_count,
-            sourced_volume_sats=sourced_volume,
-            sourced_fee_contribution_sats=sourced_fee_contribution,
-            sourced_forward_count=sourced_forward_count
+            fees_earned_sats=int(totals.get("fees_earned_sats", 0) or 0),
+            volume_routed_sats=int(totals.get("volume_routed_sats", 0) or 0),
+            forward_count=int(totals.get("forward_count", 0) or 0),
+            sourced_volume_sats=int(totals.get("sourced_volume_sats", 0) or 0),
+            sourced_fee_contribution_sats=int(totals.get("sourced_fee_contribution_sats", 0) or 0),
+            sourced_forward_count=int(totals.get("sourced_forward_count", 0) or 0),
         )
     
     def _get_last_routing_time(self, channel_id: str) -> Optional[int]:
@@ -2318,37 +2242,10 @@ class ChannelProfitabilityAnalyzer:
 
         A channel is "active" if it's routing in either direction.
         """
-        latest_time: Optional[int] = None
-
         try:
-            # Check outbound activity (as exit channel)
-            result = self.plugin.rpc.listforwards(
-                out_channel=channel_id,
-                status="settled"
-            )
-            forwards = result.get("forwards", [])
-            if forwards:
-                out_latest = max(forwards, key=lambda f: f.get("received_time", 0))
-                latest_time = int(out_latest.get("received_time", 0))
+            return self.database.get_last_forward_time_any_direction(channel_id)
         except Exception:
-            pass
-
-        try:
-            # Check inbound activity (as entry channel)
-            result = self.plugin.rpc.listforwards(
-                in_channel=channel_id,
-                status="settled"
-            )
-            forwards = result.get("forwards", [])
-            if forwards:
-                in_latest = max(forwards, key=lambda f: f.get("received_time", 0))
-                in_time = int(in_latest.get("received_time", 0))
-                if latest_time is None or in_time > latest_time:
-                    latest_time = in_time
-        except Exception:
-            pass
-
-        return latest_time
+            return None
     
     def _classify_channel(self, roi: float, net_profit: int,
                          last_routed: Optional[int], days_open: int,
