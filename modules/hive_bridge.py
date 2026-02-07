@@ -3249,8 +3249,8 @@ class HiveFeeIntelligenceBridge:
                     "tier": membership.get("tier"),
                     "hive_id": membership.get("hive_id"),
                     "joined_at": membership.get("joined_at"),
-                    "uptime_pct": membership.get("uptime_pct"),
-                    "contribution_ratio": membership.get("contribution_ratio")
+                    "uptime_pct": membership.get("uptime_pct", 0.0),
+                    "contribution_ratio": membership.get("contribution_ratio", 0.0)
                 }
             except Exception as e:
                 self._log(f"Error fetching membership details: {e}", level="debug")
