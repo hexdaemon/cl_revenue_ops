@@ -892,6 +892,13 @@ class PortfolioOptimizer:
             if total > 0:
                 weights = [w / total for w in weights]
 
+        # Final guarantee: weights must sum to 1.0
+        total = sum(weights)
+        if total <= 0 or any(math.isnan(w) for w in weights):
+            weights = [1.0 / n] * n
+        elif abs(total - 1.0) > 1e-9:
+            weights = [w / total for w in weights]
+
         return weights
 
     def _calculate_portfolio_summary(
@@ -950,7 +957,9 @@ class PortfolioOptimizer:
         if pair_count > 0:
             avg_correlation /= pair_count
 
-        systematic_risk = max(0.0, avg_correlation)
+        # avg_correlation can be negative (hedged portfolio) — clamp to [-1, 1]
+        avg_correlation = max(-1.0, min(1.0, avg_correlation))
+        systematic_risk = avg_correlation
         idiosyncratic_risk = 1.0 - systematic_risk
 
         # Improvement potential

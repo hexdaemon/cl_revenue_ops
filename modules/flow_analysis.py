@@ -185,6 +185,19 @@ class KalmanFlowFilter:
         """Initialize filter with optional existing state."""
         self.state = state or KalmanFlowState()
 
+    def _reset_state(self) -> None:
+        """Reset filter state to defaults (used on NaN/corruption recovery)."""
+        self.state = KalmanFlowState()
+
+    def _has_nan(self) -> bool:
+        """Check if any state variable is NaN."""
+        return any(math.isnan(v) for v in (
+            self.state.flow_ratio, self.state.flow_velocity,
+            self.state.variance_ratio, self.state.variance_velocity,
+            self.state.covariance, self.state.innovation_variance,
+            self.state.last_innovation
+        ))
+
     def predict(self, dt_days: float, volatility: float = 1.0) -> None:
         """
         Prediction step: Project state forward in time.
@@ -196,11 +209,20 @@ class KalmanFlowFilter:
         if dt_days <= 0:
             return
 
+        # NaN guard before computation
+        if self._has_nan():
+            self._reset_state()
+            return
+
         # State transition: x_k = A * x_{k-1}
         # A = [[1, dt], [0, 1]]
         # flow_ratio += velocity * dt
         self.state.flow_ratio += self.state.flow_velocity * dt_days
         # velocity stays the same (random walk)
+
+        # Bound state after prediction to physical range
+        self.state.flow_ratio = max(-1.0, min(1.0, self.state.flow_ratio))
+        self.state.flow_velocity = max(-1.0, min(1.0, self.state.flow_velocity))
 
         # Process noise adaptation based on volatility
         q_ratio = KALMAN_BASE_PROCESS_NOISE * volatility * KALMAN_VOLATILITY_SCALING
@@ -274,12 +296,28 @@ class KalmanFlowFilter:
         self.state.variance_ratio = max(1e-6, self.state.variance_ratio)
         self.state.variance_velocity = max(1e-6, self.state.variance_velocity)
 
+        # Ensure positive-definite: det(P) = var_ratio * var_velocity - cov^2 > 0
+        det = self.state.variance_ratio * self.state.variance_velocity - self.state.covariance ** 2
+        if det <= 0:
+            # Shrink covariance to restore positive-definiteness
+            max_cov = math.sqrt(self.state.variance_ratio * self.state.variance_velocity) * 0.9
+            self.state.covariance = max(-max_cov, min(max_cov, self.state.covariance))
+
+        # Bound state to physical range
+        self.state.flow_ratio = max(-1.0, min(1.0, self.state.flow_ratio))
+        self.state.flow_velocity = max(-1.0, min(1.0, self.state.flow_velocity))
+
         # Store innovation for regime change detection
         self.state.last_innovation = innovation
         # Update innovation variance (exponential moving average)
         self.state.innovation_variance = 0.9 * self.state.innovation_variance + 0.1 * innovation * innovation
 
         self.state.last_update = int(time.time())
+
+        # NaN guard: reset on corruption
+        if self._has_nan():
+            self._reset_state()
+            return 0.0
 
         return innovation
 
@@ -469,7 +507,10 @@ class FlowAnalyzer:
 
     def _save_kalman_filter(self, channel_id: str, kf: KalmanFlowFilter) -> None:
         """Save Kalman filter state to database."""
-        self.database.save_kalman_state(channel_id, kf.state.to_dict())
+        try:
+            self.database.save_kalman_state(channel_id, kf.state.to_dict())
+        except Exception as e:
+            self.plugin.log(f"KALMAN: Failed to save filter state for {channel_id[:12]}...: {e}", level="warn")
 
     def _calculate_kalman_volatility(self, daily_buckets: List[Dict[str, int]]) -> float:
         """

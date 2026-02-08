@@ -948,9 +948,18 @@ class Database:
                     variance_velocity REAL DEFAULT 0.1,
                     covariance REAL DEFAULT 0.0,
                     last_update INTEGER DEFAULT 0,
-                    innovation_variance REAL DEFAULT 0.01
+                    innovation_variance REAL DEFAULT 0.01,
+                    last_innovation REAL DEFAULT 0.0
                 )
             """)
+
+            # Migration: add last_innovation column if missing
+            try:
+                ks_cols = {row[1] for row in conn.execute("PRAGMA table_info(kalman_state)").fetchall()}
+                if 'last_innovation' not in ks_cols:
+                    conn.execute("ALTER TABLE kalman_state ADD COLUMN last_innovation REAL DEFAULT 0.0")
+            except Exception:
+                pass
 
         except Exception as e:
             self.plugin.log(f"DB migration warning: Kalman schema migration failed: {e}", level="warn")
@@ -1043,8 +1052,8 @@ class Database:
         conn.execute("""
             INSERT OR REPLACE INTO kalman_state
             (channel_id, flow_ratio, flow_velocity, variance_ratio, variance_velocity,
-             covariance, last_update, innovation_variance)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             covariance, last_update, innovation_variance, last_innovation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             channel_id,
             state.get("flow_ratio", 0.0),
@@ -1053,7 +1062,8 @@ class Database:
             state.get("variance_velocity", 0.1),
             state.get("covariance", 0.0),
             state.get("last_update", 0),
-            state.get("innovation_variance", 0.01)
+            state.get("innovation_variance", 0.01),
+            state.get("last_innovation", 0.0)
         ))
 
     def get_all_kalman_states(self) -> List[Dict[str, Any]]:
