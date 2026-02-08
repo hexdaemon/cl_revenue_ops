@@ -3545,7 +3545,9 @@ class Database:
             "channel_states": 0,
             "channel_failures": 0,
             "channel_probes": 0,
-            "clboss_unmanaged": 0
+            "clboss_unmanaged": 0,
+            "kalman_state": 0,
+            "flow_history": 0
         }
 
         try:
@@ -3579,6 +3581,20 @@ class Database:
                     (peer_id,)
                 )
                 deleted["clboss_unmanaged"] = cursor.rowcount
+
+            # Remove Kalman filter state for closed channel
+            cursor = conn.execute(
+                "DELETE FROM kalman_state WHERE channel_id = ?",
+                (channel_id,)
+            )
+            deleted["kalman_state"] = cursor.rowcount
+
+            # Remove flow history for closed channel
+            cursor = conn.execute(
+                "DELETE FROM flow_history WHERE channel_id = ?",
+                (channel_id,)
+            )
+            deleted["flow_history"] = cursor.rowcount
 
             conn.commit()
 

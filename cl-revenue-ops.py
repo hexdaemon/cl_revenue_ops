@@ -1434,7 +1434,23 @@ def run_flow_analysis():
         if database and config and config.enable_reputation:
             database.decay_reputation(config.reputation_decay)
             plugin.log(f"Applied reputation decay (factor={config.reputation_decay})")
-        
+
+        # Report flow observations to cl-hive for temporal pattern detection
+        if hive_bridge and hive_bridge.is_available():
+            reported = 0
+            for channel_id, metrics in results.items():
+                try:
+                    hive_bridge.report_flow_observation(
+                        channel_id=channel_id,
+                        inbound_sats=metrics.sats_in,
+                        outbound_sats=metrics.sats_out
+                    )
+                    reported += 1
+                except Exception:
+                    pass  # Non-critical, don't block flow analysis
+            if reported > 0:
+                plugin.log(f"Reported {reported} flow observations to cl-hive")
+
     except Exception as e:
         plugin.log(f"Flow analysis failed: {e}", level='error')
         raise

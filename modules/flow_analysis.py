@@ -1000,6 +1000,15 @@ class FlowAnalyzer:
             metrics.kalman_uncertainty = kalman_uncertainty
             metrics.kalman_regime_change = regime_change
 
+            # Re-classify state using Kalman estimate (matching analyze_all_channels behavior)
+            if not metrics.is_congested:
+                if kalman_ratio > self.config.source_threshold:
+                    metrics.state = ChannelState.SOURCE
+                elif kalman_ratio < self.config.sink_threshold:
+                    metrics.state = ChannelState.SINK
+                else:
+                    metrics.state = ChannelState.BALANCED
+
         # Persist state so single-channel analysis is reflected in get_channel_state()
         self.database.update_channel_state(
             channel_id=channel_id,
