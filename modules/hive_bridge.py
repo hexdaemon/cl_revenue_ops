@@ -1154,14 +1154,15 @@ class HiveFeeIntelligenceBridge:
             if destination:
                 params["destination"] = destination
 
-            # Use deposit-marker RPC if source/destination provided
+            # Use deposit-marker RPC if source/destination provided,
+            # otherwise use record-routing-outcome which handles pheromone
+            # updates without requiring source/destination
             if source and destination:
                 result = self.plugin.rpc.call("hive-deposit-marker", params)
             else:
-                # Fall back to generic pheromone update
-                result = self.plugin.rpc.call("hive-pheromone-levels", {
+                result = self.plugin.rpc.call("hive-record-routing-outcome", {
                     "channel_id": channel_id,
-                    "action": "update",
+                    "peer_id": peer_id,
                     "fee_ppm": fee_ppm,
                     "success": success,
                     "amount_sats": amount_sats
@@ -2331,6 +2332,7 @@ class HiveFeeIntelligenceBridge:
                 return None
 
             # Extract relevant data for this channel
+            # Prefer list format under "pheromone_levels" key
             levels = result.get("pheromone_levels", [])
             for level_data in levels:
                 if level_data.get("channel_id") == channel_id:
@@ -2340,6 +2342,16 @@ class HiveFeeIntelligenceBridge:
                         "level": level_data.get("level", 0),
                         "above_threshold": level_data.get("above_threshold", False)
                     }
+
+            # Fallback: handle flat dict response (legacy cl-hive format)
+            if result.get("channel_id") == channel_id:
+                self._record_success()
+                return {
+                    "channel_id": channel_id,
+                    "level": result.get("pheromone_level", result.get("level", 0)),
+                    "above_threshold": result.get("above_exploit_threshold",
+                                                  result.get("above_threshold", False))
+                }
 
             # Channel exists but no pheromone data yet
             self._record_success()
