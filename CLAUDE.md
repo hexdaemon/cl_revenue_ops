@@ -36,21 +36,22 @@ sling (Rebalancing Engine - required)
 Core Lightning
 ```
 
-### Module Organization
+### Module Organization (12 modules)
 
 | Module | Purpose |
 |--------|---------|
 | `fee_controller.py` | Thompson Sampling + AIMD fee optimization, Vegas Reflex, Scarcity Pricing |
 | `rebalancer.py` | EV-based rebalancing, sling integration, futility circuit breaker |
-| `flow_analysis.py` | Sink/Source detection, Kalman-filtered flow estimation |
+| `flow_analysis.py` | Sink/Source detection, Kalman-filtered flow estimation with NaN recovery |
 | `policy_manager.py` | Per-peer policy engine (dynamic/static/passive/hive) |
 | `profitability_analyzer.py` | P&L calculation, ROC metrics, capacity recommendations |
-| `portfolio_optimizer.py` | Mean-Variance optimization, Sharpe ratio, correlation analysis |
+| `portfolio_optimizer.py` | Markowitz Mean-Variance optimization, Sharpe ratio, simplex projection |
 | `capacity_planner.py` | Channel sizing recommendations ("Winners & Losers") |
 | `hive_bridge.py` | cl-hive integration, MCF assignments, Kalman velocity sharing |
 | `clboss_manager.py` | Optional CLBoss integration for unmanage commands |
-| `database.py` | SQLite with WAL mode, accounting tables, closed channel history |
+| `database.py` | SQLite with WAL mode, 27 tables, accounting + Kalman state persistence |
 | `config.py` | Hot-reloadable configuration |
+| `utils.py` | Shared utility functions |
 
 ### Key Algorithms
 
@@ -65,6 +66,19 @@ Core Lightning
 - Volume-weighted inventory targets
 - Futility circuit breaker (10 failures → stop)
 - Strategic exemption for Hive peers
+
+**Kalman Flow Estimation** (in `flow_analysis.py`):
+- State vector: [flow_ratio, velocity] with 2x2 covariance matrix
+- NaN recovery: Resets filter state on divergence
+- State bounding: Clamps flow_ratio to [-1, 1], velocity to [-0.5, 0.5]
+- Covariance PD enforcement: Ensures positive-definite via eigenvalue correction
+- Persisted to `kalman_state` DB table for restart survival
+
+**Portfolio Optimization** (in `portfolio_optimizer.py`):
+- Markowitz Mean-Variance with Sharpe ratio objective
+- Simplex projection constrains allocations to sum to 1.0
+- Risk decomposition: Marginal risk contribution per channel
+- Correlation analysis for hedging opportunity detection
 
 ### Key Patterns
 
@@ -97,13 +111,14 @@ Core Lightning
 | `splice_events` | Splice tracking |
 | `peer_reputation` | Peer success rate tracking |
 | `ignored_peers` | CLBoss ignore list |
+| `kalman_state` | Kalman filter state persistence (flow ratio, velocity, covariance) |
 
 ## Dependencies
 
 ### Required
 - **sling plugin**: Async rebalancing engine - REQUIRED for rebalancing to work
 - **Core Lightning**: v23.05+
-- **Python 3.8+**
+- **Python 3.10+**
 - **pyln-client**: >=24.0
 
 ### Recommended
@@ -161,20 +176,23 @@ Core Lightning
 ```
 cl-revenue-ops/
 ├── cl-revenue-ops.py       # Main plugin entry point
-├── modules/
+├── modules/                # 12 modules
 │   ├── fee_controller.py   # Thompson Sampling + Alpha Sequence
 │   ├── rebalancer.py       # EV-based rebalancing
-│   ├── flow_analysis.py    # Sink/Source detection
+│   ├── flow_analysis.py    # Sink/Source detection + Kalman filter
 │   ├── policy_manager.py   # Per-peer policies
 │   ├── profitability_analyzer.py  # P&L and ROC
+│   ├── portfolio_optimizer.py     # Markowitz Mean-Variance optimization
 │   ├── capacity_planner.py # Channel recommendations
+│   ├── hive_bridge.py      # cl-hive integration
 │   ├── clboss_manager.py   # Optional CLBoss integration
-│   ├── database.py         # SQLite layer
-│   └── config.py           # Configuration
+│   ├── database.py         # SQLite layer (27 tables)
+│   ├── config.py           # Configuration
+│   └── utils.py            # Shared utilities
 ├── config/
 │   ├── cl-revenue-ops.conf.full     # Full config with all options documented
 │   └── cl-revenue-ops.conf.minimal  # Quick-start production config
-├── tests/                  # Test suite
+├── tests/                  # 319 tests across 14 files
 ├── migrations/             # Database migrations
 └── docs/                   # Documentation
     ├── specs/              # Technical specifications

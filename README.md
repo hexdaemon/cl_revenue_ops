@@ -77,16 +77,20 @@ Centralized control via `revenue-policy` command.
 - **Financial Snapshots:** Daily recording of Net Worth, Margins, ROC
 - **`revenue-report`:** Unified RPC for P&L summaries and peer analytics
 
-### Module 6: "The Hive" Integration
+### Module 6: "The Hive" Integration (`hive_bridge.py`)
 - **Fleet Hooks:** Provides API hooks (`revenue-policy`) for cl-hive signals
 - **Zero-Fee Routing:** Supports internal fleet whitelisting
 - **Inventory Load Balancing:** Supports "Push" rebalancing via Strategic Exemptions
+- **MCF Assignments:** Accepts and executes MCF rebalance assignments from cl-hive
+- **Kalman Velocity Sharing:** Reports flow velocities to cl-hive for coordinated positioning
 
 ### Module 7: Kalman Flow Estimation (v2.1)
-- **Kalman Filter:** Smooth, noise-resistant flow state estimation
+- **Kalman Filter:** Smooth, noise-resistant flow state estimation with NaN recovery and state bounding
 - **Velocity Tracking:** Detect flow acceleration/deceleration trends
 - **Confidence Scoring:** Data quality-weighted flow classifications
 - **Fleet Sharing:** Report Kalman velocities to cl-hive for coordinated positioning
+- **Covariance Stability:** Positive-definite enforcement prevents filter divergence
+- **Persistent State:** Kalman state survives restarts via `kalman_state` database table
 
 ### Module 8: Portfolio Optimization (v2.2)
 Applies Markowitz Mean-Variance portfolio theory to Lightning channel management:
@@ -94,6 +98,8 @@ Applies Markowitz Mean-Variance portfolio theory to Lightning channel management
 - **Correlation Analysis:** Detect hedging opportunities (negatively correlated channels)
 - **Concentration Risk:** Identify over-correlated channel pairs
 - **Rebalance Recommendations:** Portfolio-optimized allocation targets
+- **Simplex Projection:** Constrained optimization ensures allocations sum to 1.0
+- **Risk Decomposition:** Per-channel marginal risk contribution analysis
 
 ## Operating Modes
 
@@ -132,18 +138,18 @@ Hive mode requires TWO conditions:
 
 Membership is verified by checking your tier via `hive-status` RPC. This ensures hive features only activate when you're actually part of a fleet.
 
-**Joining a Hive (Permissionless):**
+**Joining a Hive:**
 
-Lightning Hives use a permissionless join model - no tickets or admin approval required:
+Lightning Hives use an invitation-based join model:
 
-1. Open a channel to any existing hive member
-2. Install and start cl-hive plugin
-3. Autodiscovery happens automatically via `peer_connected` hook
-4. You join as a **neophyte** (90-day probation, 50% revenue share)
-5. After probation (or majority vote), you become a **full member**
+1. Request an invite ticket from a hive admin (via Nostr, GitHub, etc.)
+2. Open a channel to an existing hive member (skin in the game)
+3. Install and start cl-hive plugin
+4. Use `hive-join <ticket>` to join as a **neophyte** (30-day probation)
+5. Get vouched by existing members for full membership
 
 ```
-Channel Open → Autodiscovery → Neophyte (90 days) → Full Member
+Invite Ticket → Channel Open → Neophyte (30 days + vouches) → Full Member
 ```
 
 **Check your mode:**
@@ -159,7 +165,7 @@ revenue-ops-hive-enabled=true   # Require hive (warn if not member)
 revenue-ops-hive-enabled=auto   # Auto-detect (default)
 ```
 
-### Module 7: Accounting v2.0 (Closure & Splice Tracking)
+### Module 9: Accounting v2.0 (Closure & Splice Tracking)
 - **Complete P&L Formula:** `Net P&L = Revenue - (Opening + Closure + Splice + Rebalance)`
 - **Channel Closure Detection:** Subscribes to `channel_state_changed`
 - **Splice Detection:** Tracks splice_in/splice_out events
@@ -173,7 +179,7 @@ revenue-ops-hive-enabled=auto   # Auto-detect (default)
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | Core Lightning | Required | v23.05+ |
-| Python 3.8+ | Required | |
+| Python 3.10+ | Required | |
 | **sling plugin** | **Required** | Rebalancing engine |
 | bookkeeper plugin | Recommended | Accurate cost tracking |
 | CLBoss | **Included** | Base node management (enabled by default in Docker) |
@@ -334,7 +340,7 @@ All options can be set in your CLN config file or via `revenue-config set`.
 - `true`: Require hive features. Warns if not a member but continues in standalone mode until membership is established.
 - `false`: Explicitly disable hive features. Runs in standalone mode even if you are a hive member.
 
-**Note:** Membership is verified via `hive-status` RPC. To join a hive, open a channel to any existing member - no tickets or approval required.
+**Note:** Membership is verified via `hive-status` RPC. To join a hive, request an invite ticket from a hive admin and use `hive-join`.
 
 ### CLBoss Integration
 
@@ -407,6 +413,8 @@ lightning-cli revenue-history
 | [Security Audits](docs/audits/) | Red team reports and audit responses |
 
 ## Testing
+
+319 tests across 14 test files.
 
 ```bash
 # Run all tests

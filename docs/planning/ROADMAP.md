@@ -374,5 +374,31 @@ Net P&L = Revenue - (Opening Costs + Closure Costs + Splice Costs + Rebalance Co
     - `get_lifetime_report()` includes `lifetime_splice_costs_sats`.
     - Total costs calculation: Opening + Closure + Splice + Rebalance.
 
+## Phase 12: Kalman Flow Estimation + Portfolio Optimization Hardening
+*Status: COMPLETED*
+*Objective: Harden the Kalman filter and portfolio optimizer against numerical instability, edge cases, and integration bugs.*
+
+### v2.1.0: Kalman Filter Hardening ✅ COMPLETED
+
+- [x] **NaN Recovery**: Detect and reset diverged Kalman state (flow_ratio, velocity, covariance)
+- [x] **State Bounding**: Clamp flow_ratio to [-1, 1] and velocity to [-0.5, 0.5] after each update
+- [x] **Covariance PD Enforcement**: Positive-definite correction via eigenvalue floor prevents filter divergence
+- [x] **Re-classification Fix**: Kalman-smoothed flow states now correctly drive channel classification
+- [x] **Closed Channel Cleanup**: Kalman state pruned when channels close
+- [x] **Hive Reporting**: Kalman velocities correctly reported to cl-hive for coordinated positioning
+
+### v2.2.0: Portfolio Optimizer Hardening ✅ COMPLETED
+
+- [x] **Simplex Projection**: Constrained optimization ensures allocations sum to 1.0
+- [x] **Risk Decomposition Fix**: Per-channel marginal risk contribution correctly computed
+- [x] **Correlation Matrix Stability**: Handle degenerate cases (single channel, zero variance)
+
+### Integration Bug Fixes ✅ COMPLETED
+
+- [x] **Pheromone Fee Learning**: Repaired broken loop between cl-hive fee coordination and cl-revenue-ops
+- [x] **Hive Bridge**: Fixed anticipatory key mismatch and no_forecast status handling
+- [x] **MCF Bridge**: Fixed 3 RPC calls using keyword args instead of dict params
+- [x] **Thompson Sampling**: 7 bugs fixed across fee controller, rebalancer, and policy engine
+
 ---
-*Roadmap updated: January 11, 2026*
+*Roadmap updated: February 8, 2026*
