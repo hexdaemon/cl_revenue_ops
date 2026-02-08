@@ -1035,11 +1035,32 @@ class PolicyManager:
                 except ValueError:
                     raise ValueError(f"Invalid rebalance_mode '{rebalance_mode}' for peer {peer_id[:12]}...")
 
-            # Process other fields
+            # Process and validate other fields (matching set_policy validation)
             fee_ppm = update.get('fee_ppm_target', existing.fee_ppm_target)
+            if fee_ppm is not None:
+                if not isinstance(fee_ppm, int) or fee_ppm < 0:
+                    raise ValueError(f"fee_ppm_target must be a non-negative integer for peer {peer_id[:12]}...")
+                if fee_ppm > 100000:
+                    raise ValueError(f"fee_ppm_target cannot exceed 100000 PPM for peer {peer_id[:12]}...")
+
             tags = update.get('tags', existing.tags)
+            if not isinstance(tags, list):
+                raise ValueError(f"tags must be a list of strings for peer {peer_id[:12]}...")
+            tags = [str(t) for t in tags]
+
             mult_min = update.get('fee_multiplier_min', existing.fee_multiplier_min)
+            if mult_min is not None:
+                if not isinstance(mult_min, (int, float)) or mult_min < GLOBAL_MIN_FEE_MULTIPLIER:
+                    raise ValueError(f"fee_multiplier_min must be >= {GLOBAL_MIN_FEE_MULTIPLIER} for peer {peer_id[:12]}...")
+                if mult_min > GLOBAL_MAX_FEE_MULTIPLIER:
+                    raise ValueError(f"fee_multiplier_min must be <= {GLOBAL_MAX_FEE_MULTIPLIER} for peer {peer_id[:12]}...")
+
             mult_max = update.get('fee_multiplier_max', existing.fee_multiplier_max)
+            if mult_max is not None:
+                if not isinstance(mult_max, (int, float)) or mult_max < GLOBAL_MIN_FEE_MULTIPLIER:
+                    raise ValueError(f"fee_multiplier_max must be >= {GLOBAL_MIN_FEE_MULTIPLIER} for peer {peer_id[:12]}...")
+                if mult_max > GLOBAL_MAX_FEE_MULTIPLIER:
+                    raise ValueError(f"fee_multiplier_max must be <= {GLOBAL_MAX_FEE_MULTIPLIER} for peer {peer_id[:12]}...")
 
             # Process expiry
             expires_at = existing.expires_at

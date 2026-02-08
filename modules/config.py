@@ -305,7 +305,7 @@ class Config:
         self._version = database.get_config_version()
     
     def _apply_override(self, key: str, value: str) -> None:
-        """Apply a single override with type conversion."""
+        """Apply a single override with type conversion and range validation."""
         field_type = CONFIG_FIELD_TYPES.get(key, str)
         try:
             if field_type == bool:
@@ -316,6 +316,11 @@ class Config:
                 typed_value = float(value)
             else:
                 typed_value = value
+            # Range validation (matching update_runtime behavior)
+            if key in CONFIG_FIELD_RANGES:
+                min_val, max_val = CONFIG_FIELD_RANGES[key]
+                if not (min_val <= typed_value <= max_val):
+                    return  # Skip out-of-range override, keep default
             setattr(self, key, typed_value)
         except (ValueError, TypeError):
             pass  # Keep default if conversion fails

@@ -945,7 +945,7 @@ class JobManager:
             self.database.update_rebalance_result(
                 job.rebalance_id,
                 'partial',
-                fee_paid_sats=0,  # Unknown actual fee
+                actual_fee_sats=0,  # Unknown actual fee on timeout
                 actual_profit_sats=0
             )
         else:

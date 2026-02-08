@@ -1253,8 +1253,8 @@ class GaussianThompsonState:
 
         # If not enough observations, explore more widely
         if len(self.observations) < self.MIN_OBSERVATIONS:
-            # Use prior with extra exploration
-            explore_std = self.prior_std_fee * 1.5 * explore_mod
+            # Use prior with extra exploration (clamped to MIN_STD like normal path)
+            explore_std = max(self.MIN_STD, self.prior_std_fee * 1.5 * explore_mod)
             sampled = random.gauss(self.prior_mean_fee, explore_std)
         else:
             # Sample from posterior with stigmergic modulation
@@ -1418,10 +1418,10 @@ class GaussianThompsonState:
         # They need to find niche pricing more aggressively
         role_learning_boost = 1.3 if ctx_role == "S" else 1.0
 
-        # Combined learning rate
+        # Combined learning rate (revenue_weight already incorporated here)
         learning_rate = 0.1 * (1 + revenue_weight) * time_weight * role_learning_boost
 
-        new_mean = ctx_mean + learning_rate * (fee - ctx_mean) * revenue_weight
+        new_mean = ctx_mean + learning_rate * (fee - ctx_mean)
 
         # Decrease uncertainty as we gather more observations
         # Faster convergence for same-time observations
@@ -1525,11 +1525,9 @@ class GaussianThompsonState:
             age_hours = (now - timestamp) / 3600.0
             decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
 
-            # Revenue weighting: better outcomes get more weight
-            # Normalize so 100 sats/hr observation gets weight ~1.0
-            revenue_factor = min(2.0, (revenue_rate + 10) / 50.0)
-
-            weight = base_weight * decay * revenue_factor
+            # base_weight already incorporates revenue quality from update_posterior()
+            # Only apply time decay here to avoid double-counting revenue
+            weight = base_weight * decay
 
             total_weight += weight
             weighted_sum += fee * weight
@@ -2137,7 +2135,8 @@ class ThompsonAIMDState:
                         obs.get("fee_ppm", 200),
                         obs.get("revenue_rate", 0),
                         min(1.0, obs.get("forward_count", 1) / 10.0),
-                        obs.get("timestamp", 0)
+                        obs.get("timestamp", 0),
+                        obs.get("time_bucket", "normal")
                     ))
 
             # Recompute posterior from migrated observations
