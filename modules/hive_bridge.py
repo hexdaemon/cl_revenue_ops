@@ -1884,7 +1884,7 @@ class HiveFeeIntelligenceBridge:
 
         try:
             result = self.plugin.rpc.call("hive-critical-velocity", {
-                "hours_threshold": hours_threshold
+                "threshold_hours": hours_threshold
             })
 
             if result.get("error"):
@@ -2449,9 +2449,6 @@ class HiveFeeIntelligenceBridge:
             })
 
             if result.get("error"):
-                # This might not be implemented yet
-                if "unknown" in str(result.get("error")).lower():
-                    return True
                 self._log(f"Yield metrics report error: {result.get('error')}", level="debug")
                 return False
 
@@ -2459,7 +2456,8 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to report yield metrics: {e}", level="debug")
-            return True  # Don't block
+            # Return False — callers should not believe metrics were reported
+            return False
 
     def query_yield_summary(self) -> Optional[Dict[str, Any]]:
         """
