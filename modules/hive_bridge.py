@@ -2546,6 +2546,10 @@ class HiveFeeIntelligenceBridge:
                 self._log(f"Prediction query error: {result.get('error')}", level="debug")
                 return None
 
+            # Handle "no_forecast" status (insufficient data, not an error)
+            if result.get("status") == "no_forecast":
+                return None
+
             self._record_success()
             return result
 
@@ -2586,7 +2590,7 @@ class HiveFeeIntelligenceBridge:
                 return []
 
             self._record_success()
-            return result.get("predictions", [])
+            return result.get("forecasts", [])
 
         except Exception as e:
             self._log(f"Failed to query all predictions: {e}", level="debug")
