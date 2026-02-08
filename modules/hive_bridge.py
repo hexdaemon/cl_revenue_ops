@@ -3053,12 +3053,11 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call(
-                "hive-mcf-optimized-path",
-                from_channel=from_channel,
-                to_channel=to_channel,
-                amount_sats=amount_sats
-            )
+            result = self.plugin.rpc.call("hive-mcf-optimized-path", {
+                "from_channel": from_channel,
+                "to_channel": to_channel,
+                "amount_sats": amount_sats
+            })
             self._record_success()
             return result
 
@@ -3096,14 +3095,13 @@ class HiveFeeIntelligenceBridge:
 
         try:
             # Report via RPC (cl-hive will broadcast to fleet)
-            result = self.plugin.rpc.call(
-                "hive-report-mcf-completion",
-                assignment_id=assignment_id,
-                success=success,
-                actual_amount_sats=actual_amount_sats,
-                actual_cost_sats=actual_cost_sats,
-                failure_reason=failure_reason
-            )
+            result = self.plugin.rpc.call("hive-report-mcf-completion", {
+                "assignment_id": assignment_id,
+                "success": success,
+                "actual_amount_sats": actual_amount_sats,
+                "actual_cost_sats": actual_cost_sats,
+                "failure_reason": failure_reason
+            })
             self._record_success()
             return result.get("success", False)
 
@@ -3154,10 +3152,9 @@ class HiveFeeIntelligenceBridge:
 
         try:
             if assignment_id:
-                result = self.plugin.rpc.call(
-                    "hive-claim-mcf-assignment",
-                    assignment_id=assignment_id
-                )
+                result = self.plugin.rpc.call("hive-claim-mcf-assignment", {
+                    "assignment_id": assignment_id
+                })
             else:
                 result = self.plugin.rpc.call("hive-claim-mcf-assignment")
 
