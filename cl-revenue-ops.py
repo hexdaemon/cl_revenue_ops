@@ -2193,7 +2193,11 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                     "net_profit_sats": result.net_profit_sats,
                     "roi_percentage": round(result.roi_percent, 2),
                     "days_active": result.days_open,
-                    "flow_profile": flow_profile
+                    "flow_profile": flow_profile,
+                    "forward_count": outbound_count,
+                    "sourced_forward_count": inbound_count,
+                    "fees_earned_sats": result.revenue.fees_earned_sats,
+                    "volume_routed_sats": result.revenue.volume_routed_sats,
                 }
                 summary[result.classification.value].append(channel_summary)
                 flow_profiles[flow_profile].append(ch_id)
@@ -2873,7 +2877,10 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
             "period": {
                 "window_days": window_days,
                 "gross_revenue_sats": pnl.get("gross_revenue_sats", 0),
-                "opex_sats": pnl.get("opex_sats", 0)
+                "opex_sats": pnl.get("opex_sats", 0),
+                "rebalance_cost_sats": pnl.get("rebalance_cost_sats", 0),
+                "closure_cost_sats": pnl.get("closure_cost_sats", 0),
+                "splice_cost_sats": pnl.get("splice_cost_sats", 0),
             },
             "warnings": warnings,
             "bleeder_count": len(bleeders)
