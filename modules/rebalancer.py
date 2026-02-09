@@ -2541,8 +2541,31 @@ class EVRebalancer:
             turnover_weight = base_turnover_weight * flow_multiplier
             weighted_opp_cost = int(source_fee_ppm * turnover_weight)
 
+            # =================================================================
+            # FLEET-AWARE INBOUND FEE (Phase 7 Enhancement)
+            # =================================================================
+            # When the source is a hive member, the route goes through zero-fee
+            # fleet channels: us -> fleet_member -> ... -> destination.
+            # The first hop(s) are free, so the effective inbound cost is much
+            # lower than the global estimate which assumes external multi-hop routing.
+            # =================================================================
+            effective_inbound = dest_inbound_fee_ppm
+            source_is_hive = bool(
+                pid and self.policy_manager
+                and self.policy_manager.is_hive_peer(pid)
+            )
+            if source_is_hive:
+                if is_hive_destination:
+                    # Pure fleet route: us -> fleet_src -> fleet_dest, all zero-fee
+                    effective_inbound = 0
+                else:
+                    # Fleet covers most of the route; only the last hop(s) to the
+                    # external destination cost fees.  Use 10% of the external
+                    # estimate as a conservative floor.
+                    effective_inbound = max(dest_inbound_fee_ppm // 10, 0)
+
             # Calculate spread: what we earn minus what it costs
-            spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
+            spread_ppm = dest_outbound_fee_ppm - effective_inbound - weighted_opp_cost
 
             # Allow slightly negative spread only for hive destinations (strategic).
             # For non-hive peers we require non-negative spread to avoid consistent leakage.
@@ -2561,10 +2584,11 @@ class EVRebalancer:
                         'channel': cid,
                         'spread': spread_ppm,
                         'dest_fee': dest_outbound_fee_ppm,
-                        'inbound_fee': dest_inbound_fee_ppm,
+                        'inbound_fee': effective_inbound,
                         'opp_cost': weighted_opp_cost,
                         'flow_state': flow_state,
-                        'is_hive': is_hive_destination
+                        'is_hive': is_hive_destination,
+                        'source_is_hive': source_is_hive
                     }
                 continue
 

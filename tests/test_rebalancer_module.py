@@ -987,3 +987,91 @@ class TestFleetPathInjection:
 
         assert cand.source_candidates == original_sources
         assert cand.max_fee_ppm == original_ppm
+
+
+class TestFleetAwareSpread:
+    """Tests for fleet-discounted inbound fee in source selection."""
+
+    def _make_rebalancer_for_spread(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True, enable_proportional_budget=False,
+                     rebalance_min_profit=0, rebalance_min_profit_ppm=0,
+                     hive_rebalance_tolerance=0.001)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+
+        # Mock database methods used by _select_source_candidates
+        mock_database.get_channel_state.return_value = {
+            "state": "balanced", "sats_in": 0, "sats_out": 0
+        }
+        mock_database.get_peer_uptime_percent.return_value = 99.0
+
+        # Mock job_manager to avoid active-channel filtering
+        r.job_manager = MagicMock()
+        r.job_manager.active_channels = set()
+        r.job_manager.get_source_failure_count.return_value = 0
+
+        return r
+
+    def test_hive_source_gets_discounted_inbound(self, mock_plugin, mock_database):
+        """Hive member sources should use fleet-discounted inbound fee,
+        allowing candidates that would be rejected with the full external estimate."""
+        r = self._make_rebalancer_for_spread(mock_plugin, mock_database)
+
+        hive_source_peer = "02" + "f" * 64
+        non_hive_source_peer = "02" + "a" * 64
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.side_effect = lambda pid: pid == hive_source_peer
+        r.policy_manager.should_rebalance.return_value = True
+
+        sources = [
+            ("500x1x0", {"peer_id": hive_source_peer, "spendable_sats": 500_000, "fee_ppm": 0, "capacity": 1_000_000}, 0.7),
+            ("600x2x0", {"peer_id": non_hive_source_peer, "spendable_sats": 500_000, "fee_ppm": 0, "capacity": 1_000_000}, 0.7),
+        ]
+
+        # Dest outbound fee: 500 PPM. Inbound estimate: 1500 PPM (high, external).
+        # Non-hive spread: 500 - 1500 = -1000 → rejected
+        # Hive spread: 500 - 150 (10% of 1500) = +350 → accepted
+        candidates = r._select_source_candidates(
+            sources=sources,
+            amount_needed=200_000,
+            dest_channel="999x1x0",
+            dest_outbound_fee_ppm=500,
+            dest_inbound_fee_ppm=1500,
+            is_hive_destination=False
+        )
+
+        accepted_channels = [cid for cid, _, _, _ in candidates]
+        assert "500x1x0" in accepted_channels, "Hive source should pass with fleet-discounted inbound"
+        assert "600x2x0" not in accepted_channels, "Non-hive source should be rejected with full inbound"
+
+    def test_hive_source_to_hive_dest_zero_inbound(self, mock_plugin, mock_database):
+        """Hive source to hive destination should use 0 inbound fee."""
+        r = self._make_rebalancer_for_spread(mock_plugin, mock_database)
+
+        hive_source_peer = "02" + "f" * 64
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.return_value = True
+        r.policy_manager.should_rebalance.return_value = True
+
+        sources = [
+            ("500x1x0", {"peer_id": hive_source_peer, "spendable_sats": 500_000, "fee_ppm": 0, "capacity": 1_000_000}, 0.7),
+        ]
+
+        # Hive dest with 0 outbound fee but high external inbound estimate.
+        # With fleet discount: inbound = 0, spread = 0 - 0 - 0 = 0, passes >= -tolerance
+        candidates = r._select_source_candidates(
+            sources=sources,
+            amount_needed=200_000,
+            dest_channel="999x1x0",
+            dest_outbound_fee_ppm=0,
+            dest_inbound_fee_ppm=2000,
+            is_hive_destination=True
+        )
+
+        accepted_channels = [cid for cid, _, _, _ in candidates]
+        assert "500x1x0" in accepted_channels, "Hive-to-hive should use 0 inbound and pass"
