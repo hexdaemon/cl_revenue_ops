@@ -958,42 +958,50 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     try:
         # Check DB head: get timestamp of the most recent forward
         last_forward_ts = database.get_latest_forward_timestamp()
-        
+        now = int(time.time())
+
         if last_forward_ts is None:
             # Empty database - hydrate from flow_window_days ago (or 14 days default)
             hydrate_days = max(config.flow_window_days, 14)
-            start_time = int(time.time()) - (hydrate_days * 86400)
+            start_time = now - (hydrate_days * 86400)
             plugin.log(f"Forwards table empty. Hydrating last {hydrate_days} days of forwards...")
+        elif (now - last_forward_ts) < 600:
+            # Table was updated within the last 10 minutes — the real-time
+            # forward_event hook kept it current.  Skip the expensive
+            # listforwards RPC (can return millions of rows on busy nodes).
+            plugin.log("Forwards table is current; skipping hydration", level='debug')
+            start_time = None
         else:
-            # Have data - only fetch what we missed while offline
+            # Have data but a gap exists — fetch what we missed while offline
             start_time = max(0, last_forward_ts - 3600)
             plugin.log(f"Hydrating forwards since {time.strftime('%Y-%m-%d %H:%M', time.localtime(start_time))}...")
-        
-        # Fetch from RPC - this is the ONLY listforwards call we make
-        # CLN's listforwards doesn't support 'since' natively, so we filter client-side
-        result = safe_plugin.rpc.listforwards(status="settled")
-        forwards_to_insert = []
-        
-        for fwd in result.get("forwards", []):
-            received_time = fwd.get("received_time", 0)
-            if received_time > start_time:
-                forwards_to_insert.append({
-                    'in_channel': fwd.get("in_channel", ""),
-                    'out_channel': fwd.get("out_channel", ""),
-                    'in_msat': fwd.get("in_msat", fwd.get("in_msatoshi", 0)),
-                    'out_msat': fwd.get("out_msat", fwd.get("out_msatoshi", 0)),
-                    'fee_msat': fwd.get("fee_msat", fwd.get("fee_msatoshi", 0)),
-                    'resolution_time': (fwd.get("resolved_time", 0) - received_time) if fwd.get("resolved_time") else 0,
-                    'received_time': received_time,
-                    'resolved_time': int(fwd.get("resolved_time", 0) or 0)
-                })
-        
-        if forwards_to_insert:
-            inserted = database.bulk_insert_forwards(forwards_to_insert)
-            plugin.log(f"Hydration complete: inserted {inserted} forwards into local database")
-        else:
-            plugin.log("Hydration complete: no new forwards to insert")
-            
+
+        if start_time is not None:
+            # Fetch from RPC - this is the ONLY listforwards call we make.
+            # CLN's listforwards doesn't support 'since' natively, so we filter client-side.
+            result = safe_plugin.rpc.listforwards(status="settled")
+            forwards_to_insert = []
+
+            for fwd in result.get("forwards", []):
+                received_time = fwd.get("received_time", 0)
+                if received_time > start_time:
+                    forwards_to_insert.append({
+                        'in_channel': fwd.get("in_channel", ""),
+                        'out_channel': fwd.get("out_channel", ""),
+                        'in_msat': fwd.get("in_msat", fwd.get("in_msatoshi", 0)),
+                        'out_msat': fwd.get("out_msat", fwd.get("out_msatoshi", 0)),
+                        'fee_msat': fwd.get("fee_msat", fwd.get("fee_msatoshi", 0)),
+                        'resolution_time': (fwd.get("resolved_time", 0) - received_time) if fwd.get("resolved_time") else 0,
+                        'received_time': received_time,
+                        'resolved_time': int(fwd.get("resolved_time", 0) or 0)
+                    })
+
+            if forwards_to_insert:
+                inserted = database.bulk_insert_forwards(forwards_to_insert)
+                plugin.log(f"Hydration complete: inserted {inserted} forwards into local database")
+            else:
+                plugin.log("Hydration complete: no new forwards to insert", level='debug')
+
     except Exception as e:
         plugin.log(f"Warning: Forwards hydration failed: {e}", level='warn')
         # Non-fatal - flow analysis will work with whatever data we have
