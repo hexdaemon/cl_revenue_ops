@@ -886,3 +886,101 @@ class TestExecuteOnceManual:
         assert result.get("success") is False
         assert "no route found" in result.get("error", "")
         mock_database.update_rebalance_result.assert_called_once_with(55, 'failed', error_message="no route found")
+
+
+class TestFleetPathInjection:
+    """Tests for fleet path → sling source candidate injection."""
+
+    def _make_rebalancer(self, mock_plugin, mock_database, fleet_path_info=None):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r.job_manager.start_job = MagicMock(return_value={"success": True})
+        mock_database.record_rebalance = MagicMock(return_value=100)
+        mock_database.update_rebalance_result = MagicMock()
+
+        # Set up hive bridge mock
+        hive_bridge = MagicMock()
+        hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.query_fleet_rebalance_path.return_value = fleet_path_info
+        r.hive_bridge = hive_bridge
+
+        # Mock _get_channels_with_balances to return fleet member channels
+        fleet_member_a = "02" + "f" * 64
+        fleet_member_b = "02" + "e" * 64
+        r._get_channels_with_balances = MagicMock(return_value={
+            "500x1x0": {"peer_id": fleet_member_a, "capacity": 1_000_000, "spendable_sats": 500_000},
+            "600x2x0": {"peer_id": fleet_member_b, "capacity": 2_000_000, "spendable_sats": 800_000},
+            "111x222x0": {"peer_id": "02" + "a" * 64, "capacity": 500_000, "spendable_sats": 200_000},
+        })
+
+        return r, fleet_member_a, fleet_member_b
+
+    def test_fleet_sources_prepended(self, mock_plugin, mock_database):
+        """Fleet member SCIDs should be prepended to source_candidates."""
+        fleet_member_a = "02" + "f" * 64
+        fleet_member_b = "02" + "e" * 64
+
+        fleet_info = {
+            "fleet_path_available": True,
+            "fleet_path": [fleet_member_a, fleet_member_b],
+            "estimated_fleet_cost_sats": 0,
+            "estimated_external_cost_sats": 100,
+            "savings_pct": 100.0,
+        }
+        r, _, _ = self._make_rebalancer(mock_plugin, mock_database, fleet_info)
+
+        cand = _candidate(source_candidates=["111x222x0"])
+        r.execute_rebalance(cand)
+
+        # Fleet SCIDs should be first
+        assert cand.source_candidates[0] == "500x1x0"
+        assert cand.source_candidates[1] == "600x2x0"
+        # Original source still present
+        assert "111x222x0" in cand.source_candidates
+
+    def test_fleet_maxppm_reduced(self, mock_plugin, mock_database):
+        """max_fee_ppm should be capped to 50 when fleet path is available."""
+        fleet_member_a = "02" + "f" * 64
+
+        fleet_info = {
+            "fleet_path_available": True,
+            "fleet_path": [fleet_member_a],
+            "estimated_fleet_cost_sats": 0,
+            "estimated_external_cost_sats": 500,
+            "savings_pct": 100.0,
+        }
+        r, _, _ = self._make_rebalancer(mock_plugin, mock_database, fleet_info)
+
+        cand = _candidate()
+        original_max_ppm = cand.max_fee_ppm
+        assert original_max_ppm > 50  # Sanity: default is 2000
+
+        r.execute_rebalance(cand)
+
+        assert cand.max_fee_ppm == 50
+
+    def test_fleet_path_unavailable_no_change(self, mock_plugin, mock_database):
+        """Source candidates should be unchanged when no fleet path is available."""
+        fleet_info = {
+            "fleet_path_available": False,
+            "fleet_path": [],
+            "estimated_fleet_cost_sats": 0,
+            "estimated_external_cost_sats": 100,
+            "savings_pct": 0,
+        }
+        r, _, _ = self._make_rebalancer(mock_plugin, mock_database, fleet_info)
+
+        cand = _candidate(source_candidates=["111x222x0"])
+        original_sources = list(cand.source_candidates)
+        original_ppm = cand.max_fee_ppm
+
+        r.execute_rebalance(cand)
+
+        assert cand.source_candidates == original_sources
+        assert cand.max_fee_ppm == original_ppm

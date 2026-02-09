@@ -2756,6 +2756,49 @@ class EVRebalancer:
                 result["fleet_path_available"] = True
                 result["fleet_savings_pct"] = savings_pct
 
+                # Inject fleet member channels as sling source candidates
+                # so sling tries zero-fee fleet routes first.
+                fleet_members = fleet_path_info.get("fleet_path", [])
+                if fleet_members:
+                    channels = self._get_channels_with_balances()
+                    peer_to_scid = {}
+                    for scid, info in channels.items():
+                        pid = info.get("peer_id", "")
+                        if pid and pid not in peer_to_scid:
+                            peer_to_scid[pid] = scid
+
+                    fleet_scids = []
+                    fleet_peer_ids = []
+                    for member_pubkey in fleet_members:
+                        scid = peer_to_scid.get(member_pubkey)
+                        if scid:
+                            fleet_scids.append(scid)
+                            fleet_peer_ids.append(member_pubkey)
+
+                    if fleet_scids:
+                        # Prepend fleet SCIDs — sling tries them first, falls back to originals
+                        existing_sources = candidate.source_candidates
+                        existing_peer_ids = getattr(candidate, "source_candidate_peer_ids", []) or []
+                        candidate.source_candidates = fleet_scids + [
+                            s for s in existing_sources if s not in fleet_scids
+                        ]
+                        candidate.source_candidate_peer_ids = fleet_peer_ids + [
+                            p for p in existing_peer_ids if p not in fleet_peer_ids
+                        ]
+
+                        # Cap max_fee_ppm to fleet-appropriate level
+                        candidate.max_fee_ppm = min(candidate.max_fee_ppm, 50)
+                        # Reduce budget proportionally
+                        if candidate.max_budget_sats > 0:
+                            candidate.max_budget_sats = min(candidate.max_budget_sats, max(1, candidate.amount_sats * 50 // 1_000_000))
+                            candidate.max_budget_msat = candidate.max_budget_sats * 1000
+
+                        self.plugin.log(
+                            f"FLEET_PATH: Injected {len(fleet_scids)} fleet SCIDs as source candidates "
+                            f"for {candidate.to_channel[:12]}..., max_fee_ppm capped to {candidate.max_fee_ppm}",
+                            level='info'
+                        )
+
         rebalance_id: Optional[int] = None
         reserved_budget = False
         job_started = False
