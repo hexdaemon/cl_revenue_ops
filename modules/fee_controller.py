@@ -3185,9 +3185,22 @@ class HillClimbingFeeController:
 
             if total_volume > 0:
                 cost_ppm = (total_cost * 1_000_000) // total_volume
-                floor_ppm = int(cost_ppm * self.REBALANCE_FLOOR_MARGIN)
+
+                # Adjust for success rate — effective cost = cost / success_rate
+                # If 50% of rebalances fail, effective replenishment cost is 2x recorded.
+                success_data = self.database.get_channel_rebalance_success_rate(
+                    channel_id, self.REBALANCE_FLOOR_WINDOW_DAYS
+                )
+                success_rate = 1.0
+                if success_data and success_data['total'] >= self.REBALANCE_FLOOR_MIN_SAMPLES:
+                    success_rate = max(success_data['success_rate'], 0.10)  # Floor at 10% to prevent explosion
+
+                effective_cost_ppm = int(cost_ppm / success_rate)
+                floor_ppm = int(effective_cost_ppm * self.REBALANCE_FLOOR_MARGIN)
+
                 self.plugin.log(
-                    f"REBALANCE_FLOOR: {channel_id[:12]}... cost={cost_ppm}ppm "
+                    f"REBALANCE_FLOOR: {channel_id[:12]}... raw_cost={cost_ppm}ppm "
+                    f"success_rate={success_rate:.0%} effective={effective_cost_ppm}ppm "
                     f"* {self.REBALANCE_FLOOR_MARGIN:.0%} = {floor_ppm}ppm "
                     f"({len(recent_costs)} samples)",
                     level='debug'

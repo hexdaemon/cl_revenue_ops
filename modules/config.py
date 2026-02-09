@@ -50,6 +50,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'sling_target_source': float,
     'sling_target_balanced': float,
     'sling_outppm_fallback': int,
+    'sling_deplete_pct_sink': float,
+    'sling_deplete_pct_source': float,
+    'sling_deplete_pct_balanced': float,
     'rebalance_min_profit': int,
     'rebalance_min_profit_ppm': int,
     'rebalance_max_amount': int,
@@ -112,6 +115,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'sling_target_source': (0.1, 0.9),
     'sling_target_balanced': (0.1, 0.9),
     'sling_outppm_fallback': (0, 10000),
+    'sling_deplete_pct_sink': (0.01, 0.50),
+    'sling_deplete_pct_source': (0.01, 0.50),
+    'sling_deplete_pct_balanced': (0.01, 0.50),
     'rebalance_min_profit_ppm': (0, 100000),
     'rpc_timeout_seconds': (1, 300),
     'rpc_circuit_breaker_seconds': (0, 3600),
@@ -226,6 +232,9 @@ class Config:
     sling_target_source: float = 0.65         # Balance target for source channels (want more outbound)
     sling_target_balanced: float = 0.50       # Balance target for balanced channels
     sling_outppm_fallback: int = 500          # Max fee PPM for outppm fallback (0 = disabled)
+    sling_deplete_pct_sink: float = 0.10      # Aggressive drain for sink sources
+    sling_deplete_pct_source: float = 0.35    # Protective for source channels
+    sling_deplete_pct_balanced: float = 0.20  # Sling default
 
     # Safety flags
     dry_run: bool = False          # If True, log but don't execute
@@ -472,6 +481,9 @@ class ConfigSnapshot:
     sling_target_source: float
     sling_target_balanced: float
     sling_outppm_fallback: int
+    sling_deplete_pct_sink: float
+    sling_deplete_pct_source: float
+    sling_deplete_pct_balanced: float
 
     # Safety flags
     dry_run: bool
@@ -569,6 +581,9 @@ class ConfigSnapshot:
             sling_target_source=config.sling_target_source,
             sling_target_balanced=config.sling_target_balanced,
             sling_outppm_fallback=config.sling_outppm_fallback,
+            sling_deplete_pct_sink=config.sling_deplete_pct_sink,
+            sling_deplete_pct_source=config.sling_deplete_pct_source,
+            sling_deplete_pct_balanced=config.sling_deplete_pct_balanced,
             dry_run=config.dry_run,
             sling_available=config.sling_available,
             enable_vegas_reflex=config.enable_vegas_reflex,

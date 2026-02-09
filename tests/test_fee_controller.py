@@ -383,6 +383,7 @@ class TestRebalanceCostFloor:
             {"cost_sats": 120, "amount_sats": 1_200_000, "timestamp": int(time.time()) - 86400 * 2},
             {"cost_sats": 80, "amount_sats": 800_000, "timestamp": int(time.time()) - 86400 * 3},
         ]
+        mock_database.get_channel_rebalance_success_rate.return_value = None
 
         # Should return floor for SOURCE
         result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
@@ -413,10 +414,11 @@ class TestRebalanceCostFloor:
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 2},
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 3},
         ]
+        mock_database.get_channel_rebalance_success_rate.return_value = None
 
         result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
 
-        # Cost is 100ppm, with 20% margin = 120ppm
+        # Cost is 100ppm, with 20% margin = 120ppm (success_rate=1.0 default)
         expected = int(100 * fc.REBALANCE_FLOOR_MARGIN)  # 120
         assert result == expected
 
@@ -699,3 +701,117 @@ class TestSaturationProtectionFloor:
             channel_id, capacity_sats, 100.0, global_min
         )
         assert result == global_min
+
+
+# =============================================================================
+# Success-Rate-Adjusted Cost Floor Tests (Change 9)
+# =============================================================================
+
+
+class TestSuccessRateAdjustedFloor:
+    """Verify fee floor adjusts by rebalance success rate."""
+
+    def _make_fc(self, mock_plugin, mock_database):
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+        return HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+    def _cost_history(self, cost_ppm=100, n=3):
+        """Return n cost records that average to cost_ppm per 1M sats."""
+        now = int(time.time())
+        return [
+            {"cost_sats": cost_ppm, "amount_sats": 1_000_000, "timestamp": now - 86400 * (i + 1)}
+            for i in range(n)
+        ]
+
+    def test_success_rate_doubles_floor_at_50pct(self, mock_database, mock_plugin):
+        """50% success rate should ~double the floor vs 100% success rate."""
+        fc = self._make_fc(mock_plugin, mock_database)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_database.get_channel_cost_history.return_value = self._cost_history(100, 5)
+
+        # 100% success rate
+        mock_database.get_channel_rebalance_success_rate.return_value = {
+            'total': 10, 'successes': 10, 'failures': 0,
+            'success_rate': 1.0, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
+        }
+        floor_100 = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+
+        # 50% success rate
+        mock_database.get_channel_rebalance_success_rate.return_value = {
+            'total': 10, 'successes': 5, 'failures': 5,
+            'success_rate': 0.5, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
+        }
+        floor_50 = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+
+        # 50% rate should produce ~2x floor
+        assert floor_50 > floor_100
+        assert abs(floor_50 - 2 * floor_100) <= 1  # Allow rounding
+
+    def test_success_rate_floor_minimum_10pct(self, mock_database, mock_plugin):
+        """Success rate should be floored at 10% to prevent 10x+ explosion."""
+        fc = self._make_fc(mock_plugin, mock_database)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_database.get_channel_cost_history.return_value = self._cost_history(100, 5)
+
+        # 5% success rate (below 10% floor)
+        mock_database.get_channel_rebalance_success_rate.return_value = {
+            'total': 100, 'successes': 5, 'failures': 95,
+            'success_rate': 0.05, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
+        }
+        floor_low = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+
+        # 10% success rate (at floor)
+        mock_database.get_channel_rebalance_success_rate.return_value = {
+            'total': 100, 'successes': 10, 'failures': 90,
+            'success_rate': 0.10, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
+        }
+        floor_at_minimum = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+
+        # Both should produce the same floor (clamped at 10%)
+        assert floor_low == floor_at_minimum
+        # 100ppm / 0.10 * 1.20 = 1200ppm
+        assert floor_low == 1200
+
+    def test_success_rate_insufficient_samples(self, mock_database, mock_plugin):
+        """Success rate = 1.0 should be used when < min_samples."""
+        fc = self._make_fc(mock_plugin, mock_database)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_database.get_channel_cost_history.return_value = self._cost_history(100, 5)
+
+        # Only 2 rebalances (below min_samples=3)
+        mock_database.get_channel_rebalance_success_rate.return_value = {
+            'total': 2, 'successes': 1, 'failures': 1,
+            'success_rate': 0.5, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
+        }
+        floor = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+
+        # Should use success_rate=1.0, so floor = 100 * 1.20 = 120
+        assert floor == 120
+
+    def test_success_rate_no_data_uses_default(self, mock_database, mock_plugin):
+        """No rebalance success data should default to success_rate=1.0."""
+        fc = self._make_fc(mock_plugin, mock_database)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_database.get_channel_cost_history.return_value = self._cost_history(100, 5)
+        mock_database.get_channel_rebalance_success_rate.return_value = None
+
+        floor = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+
+        # No success data → success_rate=1.0 → floor = 100 * 1.20 = 120
+        assert floor == 120

@@ -106,6 +106,9 @@ class RebalanceCandidate:
     reason_code: str = RebalanceReasonCode.EV_POSITIVE.value  # Why this rebalance was approved
     bleeder_status: str = "none"  # 'hard', 'soft', or 'none'
 
+    # Direction: "pull" fills to_channel from sources; "push" drains to_channel to destinations
+    direction: str = "pull"
+
     # Multi-source peer IDs aligned with source_candidates (best-first).
     # Optional for backward compatibility; when absent, callers may fall back to primary_source_peer_id.
     source_candidate_peer_ids: List[str] = field(default_factory=list)
@@ -146,7 +149,8 @@ class RebalanceCandidate:
             "source_turnover_rate": round(self.source_turnover_rate, 4),
             "num_source_candidates": len(self.source_candidates),
             "reason_code": self.reason_code,
-            "bleeder_status": self.bleeder_status
+            "bleeder_status": self.bleeder_status,
+            "direction": self.direction
         }
 
 
@@ -163,7 +167,8 @@ class ActiveJob:
     initial_local_sats: int        # Local balance when job started
     max_fee_ppm: int               # Max fee rate for this job
     status: JobStatus = JobStatus.PENDING
-    
+    direction: str = "pull"
+
     # Backwards compatibility property
     @property
     def from_scid(self) -> str:
@@ -386,16 +391,29 @@ class JobManager:
             # - BALANCED: Neutral 50/50
             # =================================================================
             flow_state = candidate.dest_flow_state if hasattr(candidate, 'dest_flow_state') else "balanced"
-            if flow_state == "sink":
-                target = self.config.sling_target_sink
-            elif flow_state == "source":
-                target = self.config.sling_target_source
+            direction = getattr(candidate, 'direction', 'pull')
+
+            if direction == "push":
+                # Push: target is the local balance ratio to drain DOWN to
+                if flow_state == "source":
+                    target = 1.0 - self.config.sling_target_source
+                elif flow_state == "sink":
+                    target = 1.0 - self.config.sling_target_sink
+                else:
+                    target = 1.0 - self.config.sling_target_balanced
             else:
-                target = self.config.sling_target_balanced
+                # Pull: existing logic unchanged
+                if flow_state == "sink":
+                    target = self.config.sling_target_sink
+                elif flow_state == "source":
+                    target = self.config.sling_target_source
+                else:
+                    target = self.config.sling_target_balanced
 
             self.plugin.log(
-                f"Starting sling-job: {to_scid} <- [{len(source_scids_sling)} candidates], "
-                f"primary={primary_source}, amount={chunk_size}, "
+                f"Starting sling-job: {to_scid} {'<-' if direction == 'pull' else '->'} "
+                f"[{len(source_scids_sling)} candidates], "
+                f"primary={primary_source}, dir={direction}, amount={chunk_size}, "
                 f"maxppm={maxppm}, maxhops={self.config.sling_max_hops}, "
                 f"target={target} (flow={flow_state}), budget_sats={candidate.max_budget_sats}"
             )
@@ -409,12 +427,24 @@ class JobManager:
             # =================================================================
             job_params = {
                 "scid": to_scid,
-                "direction": "pull",
+                "direction": direction,
                 "amount": chunk_size,
                 "maxppm": maxppm,
                 "maxhops": self.config.sling_max_hops,
                 "target": target,
+                "paralleljobs": self.config.sling_parallel_jobs,
             }
+
+            # Flow-aware depletion: how aggressively to drain source candidates
+            if flow_state == "sink":
+                deplete_pct = self.config.sling_deplete_pct_sink
+            elif flow_state == "source":
+                deplete_pct = self.config.sling_deplete_pct_source
+            else:
+                deplete_pct = self.config.sling_deplete_pct_balanced
+
+            job_params["depleteuptopercent"] = deplete_pct
+            job_params["depleteuptoamount"] = max(100_000, chunk_size * 2)
 
             # Add candidates if we have them
             if source_scids_sling:
@@ -454,7 +484,8 @@ class JobManager:
                 target_amount_sats=candidate.amount_sats,
                 initial_local_sats=initial_balance,
                 max_fee_ppm=maxppm,  # Use enforced budget-derived maxppm
-                status=JobStatus.RUNNING
+                status=JobStatus.RUNNING,
+                direction=direction,
             )
             self._active_jobs[normalized_scid] = job
             
@@ -625,9 +656,12 @@ class JobManager:
             
             # Job still running
             summary["still_running"] += 1
+            failure_count = self._extract_failure_count(job_stats)
+            fee_ppm = self._extract_fee_ppm(job_stats)
             self.plugin.log(
                 f"Job {job.scid} running: {elapsed}s elapsed, "
-                f"transferred={balance_delta} sats",
+                f"transferred={balance_delta} sats, failures={failure_count}"
+                + (f", avg_ppm={fee_ppm}" if fee_ppm else ""),
                 level='debug'
             )
         
@@ -684,90 +718,133 @@ class JobManager:
 
     def _extract_success_amount_sats(self, stats: Dict[str, Any]) -> Optional[int]:
         """
-        Best-effort extraction of how much has been successfully transferred.
+        Extract how much has been successfully transferred from sling stats.
 
-        Sling stats schemas can vary by version. We look for a small set of plausible
-        keys and return None if we can't find a signal.
+        Preferred source: per-scid ``successes_in_time_window.total_amount_sats``
+        (returned by ``sling-stats scid=X json=true``).  Falls back to legacy
+        flat keys for older sling versions or bulk-query results.
         """
         if not stats:
             return None
 
-        # Try msat-based totals first.
-        for k in (
-            "success_total_msat",
-            "successful_total_msat",
-            "success_amount_msat",
-            "successful_amount_msat",
-            "amount_success_msat",
-            "sent_success_msat",
-            "total_sent_msat",
-        ):
+        # Per-scid detailed stats (from per-job query)
+        successes = stats.get("successes_in_time_window")
+        if isinstance(successes, dict):
+            sats = self._parse_sats(successes.get("total_amount_sats"))
+            if sats > 0:
+                return sats
+
+        # Fallback: bulk query fields (legacy/version compat)
+        for k in ("success_total_msat", "successful_total_msat"):
             if k in stats:
-                msat = self._parse_msat(stats.get(k))
+                msat = self._parse_msat(stats[k])
                 if msat > 0:
                     return msat // 1000
 
-        # Then sats-based totals.
-        for k in (
-            "success_total_sats",
-            "successful_total_sats",
-            "success_amount_sats",
-            "successful_amount_sats",
-            "amount_success_sats",
-            "total_sent_sats",
-        ):
+        for k in ("success_total_sats", "successful_total_sats"):
             if k in stats:
-                sats = self._parse_sats(stats.get(k))
+                sats = self._parse_sats(stats[k])
                 if sats > 0:
                     return sats
 
         return None
 
     def _extract_success_count(self, stats: Dict[str, Any]) -> int:
+        """Extract successful rebalance count from sling stats."""
         if not stats:
             return 0
-        for k in (
-            "success_count",
-            "successful_payments",
-            "payments_successful",
-            "successes",
-            "completed_payments",
-            "completed",
-        ):
+
+        # Per-scid detailed stats
+        successes = stats.get("successes_in_time_window")
+        if isinstance(successes, dict):
+            n = self._parse_sats(successes.get("total_rebalances"))
+            if n > 0:
+                return n
+
+        # Fallback
+        for k in ("success_count", "successful_payments"):
             if k in stats:
-                n = self._parse_sats(stats.get(k))
+                n = self._parse_sats(stats[k])
                 if n > 0:
                     return n
+
         return 0
-    
+
+    def _extract_failure_count(self, stats: Dict[str, Any]) -> int:
+        """Extract failure count from sling per-scid stats."""
+        if not stats:
+            return 0
+
+        failures = stats.get("failures_in_time_window")
+        if isinstance(failures, dict):
+            n = self._parse_sats(failures.get("total_rebalances"))
+            if n > 0:
+                return n
+
+        # Fallback
+        for k in ("consecutive_failures", "failure_count"):
+            if k in stats:
+                n = self._parse_sats(stats[k])
+                if n > 0:
+                    return n
+
+        return 0
+
+    def _extract_fee_ppm(self, stats: Dict[str, Any]) -> Optional[int]:
+        """Extract weighted average fee PPM from sling per-scid stats."""
+        if not stats:
+            return None
+
+        successes = stats.get("successes_in_time_window")
+        if isinstance(successes, dict):
+            ppm = self._parse_sats(successes.get("feeppm_weighted_avg"))
+            if ppm > 0:
+                return ppm
+
+        return None
+
     def _get_sling_stats(self) -> Dict[str, Dict[str, Any]]:
-        """Query sling-stats for all jobs and return as dict keyed by SCID."""
-        stats = {}
-        try:
-            # sling-stats with json=true returns structured data
-            result = self.plugin.rpc.call("sling-stats", {"json": True})
-            
-            if isinstance(result, dict):
-                # Result might be keyed by SCID or be a list
-                if "jobs" in result:
-                    for job in result["jobs"]:
-                        scid = job.get("scid", "")
+        """Query sling-stats for all active jobs, returning dict keyed by SCID.
+
+        Preferred approach: per-job ``sling-stats scid=<scid> json=true``
+        which returns a known schema with ``successes_in_time_window`` /
+        ``failures_in_time_window`` nested dicts.  Falls back to the bulk
+        ``sling-stats json=true`` call if per-scid queries fail.
+        """
+        stats: Dict[str, Dict[str, Any]] = {}
+
+        # Per-job detailed stats (preferred — returns known schema)
+        for normalized_scid, job in self._active_jobs.items():
+            try:
+                result = self.plugin.rpc.call("sling-stats", {
+                    "scid": job.scid,
+                    "json": True
+                })
+                if isinstance(result, dict):
+                    stats[job.scid] = result
+            except Exception:
+                pass  # Fall through to bulk query
+
+        # Bulk fallback if per-job queries failed
+        if not stats:
+            try:
+                result = self.plugin.rpc.call("sling-stats", {"json": True})
+                if isinstance(result, dict):
+                    if "jobs" in result:
+                        for job_data in result["jobs"]:
+                            scid = job_data.get("scid", "")
+                            if scid:
+                                stats[scid] = job_data
+                    else:
+                        stats = result
+                elif isinstance(result, list):
+                    for job_data in result:
+                        scid = job_data.get("scid", "")
                         if scid:
-                            stats[scid] = job
-                else:
-                    # Assume dict is already keyed by SCID
-                    stats = result
-            elif isinstance(result, list):
-                for job in result:
-                    scid = job.get("scid", "")
-                    if scid:
-                        stats[scid] = job
-                        
-        except RpcError as e:
-            self.plugin.log(f"sling-stats error: {e}", level='debug')
-        except Exception as e:
-            self.plugin.log(f"Error getting sling stats: {e}", level='debug')
-        
+                            stats[scid] = job_data
+            except Exception as e:
+                self.plugin.log(f"sling-stats error: {e}", level='debug')
+
         return stats
     
     def _check_job_error(self, job: ActiveJob, stats: Dict[str, Any]) -> bool:
@@ -796,6 +873,11 @@ class JobManager:
         if not fee_sats:
             fee_msat = stats.get("fee_total_msat", 0)
             fee_sats = fee_msat // 1000 if fee_msat else 0
+        if not fee_sats:
+            # Per-scid detailed stats provide total_spent_sats
+            successes = stats.get("successes_in_time_window")
+            if isinstance(successes, dict):
+                fee_sats = self._parse_sats(successes.get("total_spent_sats"))
         
         # Estimate fee from amount if sling doesn't report it
         if fee_sats == 0 and amount_transferred > 0:
@@ -1035,6 +1117,54 @@ class JobManager:
         except Exception as e:
             self.plugin.log(f"Startup Hygiene: Unexpected error: {e}", level='warn')
             return 0
+
+    def execute_once(self, scid: str, direction: str, amount: int,
+                     maxppm: int, onceamount: Optional[int] = None,
+                     candidates: Optional[List[str]] = None,
+                     outppm: Optional[int] = None) -> Dict[str, Any]:
+        """
+        One-shot rebalance via sling-once.  Blocks until complete.
+
+        Unlike sling-job, no persistent job is created — nothing to
+        track, monitor, or delete afterward.
+
+        Used for: Defibrillator shocks, manual rebalances.
+
+        sling-once params: scid, direction, amount, maxppm, onceamount
+        (must be multiple of amount).  Target is forbidden for sling-once.
+        """
+        sling_scid = self._to_sling_scid(scid)
+        if onceamount is None:
+            onceamount = amount
+        # Ensure multiple of amount
+        if amount > 0 and onceamount % amount != 0:
+            onceamount = ((onceamount // amount) + 1) * amount
+
+        params: Dict[str, Any] = {
+            "scid": sling_scid,
+            "direction": direction,
+            "amount": amount,
+            "maxppm": maxppm,
+            "onceamount": onceamount,
+        }
+        if candidates:
+            params["candidates"] = [self._to_sling_scid(c) for c in candidates]
+        if outppm and outppm > 0:
+            params["outppm"] = outppm
+
+        self.plugin.log(
+            f"sling-once: {sling_scid} dir={direction} amt={amount} "
+            f"maxppm={maxppm} total={onceamount}",
+            level='info'
+        )
+
+        try:
+            result = self.plugin.rpc.call("sling-once", params)
+            return {"success": True, "message": "sling-once completed", "raw": result}
+        except RpcError as e:
+            return {"success": False, "error": f"sling-once RPC error: {e}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def sync_peer_exclusions(self, policy_manager=None) -> int:
         """
