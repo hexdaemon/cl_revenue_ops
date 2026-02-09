@@ -1390,17 +1390,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         except Exception as e:
             plugin.log(f"Warning: Could not sync peer exclusions: {e}", level='warn')
 
-        # Sling hygiene: configure stats retention (prevent unbounded growth)
-        for opt, val in [
-            ("sling-stats-delete-failures-age", 30),
-            ("sling-stats-delete-successes-age", 30),
-            ("sling-candidates-min-age", 144),  # ~1 day in blocks
-        ]:
-            try:
-                plugin.rpc.setconfig(config=opt, val=val)
-            except Exception:
-                pass  # Older sling versions may not support these
-        plugin.log("Sling hygiene: stats retention + min-age configured", level='debug')
+        # Sling hygiene: stats retention settings.
+        # NOTE: setconfig on plugin-owned options (sling-*) triggers a segfault
+        # in CLN v25.12.1 (configvar_finalize_overrides). These must be set in
+        # the CLN config file at startup instead:
+        #   sling-stats-delete-failures-age=30
+        #   sling-stats-delete-successes-age=30
+        #   sling-candidates-min-age=144
+        plugin.log("Sling hygiene: configure stats retention in CLN config (setconfig unsafe on v25.12.1)", level='debug')
     
     # Start background threads (daemon=True so they don't block shutdown)
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
