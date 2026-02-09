@@ -922,13 +922,14 @@ class TestFleetPathInjection:
         return r, fleet_member_a, fleet_member_b
 
     def test_fleet_sources_prepended(self, mock_plugin, mock_database):
-        """Fleet member SCIDs should be prepended to source_candidates."""
+        """Source-eligible fleet member SCIDs should be prepended to source_candidates."""
         fleet_member_a = "02" + "f" * 64
         fleet_member_b = "02" + "e" * 64
 
         fleet_info = {
             "fleet_path_available": True,
-            "fleet_path": [fleet_member_a, fleet_member_b],
+            "fleet_path": ["02" + "d" * 64],  # intermediate (not our peer)
+            "source_eligible_members": [fleet_member_a, fleet_member_b],
             "estimated_fleet_cost_sats": 0,
             "estimated_external_cost_sats": 100,
             "savings_pct": 100.0,
@@ -950,7 +951,8 @@ class TestFleetPathInjection:
 
         fleet_info = {
             "fleet_path_available": True,
-            "fleet_path": [fleet_member_a],
+            "fleet_path": ["02" + "d" * 64],
+            "source_eligible_members": [fleet_member_a],
             "estimated_fleet_cost_sats": 0,
             "estimated_external_cost_sats": 500,
             "savings_pct": 100.0,
@@ -970,6 +972,7 @@ class TestFleetPathInjection:
         fleet_info = {
             "fleet_path_available": False,
             "fleet_path": [],
+            "source_eligible_members": [],
             "estimated_fleet_cost_sats": 0,
             "estimated_external_cost_sats": 100,
             "savings_pct": 0,

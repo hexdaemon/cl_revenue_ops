@@ -2758,7 +2758,9 @@ class EVRebalancer:
 
                 # Inject fleet member channels as sling source candidates
                 # so sling tries zero-fee fleet routes first.
-                fleet_members = fleet_path_info.get("fleet_path", [])
+                # source_eligible_members: fleet peers we have channels with
+                # that are also connected to to_peer (ideal 2-hop zero-fee routes).
+                fleet_members = fleet_path_info.get("source_eligible_members", [])
                 if fleet_members:
                     channels = self._get_channels_with_balances()
                     peer_to_scid = {}
