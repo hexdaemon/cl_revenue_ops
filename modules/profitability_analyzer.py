@@ -70,7 +70,8 @@ class ChannelCosts:
     peer_id: str
     open_cost_sats: int
     rebalance_cost_sats: int
-    
+    effective_rebalance_cost_sats: int = 0  # cost adjusted for success rate
+
     @property
     def total_cost_sats(self) -> int:
         return self.open_cost_sats + self.rebalance_cost_sats
@@ -171,7 +172,9 @@ class ChannelProfitability:
         """
         # Use total contribution (direct fees + sourced fee contribution)
         total_contribution = self.revenue.total_contribution_sats
-        rebalance_costs = self.costs.rebalance_cost_sats
+        # Use effective cost (adjusted for success rate) when available
+        effective = getattr(self.costs, 'effective_rebalance_cost_sats', 0)
+        rebalance_costs = effective if effective > 0 else self.costs.rebalance_cost_sats
 
         # If no rebalancing has occurred, check if channel is contributing value
         if rebalance_costs == 0:
@@ -306,6 +309,7 @@ class BleederClassification:
     net_profit_30d: int
     net_profit_7d: int
     recommended_action: str  # 'disable_rebalance', 'reduce_rebalance', 'monitor'
+    effective_rebalance_cost_30d: int = 0  # cost adjusted for success rate
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -314,6 +318,7 @@ class BleederClassification:
             "classification": self.classification,
             "reason": self.reason,
             "rebalance_cost_30d": self.rebalance_cost_30d,
+            "effective_rebalance_cost_30d": self.effective_rebalance_cost_30d,
             "revenue_30d": self.revenue_30d,
             "net_profit_30d": self.net_profit_30d,
             "net_profit_7d": self.net_profit_7d,
@@ -1391,14 +1396,22 @@ class ChannelProfitabilityAnalyzer:
                     net_profit_30d = pnl_30d.get('net_pnl_sats', 0)
                     net_profit_7d = pnl_7d.get('net_pnl_sats', 0)
 
+                    # Adjust for success rate — effective cost accounts for failed attempts
+                    success_data = self.database.get_channel_rebalance_success_rate(channel_id, window_days)
+                    if success_data and success_data['total'] >= 3:
+                        sr = max(success_data['success_rate'], 0.10)
+                        effective_rebalance_cost_30d = int(rebalance_cost_30d / sr)
+                    else:
+                        effective_rebalance_cost_30d = rebalance_cost_30d
+
                     # Classify the channel
                     classification = "none"
                     reason = "Channel is profitable or break-even"
                     recommended_action = "monitor"
 
                     # Check for HARD BLEEDER first (most severe)
-                    # Condition: rebal_cost > 2x revenue AND net_profit < -1000 sats
-                    if (rebalance_cost_30d > revenue_30d * 2 and
+                    # Condition: effective_rebal_cost > 2x revenue AND net_profit < -1000 sats
+                    if (effective_rebalance_cost_30d > revenue_30d * 2 and
                             net_profit_30d < -1000):
                         classification = "hard"
                         reason = (f"Rebalance cost ({rebalance_cost_30d} sats) exceeds "
@@ -1436,7 +1449,8 @@ class ChannelProfitabilityAnalyzer:
                         revenue_30d=revenue_30d,
                         net_profit_30d=net_profit_30d,
                         net_profit_7d=net_profit_7d,
-                        recommended_action=recommended_action
+                        recommended_action=recommended_action,
+                        effective_rebalance_cost_30d=effective_rebalance_cost_30d
                     ))
                 except Exception as e:
                     self.plugin.log(
@@ -1803,11 +1817,19 @@ class ChannelProfitabilityAnalyzer:
                     level='debug'
                 )
         
+        # Success-rate-adjusted effective cost
+        effective_rebalance_costs = rebalance_costs
+        success_data = self.database.get_channel_rebalance_success_rate(channel_id)
+        if success_data and success_data['total'] >= 3:
+            sr = max(success_data['success_rate'], 0.10)
+            effective_rebalance_costs = int(rebalance_costs / sr)
+
         return ChannelCosts(
             channel_id=channel_id,
             peer_id=peer_id,
             open_cost_sats=open_cost,
-            rebalance_cost_sats=rebalance_costs
+            rebalance_cost_sats=rebalance_costs,
+            effective_rebalance_cost_sats=effective_rebalance_costs
         )
     
     def _sanity_check_open_cost(self, channel_id: str, peer_id: str,

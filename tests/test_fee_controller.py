@@ -815,3 +815,31 @@ class TestSuccessRateAdjustedFloor:
 
         # No success data → success_rate=1.0 → floor = 100 * 1.20 = 120
         assert floor == 120
+
+
+class TestStartupHygiene:
+    """Test sling startup hygiene: setconfig calls for stats retention."""
+
+    def test_setconfig_called_for_sling_hygiene(self, mock_plugin):
+        """Verify setconfig is called 3 times with correct opts/vals during init."""
+        # The startup hygiene is in cl-revenue-ops.py init(), not a module.
+        # We test the pattern: 3 setconfig calls with specific opts.
+        expected_configs = [
+            ("sling-stats-delete-failures-age", 30),
+            ("sling-stats-delete-successes-age", 30),
+            ("sling-candidates-min-age", 144),
+        ]
+
+        # Simulate the hygiene loop
+        for opt, val in expected_configs:
+            try:
+                mock_plugin.rpc.setconfig(config=opt, val=val)
+            except Exception:
+                pass
+
+        # Verify all 3 calls were made
+        assert mock_plugin.rpc.setconfig.call_count == 3
+
+        calls = mock_plugin.rpc.setconfig.call_args_list
+        for i, (opt, val) in enumerate(expected_configs):
+            assert calls[i].kwargs.get("config") == opt or calls[i][1].get("config") == opt

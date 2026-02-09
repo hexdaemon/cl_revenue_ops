@@ -131,18 +131,29 @@ class CapacityPlanner:
             capacity = prof.capacity_sats or 0
             turnover = flow_metrics.daily_volume / capacity if capacity > 0 else 0
 
-            if (prof.marginal_roi_percent > 20.0 and
+            # Rebalance difficulty penalty: low success rate reduces effective ROI
+            success_data = self.profitability.database.get_channel_rebalance_success_rate(scid, 30)
+            rebal_penalty = 0.0
+            if success_data and success_data['total'] >= 3:
+                if success_data['success_rate'] < 0.5:
+                    rebal_penalty = (0.5 - success_data['success_rate']) * 50  # Up to 25% ROI penalty
+
+            effective_roi = prof.marginal_roi_percent - rebal_penalty
+            rebal_difficulty = round(1.0 - (success_data['success_rate'] if success_data and success_data['total'] >= 3 else 1.0), 2)
+
+            if (effective_roi > 20.0 and
                 turnover > 0.5 and
                 (flow_metrics.flow_ratio > 0.8 or flow_metrics.flow_ratio < -0.8)):
 
                 winners.append({
                     "scid": scid_display,
                     "peer_id": prof.peer_id,
-                    "roi": round(prof.marginal_roi_percent, 2),
+                    "roi": round(effective_roi, 2),
                     "flow_ratio": round(flow_metrics.flow_ratio, 4),
                     "turnover": round(turnover, 4),
                     "capacity": prof.capacity_sats,
-                    "peer_supports_splice": peer_splice_map.get(prof.peer_id, False)
+                    "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
+                    "rebal_difficulty": rebal_difficulty,
                 })
 
         return winners
@@ -161,6 +172,12 @@ class CapacityPlanner:
             # Fetch diagnostic stats from DB
             diag_stats = self.profitability.database.get_diagnostic_rebalance_stats(scid, days=14)
             attempt_count = diag_stats.get("attempt_count", 0)
+
+            # Rebalance difficulty scoring from success rate history
+            success_data = self.profitability.database.get_channel_rebalance_success_rate(scid, 30)
+            rebal_difficulty = 0.0
+            if success_data and success_data['total'] >= 3:
+                rebal_difficulty = 1.0 - success_data['success_rate']  # 0=easy, 1=impossible
 
             # SCID formatting check - ensure 'x' separator
             scid_display = scid.replace(':', 'x')
@@ -188,6 +205,11 @@ class CapacityPlanner:
                     if prof.marginal_roi_percent < 10.0:
                         is_stagnant = True
 
+            # High rebalance difficulty makes losers worse — harder to recover
+            if rebal_difficulty > 0.7 and not is_fire_sale and is_stagnant:
+                is_fire_sale = True
+                fire_sale_reason = "STAGNANT+HARD_REBAL"
+
             if is_fire_sale or is_stagnant:
                 # PROTECTION: A channel cannot be recommended for "Close" or "Splice-out"
                 # until the diagnostic_rebalance has been attempted at least twice in the last 14 days.
@@ -206,6 +228,7 @@ class CapacityPlanner:
                         "capacity": prof.capacity_sats,
                         "estimated_closure_cost_sats": estimated_closure_cost,
                         "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
+                        "rebal_difficulty": round(rebal_difficulty, 2),
                         "action": "DEFIBRILLATE"
                     })
                 else:
@@ -219,6 +242,7 @@ class CapacityPlanner:
                         "capacity": prof.capacity_sats,
                         "estimated_closure_cost_sats": estimated_closure_cost,
                         "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
+                        "rebal_difficulty": round(rebal_difficulty, 2),
                         "action": "CLOSE"
                     })
 

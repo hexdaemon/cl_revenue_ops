@@ -1,0 +1,154 @@
+"""
+Tests for capacity_planner — rebalance difficulty scoring.
+"""
+
+import os
+import sys
+import pytest
+from unittest.mock import MagicMock
+
+# Mock pyln.client before importing modules
+mock_pyln = MagicMock()
+mock_pyln.Plugin = MagicMock
+mock_pyln.RpcError = Exception
+sys.modules['pyln'] = mock_pyln
+sys.modules['pyln.client'] = mock_pyln
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from modules.capacity_planner import CapacityPlanner
+from modules.profitability_analyzer import ProfitabilityClass
+
+
+def _mock_profitability(
+    scid="111x222x0",
+    peer_id="02" + "a" * 64,
+    marginal_roi_percent=5.0,
+    roi_percent=-10.0,
+    classification=ProfitabilityClass.UNDERWATER,
+    capacity_sats=2_000_000,
+    days_open=100,
+):
+    """Create a mock ChannelProfitability."""
+    prof = MagicMock()
+    prof.peer_id = peer_id
+    prof.marginal_roi_percent = marginal_roi_percent
+    prof.marginal_roi = marginal_roi_percent / 100.0
+    prof.roi_percent = roi_percent
+    prof.classification = classification
+    prof.capacity_sats = capacity_sats
+    prof.days_open = days_open
+    return prof
+
+
+def _mock_flow(
+    our_balance=1_000_000,
+    capacity=2_000_000,
+    daily_volume=100,
+    flow_ratio=0.0,
+):
+    """Create a mock FlowAnalysis."""
+    flow = MagicMock()
+    flow.our_balance = our_balance
+    flow.capacity = capacity
+    flow.daily_volume = daily_volume
+    flow.flow_ratio = flow_ratio
+    return flow
+
+
+class TestRebalanceDifficulty:
+    """Test rebalance difficulty scoring in capacity_planner."""
+
+    def test_loser_escalated_by_high_difficulty(self):
+        """Stagnant channel + difficulty > 0.7 → escalated to FIRE SALE."""
+        plugin = MagicMock()
+        config = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+
+        planner = CapacityPlanner(plugin, config, prof_analyzer, flow_analyzer)
+
+        scid = "111x222x0"
+        prof = _mock_profitability(
+            scid=scid,
+            marginal_roi_percent=5.0,
+            roi_percent=-10.0,
+            classification=ProfitabilityClass.UNDERWATER,
+            days_open=100,
+        )
+        # Stagnant: balanced (outbound_ratio ~0.5) and low turnover
+        flow = _mock_flow(
+            our_balance=1_000_000,
+            capacity=2_000_000,
+            daily_volume=2,  # turnover = 2/2M = 0.000001 < 0.0015
+            flow_ratio=0.0,
+        )
+
+        all_prof = {scid: prof}
+        all_flow = {scid: flow}
+        peer_splice_map = {prof.peer_id: False}
+
+        # Mock database methods
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 3}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            'total': 10, 'successes': 2, 'failures': 8,
+            'success_rate': 0.2, 'avg_cost_ppm': 500, 'avg_amount_sats': 50000,
+        }
+
+        losers = planner._identify_losers(all_prof, all_flow, peer_splice_map)
+
+        assert len(losers) == 1
+        loser = losers[0]
+        # Stagnant + high difficulty (0.8 > 0.7) → escalated to FIRE SALE
+        assert loser["reason"] == "STAGNANT+HARD_REBAL"
+        assert loser["action"] == "CLOSE"
+        assert loser["rebal_difficulty"] == 0.8
+
+    def test_winner_penalized_by_difficulty(self):
+        """Low success rate penalizes winner ROI score."""
+        plugin = MagicMock()
+        config = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+
+        planner = CapacityPlanner(plugin, config, prof_analyzer, flow_analyzer)
+
+        scid = "222x333x0"
+        prof = _mock_profitability(
+            scid=scid,
+            marginal_roi_percent=30.0,  # Base ROI is 30%
+            roi_percent=30.0,
+            classification=ProfitabilityClass.PROFITABLE,
+            days_open=60,
+        )
+        flow = _mock_flow(
+            our_balance=500_000,
+            capacity=2_000_000,
+            daily_volume=1_500_000,  # turnover = 0.75 > 0.5
+            flow_ratio=0.9,  # > 0.8
+        )
+
+        all_prof = {scid: prof}
+        all_flow = {scid: flow}
+        peer_splice_map = {prof.peer_id: True}
+
+        # Success rate = 30% → penalty = (0.5 - 0.3) * 50 = 10
+        # Effective ROI = 30 - 10 = 20, which is NOT > 20 → won't be winner
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            'total': 10, 'successes': 3, 'failures': 7,
+            'success_rate': 0.3, 'avg_cost_ppm': 800, 'avg_amount_sats': 50000,
+        }
+
+        winners = planner._identify_winners(all_prof, all_flow, peer_splice_map)
+
+        # effective_roi = 30 - 10 = 20.0, condition is > 20.0 (strict), so NOT a winner
+        assert len(winners) == 0
+
+        # Now with higher ROI → still a winner but penalized
+        prof.marginal_roi_percent = 40.0
+        winners = planner._identify_winners(all_prof, all_flow, peer_splice_map)
+
+        assert len(winners) == 1
+        # ROI should be 40 - 10 = 30
+        assert winners[0]["roi"] == 30.0
+        assert winners[0]["rebal_difficulty"] == 0.7  # 1 - 0.3

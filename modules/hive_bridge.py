@@ -2079,7 +2079,8 @@ class HiveFeeIntelligenceBridge:
         amount_sats: int,
         cost_sats: int,
         success: bool,
-        via_fleet: bool = False
+        via_fleet: bool = False,
+        failure_reason: str = ""
     ) -> bool:
         """
         Report rebalance outcome for fleet coordination.
@@ -2105,14 +2106,17 @@ class HiveFeeIntelligenceBridge:
             return False
 
         try:
-            result = self.plugin.rpc.call("hive-report-rebalance-outcome", {
+            payload = {
                 "from_channel": from_channel,
                 "to_channel": to_channel,
                 "amount_sats": amount_sats,
                 "cost_sats": cost_sats,
                 "success": success,
                 "via_fleet": via_fleet
-            })
+            }
+            if failure_reason:
+                payload["failure_reason"] = failure_reason
+            result = self.plugin.rpc.call("hive-report-rebalance-outcome", payload)
 
             if result.get("error"):
                 # This might not be implemented yet - that's OK
@@ -2127,6 +2131,35 @@ class HiveFeeIntelligenceBridge:
             # Method might not exist yet - fail gracefully
             self._log(f"Failed to report rebalance outcome: {e}", level="debug")
             return True  # Don't block on this
+
+    def report_cost_trends(
+        self,
+        channel_costs: List[Dict[str, Any]]
+    ) -> bool:
+        """
+        Share per-channel rebalance cost trends with fleet.
+
+        Enables fleet-wide optimization: if member A's channel to peer X
+        is expensive to rebalance, member B might route differently.
+
+        Args:
+            channel_costs: List of {channel_id, avg_cost_ppm, success_rate, sample_count}
+        """
+        if not self.is_available() or self._is_circuit_open():
+            return False
+
+        try:
+            result = self.plugin.rpc.call("hive-report-cost-trends", {
+                "costs": channel_costs[:50]  # Bounded to top 50
+            })
+            if result.get("error"):
+                if "unknown" in str(result.get("error")).lower():
+                    return True  # Not implemented yet
+                return False
+            return True
+        except Exception as e:
+            self._log(f"Failed to report cost trends: {e}", level="debug")
+            return True  # Non-fatal
 
     # =========================================================================
     # YIELD OPTIMIZATION PHASE 5: STRATEGIC POSITIONING (PHYSARUM)

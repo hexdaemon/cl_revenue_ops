@@ -425,6 +425,26 @@ class PortfolioOptimizer:
                 kalman_uncertainty=kalman_uncertainty
             )
 
+        # Post-process: adjust expected returns for rebalance costs
+        for scid, stat in stats.items():
+            try:
+                cost_data = self.database.get_channel_rebalance_success_rate(scid, PORTFOLIO_WINDOW_DAYS)
+                if cost_data and cost_data['successes'] > 0:
+                    avg_cost_ppm = cost_data.get('avg_cost_ppm', 0)
+                    avg_amount = cost_data.get('avg_amount_sats', 0)
+                    avg_cost = avg_cost_ppm * avg_amount / 1_000_000
+                    hours_in_window = PORTFOLIO_WINDOW_DAYS * 24
+                    cost_per_hour = (avg_cost * cost_data['successes']) / hours_in_window if hours_in_window > 0 else 0
+                    stat.expected_return = max(0, stat.expected_return - cost_per_hour)
+
+                    # Cost uncertainty: lower success rate = higher variance contribution
+                    success_rate = cost_data['success_rate'] if cost_data['success_rate'] > 0 else 1.0
+                    cost_variance_contribution = (cost_per_hour ** 2) * (1.0 / success_rate - 1.0)
+                    stat.variance += cost_variance_contribution
+                    stat.std_dev = math.sqrt(stat.variance) if stat.variance > 0 else 0.0
+            except Exception:
+                pass  # Non-fatal — proceed with unadjusted stats
+
         self._channel_stats = stats
         return stats
 

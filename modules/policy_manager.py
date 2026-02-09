@@ -894,6 +894,7 @@ class PolicyManager:
 
             for bleeder in bleeders:
                 peer_id = bleeder.get('peer_id', '')
+                channel_id = bleeder.get('channel_id', '')
                 if not peer_id:
                     continue
 
@@ -909,6 +910,22 @@ class PolicyManager:
                 forward_count = bleeder.get('forward_count', 0)
                 rebalance_cost = bleeder.get('rebalance_cost_sats', 0)
 
+                # Query success rate trend: compare recent (7d) vs historical (30d)
+                trend = "stable"
+                if channel_id and self.database:
+                    try:
+                        recent_sr = self.database.get_channel_rebalance_success_rate(channel_id, 7)
+                        historical_sr = self.database.get_channel_rebalance_success_rate(channel_id, 30)
+                        if (recent_sr and historical_sr and
+                                recent_sr['total'] >= 2 and historical_sr['total'] >= 3):
+                            delta = recent_sr['success_rate'] - historical_sr['success_rate']
+                            if delta < -0.15:
+                                trend = "declining"
+                            elif delta > 0.15:
+                                trend = "improving"
+                    except Exception:
+                        pass
+
                 # Determine suggestion type
                 if forward_count == ZOMBIE_FORWARD_THRESHOLD and net_pnl < 0:
                     # Zombie: No activity but costs money
@@ -921,20 +938,33 @@ class PolicyManager:
                         'suggested_rebalance_mode': 'disabled',
                         'reason': f"Zombie channel: 0 forwards, {abs(net_pnl)} sats loss",
                         'severity': 'high',
-                        'action': 'consider_close'
+                        'action': 'consider_close',
+                        'trend': trend
                     })
                 elif net_pnl < 0 and rebalance_cost > 0:
                     # Bleeder: Active but rebalance costs exceed revenue
+                    # Declining trend escalates severity; improving trend softens it
+                    if trend == "declining":
+                        severity = 'high'
+                        action = 'disable_rebalance'
+                    elif trend == "improving":
+                        severity = 'medium'
+                        action = 'monitor'
+                    else:
+                        severity = 'medium'
+                        action = 'disable_rebalance'
+
                     suggestions.append({
                         'peer_id': peer_id,
                         'peer_id_short': peer_id[:12] + '...',
                         'current_strategy': current_policy.strategy.value,
                         'current_rebalance_mode': current_policy.rebalance_mode.value,
                         'suggested_strategy': None,  # Keep current
-                        'suggested_rebalance_mode': 'disabled',
+                        'suggested_rebalance_mode': 'disabled' if action == 'disable_rebalance' else None,
                         'reason': f"Bleeder: rebalance cost {rebalance_cost} > revenue, net loss {abs(net_pnl)} sats",
-                        'severity': 'medium',
-                        'action': 'disable_rebalance'
+                        'severity': severity,
+                        'action': action,
+                        'trend': trend
                     })
 
             # Check for high-velocity sources that should be protected

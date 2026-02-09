@@ -219,7 +219,7 @@ class JobManager:
         self.last_decay_time = time.time()
 
     def _report_outcome_to_hive(self, job: ActiveJob, success: bool, cost_sats: int,
-                                 amount_transferred: int = 0) -> None:
+                                 amount_transferred: int = 0, failure_reason: str = "") -> None:
         """
         Report rebalance outcome to hive for fleet coordination.
 
@@ -233,6 +233,7 @@ class JobManager:
             success: Whether rebalance succeeded
             cost_sats: Fee cost of the rebalance
             amount_transferred: Amount successfully moved (0 if failed)
+            failure_reason: Error description if failed
         """
         if not self.hive_bridge:
             return
@@ -247,7 +248,8 @@ class JobManager:
                 amount_sats=amount_transferred if success else job.target_amount_sats,
                 cost_sats=cost_sats,
                 success=success,
-                via_fleet=via_fleet
+                via_fleet=via_fleet,
+                failure_reason=failure_reason
             )
 
             self.plugin.log(
@@ -965,7 +967,8 @@ class JobManager:
         self.database.release_budget_reservation(job.rebalance_id)
 
         # Report outcome to hive for fleet coordination (Phase 7)
-        self._report_outcome_to_hive(job, success=False, cost_sats=0, amount_transferred=0)
+        self._report_outcome_to_hive(job, success=False, cost_sats=0, amount_transferred=0,
+                                     failure_reason=error_msg)
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
@@ -1005,7 +1008,8 @@ class JobManager:
         # Report the actual cost incurred even though job failed
         actual_cost_sats = (fee_msat + 999) // 1000
         self._report_outcome_to_hive(job, success=False, cost_sats=actual_cost_sats,
-                                     amount_transferred=0)
+                                     amount_transferred=0,
+                                     failure_reason=f"exceeded_budget: {msg}")
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="exceeded_budget")
@@ -1051,7 +1055,8 @@ class JobManager:
             job,
             success=(amount_transferred > 0),
             cost_sats=0,  # Unknown actual fee on timeout
-            amount_transferred=amount_transferred
+            amount_transferred=amount_transferred,
+            failure_reason="" if amount_transferred > 0 else "timeout"
         )
 
         # Stop the job
@@ -1647,15 +1652,49 @@ class EVRebalancer:
                     if len(candidates) >= available_slots:
                         break
             
+            # === PUSH CANDIDATE DETECTION ===
+            # Overfull channels that have high source failure rates benefit from
+            # PUSH direction (drain out to destinations) instead of being used
+            # as pull sources (which keeps failing).
+            remaining_slots = available_slots - len(candidates)
+            if remaining_slots > 0 and depleted_channels:
+                push_candidates = []
+                # Channels already selected as pull sources — skip them for push
+                used_sources = set()
+                for c in candidates:
+                    used_sources.update(c.source_candidates)
+
+                for src_id, src_info, src_ratio in source_channels:
+                    if src_id in active_channels or src_id in used_sources:
+                        continue
+                    # Only extremely overfull channels (>85% local)
+                    if src_ratio < 0.85:
+                        continue
+                    # Must have source failure history (>3 failures) — this is the signal
+                    # that pull-from-this-channel doesn't work well
+                    src_fail_count = self.job_manager.source_failure_counts.get(src_id, 0)
+                    if src_fail_count < 3:
+                        continue
+
+                    # Build push candidate: drain src_id, liquidity flows to depleted channels
+                    dest_scids = [d[0] for d in depleted_channels[:5]]
+                    push_ev = self._estimate_push_ev(src_id, src_info, src_ratio, dest_scids)
+                    if push_ev and push_ev.expected_profit_sats >= 0:
+                        push_candidates.append(push_ev)
+
+                # Sort by profit, take remaining slots
+                push_candidates.sort(key=lambda c: c.expected_profit_sats, reverse=True)
+                candidates.extend(push_candidates[:remaining_slots])
+
             # Sort by priority
             def sort_key(c):
                 dest_state = self.database.get_channel_state(c.to_channel)
                 flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
                 priority = 2 if flow_state == "source" else 1
                 return (priority, c.expected_profit_sats)
-            
+
             candidates.sort(key=sort_key, reverse=True)
-            
+
             # Limit to available slots
             return candidates[:available_slots]
         
@@ -2117,6 +2156,56 @@ class EVRebalancer:
             return max(0.0001, min(1.0, volume / capacity))
         except Exception: 
             return 0.05
+
+    def _estimate_push_ev(self, src_channel: str, src_info: Dict,
+                          src_ratio: float, dest_scids: List[str]) -> Optional[RebalanceCandidate]:
+        """Estimate EV for a push rebalance (draining an overfull channel)."""
+        cfg = self.config.snapshot()
+        capacity = src_info.get("capacity", 0)
+        if capacity == 0:
+            return None
+
+        # Push amount: drain to 50% outbound ratio
+        target_ratio = 0.50
+        excess_sats = int((src_ratio - target_ratio) * capacity)
+        amount = min(excess_sats, cfg.rebalance_max_amount)
+        amount = max(amount, cfg.rebalance_min_amount)
+
+        src_peer_id = src_info.get("peer_id", "")
+        src_fee = src_info.get("fee_ppm", 0)
+        inbound_fee = self._estimate_inbound_fee(src_peer_id)
+
+        # For push, the "outbound fee" is what we earn when traffic flows in the
+        # direction we're creating capacity for (the reverse direction)
+        spread = src_fee - inbound_fee
+        max_fee_ppm = max(1, int(spread * cfg.kelly_fraction))
+        max_budget = int(amount * max_fee_ppm / 1_000_000)
+
+        if max_budget <= 0:
+            return None
+
+        return RebalanceCandidate(
+            source_candidates=dest_scids,
+            to_channel=src_channel,
+            primary_source_peer_id="",
+            to_peer_id=src_peer_id,
+            amount_sats=amount,
+            amount_msat=amount * 1000,
+            outbound_fee_ppm=src_fee,
+            inbound_fee_ppm=inbound_fee,
+            source_fee_ppm=0,
+            weighted_opp_cost_ppm=0,
+            spread_ppm=spread,
+            max_budget_sats=max_budget,
+            max_budget_msat=max_budget * 1000,
+            max_fee_ppm=max_fee_ppm,
+            expected_profit_sats=int(spread * amount / 1_000_000) - max_budget,
+            liquidity_ratio=src_ratio,
+            dest_flow_state="push_drain",
+            dest_turnover_rate=0.0,
+            source_turnover_rate=0.0,
+            direction="push"
+        )
 
     def _estimate_inbound_fee(self, peer_id: str, amount_msat: int = 100000000) -> int:
         """
@@ -2896,13 +2985,39 @@ class EVRebalancer:
                     "success": True,
                     "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
                 }
-            
-            # Execute Active Shock
-            result = self.execute_rebalance(candidate, rebalance_type='diagnostic')
-            
+
+            # Record in database (execute_once bypasses normal job flow)
+            rebalance_id = self.database.record_rebalance(
+                from_channel=best_source_id,
+                to_channel=channel_id,
+                amount_sats=shock_amount,
+                max_fee_sats=100,
+                expected_profit_sats=-50,
+                rebalance_type='diagnostic',
+                reason_code='defibrillator'
+            )
+
+            result = self.job_manager.execute_once(
+                scid=channel_id,
+                direction="pull",
+                amount=shock_amount,
+                maxppm=2000,
+                onceamount=shock_amount,
+                candidates=[best_source_id]
+            )
+
+            # Update database with outcome
+            if result.get("success"):
+                self.database.update_rebalance_result(rebalance_id, 'success')
+            else:
+                self.database.update_rebalance_result(
+                    rebalance_id, 'failed',
+                    error_message=result.get("error", "sling-once failed")
+                )
+
             return {
-                "success": True, 
-                "message": f"Defibrillator active: Zero-Fee flag set + Shock job queued ({result.get('message', 'pending')})"
+                "success": True,
+                "message": f"Defibrillator active: Zero-Fee flag set + Shock {'completed' if result.get('success') else 'failed'}"
             }
 
         except Exception as e:
@@ -2976,9 +3091,36 @@ class EVRebalancer:
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0
         )
-        # Manual rebalances are explicit operator actions; bypass budget reservations by design.
+        # Manual rebalances use execute_once (blocking sling-once) and bypass budget reservations.
         # Fees are still recorded in history and will reduce budget available for automated runs.
-        result = self.execute_rebalance(cand, rebalance_type='manual', enforce_budget=False)
+        rebalance_id = self.database.record_rebalance(
+            from_channel=from_channel,
+            to_channel=to_channel,
+            amount_sats=amount_sats,
+            max_fee_sats=max_fee_sats,
+            expected_profit_sats=0,
+            rebalance_type='manual',
+            reason_code='manual'
+        )
+
+        once_result = self.job_manager.execute_once(
+            scid=to_channel,
+            direction="pull",
+            amount=amount_sats,
+            maxppm=max_fee_ppm,
+            onceamount=amount_sats,
+            candidates=[from_channel]
+        )
+
+        if once_result.get("success"):
+            self.database.update_rebalance_result(rebalance_id, 'success')
+            result = {"success": True, "message": once_result.get("message", "completed")}
+        else:
+            self.database.update_rebalance_result(
+                rebalance_id, 'failed',
+                error_message=once_result.get("error", "")
+            )
+            result = {"success": False, "error": once_result.get("error", "sling-once failed")}
 
         # Include capital controls warning in result (unless force=True)
         if not capital_ok and not force:
