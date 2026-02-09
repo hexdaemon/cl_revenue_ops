@@ -1044,16 +1044,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log("=" * 60)
     else:
         # Auto or required hive mode
-        # Retry a few times in case cl-hive loads after us
+        # Retry with backoff in case cl-hive loads after us.
+        # CLN starts all plugins concurrently; cl-hive's init() may still
+        # be running when we reach this point.  Each attempt invalidates
+        # the bridge cache so we get a fresh plugin-list + hive-status check.
         hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database)
         hive_available = False
-        for attempt in range(3):
+        max_attempts = 6
+        for attempt in range(max_attempts):
+            hive_bridge.invalidate_availability()
             hive_available = hive_bridge.is_available()
             if hive_available:
                 break
-            if attempt < 2:
-                plugin.log(f"Waiting for cl-hive (attempt {attempt + 1}/3)...")
-                time.sleep(5)
+            if attempt < max_attempts - 1:
+                wait = 3 if attempt < 2 else 5
+                plugin.log(f"Waiting for cl-hive (attempt {attempt + 1}/{max_attempts})...")
+                time.sleep(wait)
 
         if config.hive_enabled == 'true' and not hive_available:
             # Required mode but hive not available - warn but continue

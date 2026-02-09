@@ -225,6 +225,11 @@ class HiveFeeIntelligenceBridge:
             self._availability_check_time = now - (self._availability_ttl - 5)
             return False
 
+    def invalidate_availability(self) -> None:
+        """Force a fresh availability check on next is_available() call."""
+        self._hive_available = None
+        self._availability_check_time = 0
+
     # =========================================================================
     # CIRCUIT BREAKER
     # =========================================================================
