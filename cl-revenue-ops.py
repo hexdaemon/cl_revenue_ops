@@ -2142,7 +2142,7 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                 return {"channel_id": channel_id, "error": "No data available"}
         else:
             # Analyze all channels
-            all_results = profitability_analyzer.analyze_all_channels()
+            all_results = profitability_analyzer.analyze_all_channels(force=True)
 
             # Group by profitability class
             summary = {

@@ -409,7 +409,7 @@ class ChannelProfitabilityAnalyzer:
                 return 0
         return 0
     
-    def analyze_all_channels(self) -> Dict[str, ChannelProfitability]:
+    def analyze_all_channels(self, force: bool = False) -> Dict[str, ChannelProfitability]:
         """
         Analyze profitability for all channels.
 
@@ -419,9 +419,18 @@ class ChannelProfitabilityAnalyzer:
         Uses a lock to prevent concurrent analysis stampede - if another thread
         is already analyzing, returns the existing cache instead of duplicating work.
 
+        Args:
+            force: If True, bypass cache TTL and always run fresh analysis
+
         Returns:
             Dict mapping channel_id to ChannelProfitability
         """
+        # Return cached results if still fresh (prevents redundant re-analysis)
+        if not force and self._profitability_cache:
+            cache_age = int(time.time()) - self._cache_timestamp
+            if cache_age <= self._cache_ttl:
+                return self._profitability_cache
+
         # Non-blocking lock acquisition - if another thread is analyzing, return cache
         if not self._analysis_lock.acquire(blocking=False):
             return self._profitability_cache

@@ -2481,7 +2481,7 @@ class EVRebalancer:
                     self.plugin.log(
                         f"Skipping source candidate {pid}: unstable connection "
                         f"({uptime_pct:.1f}% uptime in 24h).",
-                        level='info'
+                        level='debug'
                     )
                     continue
 

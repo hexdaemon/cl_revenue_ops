@@ -1532,7 +1532,7 @@ class Database:
             self.plugin.log(
                 f"Financial snapshot recorded: TLV={local_balance_sats + onchain_sats} sats, "
                 f"{channel_count} channels",
-                level='info'
+                level='debug'
             )
             return True
 

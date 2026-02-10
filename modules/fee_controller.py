@@ -2971,6 +2971,10 @@ class HillClimbingFeeController:
             if not state.thompson.observations:
                 state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
 
+            # Stamp as migrated so we don't re-migrate on next restart
+            state.algorithm_version = "thompson_aimd_v1"
+            self._save_thompson_aimd_state(channel_id, state)
+
             self.plugin.log(
                 f"THOMPSON_MIGRATE: {channel_id[:12]}... migrated from Hill Climbing "
                 f"({len(state.thompson.observations)} observations from history)",
