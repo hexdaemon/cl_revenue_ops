@@ -2836,6 +2836,7 @@ class HillClimbingFeeController:
 
         # Thompson+AIMD state cache (v1.7.0)
         self._thompson_aimd_states: Dict[str, ThompsonAIMDState] = {}
+        self._thompson_migrated_channels: set = set()  # Dedup migration logs
 
         # Lock protecting state dict access across threads
         self._state_lock = threading.Lock()
@@ -3130,11 +3131,13 @@ class HillClimbingFeeController:
             state.algorithm_version = "thompson_aimd_v1"
             self._save_thompson_aimd_state(channel_id, state)
 
-            self.plugin.log(
-                f"THOMPSON_MIGRATE: {channel_id[:12]}... migrated from Hill Climbing "
-                f"({len(state.thompson.observations)} observations from history)",
-                level='info'
-            )
+            if channel_id not in self._thompson_migrated_channels:
+                self._thompson_migrated_channels.add(channel_id)
+                self.plugin.log(
+                    f"THOMPSON_MIGRATE: {channel_id[:12]}... migrated from Hill Climbing "
+                    f"({len(state.thompson.observations)} observations from history)",
+                    level='info'
+                )
 
         # Desync check
         if actual_fee_ppm is not None and actual_fee_ppm > 0:
