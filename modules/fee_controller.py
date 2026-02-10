@@ -5277,6 +5277,7 @@ class HillClimbingFeeController:
             # members' posteriors. If our posterior overlaps significantly with
             # fleet members, differentiate by biasing away from crowded regions.
             fleet_posteriors = None
+            differentiation_offset = 0
             if self.hive_bridge and self.hive_bridge.is_available():
                 # Share our posterior summary for fleet coordination
                 try:
@@ -5294,9 +5295,6 @@ class HillClimbingFeeController:
                         f"P2_COMPETE: Failed to share posterior: {e}",
                         level='debug'
                     )
-
-                # Differentiation offset (computed below, applied to sampled fee)
-                differentiation_offset = 0
 
                 # Query fleet posteriors for competition avoidance
                 try:
