@@ -996,7 +996,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
             if forwards_to_insert:
                 inserted = database.bulk_insert_forwards(forwards_to_insert)
-                plugin.log(f"Hydration complete: inserted {inserted} forwards into local database")
+                if inserted > 0:
+                    plugin.log(f"Hydration complete: inserted {inserted} forwards into local database")
+                else:
+                    plugin.log(f"Hydration: {len(forwards_to_insert)} forwards already in database", level='debug')
             else:
                 plugin.log("Hydration complete: no new forwards to insert", level='debug')
 
