@@ -470,6 +470,8 @@ class ThreadSafeRpcProxy:
             return "sling"
         if method_name.startswith("bkpr-"):
             return "bkpr"
+        if method_name in ("hive-deposit-marker", "hive-record-routing-outcome"):
+            return "hive-routing"
         if method_name.startswith("hive-"):
             return "hive"
         if method_name.startswith("revenue-"):
