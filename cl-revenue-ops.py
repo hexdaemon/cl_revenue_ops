@@ -3972,6 +3972,17 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
             their_funding_sats=their_funding_sats
         )
 
+        # Set initial fee immediately so the channel doesn't sit with CLN
+        # defaults until the next periodic fee adjustment cycle.
+        if fee_controller is not None:
+            try:
+                fee_controller.set_initial_fee(channel_id, peer_id)
+            except Exception as fee_err:
+                plugin.log(
+                    f"Failed to set initial fee for {channel_id}: {fee_err}",
+                    level='warn'
+                )
+
     except Exception as e:
         plugin.log(f"Error handling channel open {channel_id}: {e}", level='debug')
 

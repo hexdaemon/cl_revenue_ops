@@ -310,3 +310,215 @@ class TestZeroFeeProbeEndToEnd:
         mock_database.clear_channel_probe.assert_called()
         _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
         assert applied_fee == adj.new_fee_ppm
+
+
+class TestSetInitialFee:
+    """Tests for set_initial_fee - immediate fee setting on channel open."""
+
+    def _make_controller(self, mock_plugin, mock_database, policy_manager=None):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel.return_value = True
+
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = HillClimbingFeeController(
+            mock_plugin, cfg, mock_database, clboss, policy_manager
+        )
+        return fc
+
+    def test_initial_fee_sets_thompson_prior_sample(self, mock_plugin, mock_database):
+        """New dynamic channel gets a fee from the Thompson prior."""
+        from modules.fee_controller import FeeReasonCode
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # After setchannel is called, verification re-queries listpeerchannels.
+        # Simulate the fee actually taking effect.
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        def fake_listpeerchannels(*args, **kwargs):
+            if mock_plugin.rpc.setchannel.called:
+                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+                return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=last_fee)
+            return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=0)
+
+        mock_plugin.rpc.listpeerchannels.side_effect = fake_listpeerchannels
+
+        fc = self._make_controller(mock_plugin, mock_database)
+        result = fc.set_initial_fee(channel_id, peer_id)
+
+        assert result is not None
+        assert result["success"] is True
+        mock_plugin.rpc.setchannel.assert_called()
+        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        # Fee should be within configured bounds
+        assert 10 <= applied_fee <= 5000
+
+    def test_initial_fee_respects_passive_policy(self, mock_plugin, mock_database):
+        """PASSIVE policy channels are skipped entirely."""
+        from modules.policy_manager import PolicyManager, FeeStrategy, PeerPolicy
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
+            channel_id, peer_id
+        )
+
+        pm = MagicMock(spec=PolicyManager)
+        pm.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id, strategy=FeeStrategy.PASSIVE
+        )
+
+        fc = self._make_controller(mock_plugin, mock_database, policy_manager=pm)
+        result = fc.set_initial_fee(channel_id, peer_id)
+
+        assert result is None
+        mock_plugin.rpc.setchannel = MagicMock()
+        mock_plugin.rpc.setchannel.assert_not_called()
+
+    def test_initial_fee_respects_static_policy(self, mock_plugin, mock_database):
+        """STATIC policy sets the exact target fee."""
+        from modules.policy_manager import PolicyManager, FeeStrategy, PeerPolicy
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        def fake_listpeerchannels(*args, **kwargs):
+            if mock_plugin.rpc.setchannel.called:
+                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+                return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=last_fee)
+            return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=0)
+
+        mock_plugin.rpc.listpeerchannels.side_effect = fake_listpeerchannels
+
+        pm = MagicMock(spec=PolicyManager)
+        pm.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id, strategy=FeeStrategy.STATIC, fee_ppm_target=250
+        )
+
+        fc = self._make_controller(mock_plugin, mock_database, policy_manager=pm)
+        result = fc.set_initial_fee(channel_id, peer_id)
+
+        assert result is not None
+        assert result["success"] is True
+        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        assert applied_fee == 250
+
+    def test_initial_fee_respects_hive_policy(self, mock_plugin, mock_database):
+        """HIVE policy sets zero fee regardless of min_fee_ppm."""
+        from modules.policy_manager import PolicyManager, FeeStrategy, PeerPolicy
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        def fake_listpeerchannels(*args, **kwargs):
+            if mock_plugin.rpc.setchannel.called:
+                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+                return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=last_fee)
+            return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
+
+        mock_plugin.rpc.listpeerchannels.side_effect = fake_listpeerchannels
+
+        pm = MagicMock(spec=PolicyManager)
+        pm.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id, strategy=FeeStrategy.HIVE
+        )
+
+        fc = self._make_controller(mock_plugin, mock_database, policy_manager=pm)
+        result = fc.set_initial_fee(channel_id, peer_id)
+
+        assert result is not None
+        assert result["success"] is True
+        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        assert applied_fee == 0
+
+    def test_initial_fee_matches_by_funding_txid(self, mock_plugin, mock_database):
+        """Channel can be resolved using the funding txid (channel_id field)."""
+        scid = "800x1x0"
+        funding_txid = "ad723c457ceb425d3f6833cc35402c84b178df1778e6ba37fd73354ad5c15c6f"
+        peer_id = "02" + "a" * 64
+
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        def fake_listpeerchannels(*args, **kwargs):
+            if mock_plugin.rpc.setchannel.called:
+                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+            else:
+                last_fee = 0
+            return {
+                "channels": [{
+                    "state": "CHANNELD_NORMAL",
+                    "short_channel_id": scid,
+                    "channel_id": funding_txid,
+                    "peer_id": peer_id,
+                    "spendable_msat": 500_000_000,
+                    "receivable_msat": 500_000_000,
+                    "total_msat": 1_000_000_000,
+                    "updates": {"local": {"fee_base_msat": 0, "fee_proportional_millionths": last_fee}},
+                }]
+            }
+
+        mock_plugin.rpc.listpeerchannels.side_effect = fake_listpeerchannels
+
+        fc = self._make_controller(mock_plugin, mock_database)
+        result = fc.set_initial_fee(funding_txid, peer_id)
+
+        assert result is not None
+        assert result["success"] is True
+        # Should use the SCID for the setchannel call
+        called_id = mock_plugin.rpc.setchannel.call_args[0][0]
+        assert called_id == scid
+
+    def test_initial_fee_fallback_single_normal_channel(self, mock_plugin, mock_database):
+        """Falls back to the only NORMAL channel if ID doesn't match."""
+        scid = "800x1x0"
+        event_id = "some_unrecognized_id"
+        peer_id = "02" + "a" * 64
+
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        def fake_listpeerchannels(*args, **kwargs):
+            if mock_plugin.rpc.setchannel.called:
+                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+            else:
+                last_fee = 0
+            return {
+                "channels": [{
+                    "state": "CHANNELD_NORMAL",
+                    "short_channel_id": scid,
+                    "peer_id": peer_id,
+                    "spendable_msat": 500_000_000,
+                    "receivable_msat": 500_000_000,
+                    "total_msat": 1_000_000_000,
+                    "updates": {"local": {"fee_base_msat": 0, "fee_proportional_millionths": last_fee}},
+                }]
+            }
+
+        mock_plugin.rpc.listpeerchannels.side_effect = fake_listpeerchannels
+
+        fc = self._make_controller(mock_plugin, mock_database)
+        result = fc.set_initial_fee(event_id, peer_id)
+
+        assert result is not None
+        assert result["success"] is True
+
+    def test_initial_fee_returns_none_on_rpc_error(self, mock_plugin, mock_database):
+        """Gracefully handles RPC failures without raising."""
+        peer_id = "02" + "a" * 64
+        mock_plugin.rpc.listpeerchannels.side_effect = Exception("RPC timeout")
+
+        fc = self._make_controller(mock_plugin, mock_database)
+        result = fc.set_initial_fee("123x456x0", peer_id)
+
+        assert result is None

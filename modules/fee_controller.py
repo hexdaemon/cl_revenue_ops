@@ -85,6 +85,7 @@ class FeeReasonCode(Enum):
     CONGESTION = "congestion"                         # Congestion-based fee surge
     SCARCITY = "scarcity"                             # Low outbound liquidity premium
     GOSSIP_REFRESH = "gossip_refresh"                 # Minimal nudge to refresh channel_update
+    CHANNEL_OPEN = "channel_open"                     # Initial fee set on channel open
 
     # Heuristic modifiers (applied on top of algorithm decision)
     YOUNG_CHANNEL_CAP = "young_channel_cap"                   # Step capped for young channel
@@ -6403,7 +6404,8 @@ class HillClimbingFeeController:
                 FeeReasonCode.POLICY_STATIC.value,
                 FeeReasonCode.POLICY_HIVE.value,
                 FeeReasonCode.ZERO_FEE_PROBE.value,
-                FeeReasonCode.GOSSIP_REFRESH.value
+                FeeReasonCode.GOSSIP_REFRESH.value,
+                FeeReasonCode.CHANNEL_OPEN.value,
             )
             if should_sync_state:
                 now = int(time.time())
@@ -6452,7 +6454,157 @@ class HillClimbingFeeController:
         
         return result
     
-    def _calculate_floor(self, capacity_sats: int, 
+    def set_initial_fee(self, channel_id: str, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Set an initial fee for a newly opened channel.
+
+        Called immediately when a channel transitions to CHANNELD_NORMAL so it
+        doesn't sit with CLN defaults until the next periodic fee cycle.
+
+        Decision priority:
+        1. PASSIVE policy  -> skip (no fee management)
+        2. STATIC policy   -> set fixed target fee
+        3. HIVE policy     -> set hive fee (typically 0)
+        4. DYNAMIC policy  -> Thompson prior sample (or prior mean)
+
+        Args:
+            channel_id: Channel ID from the channel_state_changed event
+                        (may be funding txid or SCID)
+            peer_id: Peer public key
+
+        Returns:
+            Result dict from set_channel_fee, or None if skipped
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        try:
+            # Resolve channel via listpeerchannels to get SCID and info
+            result = self.plugin.rpc.listpeerchannels(id=peer_id)
+            target_ch = None
+            for ch in result.get('channels', []):
+                if ch.get('state') != 'CHANNELD_NORMAL':
+                    continue
+                scid = ch.get('short_channel_id', '')
+                cid = ch.get('channel_id', '')
+                # Match by either SCID or funding channel_id
+                norm_scid = scid.replace(':', 'x') if scid else ''
+                norm_cid = cid.replace(':', 'x') if cid else ''
+                norm_event = channel_id.replace(':', 'x') if channel_id else ''
+                if norm_event in (norm_scid, norm_cid) or norm_scid == norm_event:
+                    target_ch = ch
+                    break
+
+            if target_ch is None:
+                # Peer might have only one NORMAL channel – use it
+                normal_chs = [
+                    ch for ch in result.get('channels', [])
+                    if ch.get('state') == 'CHANNELD_NORMAL'
+                ]
+                if len(normal_chs) == 1:
+                    target_ch = normal_chs[0]
+
+            if target_ch is None:
+                self.plugin.log(
+                    f"INITIAL_FEE: Could not resolve channel {channel_id[:16]}... "
+                    f"for peer {peer_id[:16]}...",
+                    level='warn'
+                )
+                return None
+
+            # Use SCID as canonical identifier (preferred by rest of codebase)
+            scid = target_ch.get('short_channel_id', '') or target_ch.get('channel_id', '')
+            scid = scid.replace(':', 'x') if scid else channel_id
+
+            # Build channel_info dict matching _get_channels_info() shape
+            updates = target_ch.get('updates', {})
+            local_updates = updates.get('local', {})
+            spendable_msat = target_ch.get('spendable_msat', 0) or 0
+            receivable_msat = target_ch.get('receivable_msat', 0) or 0
+            total_msat = (
+                target_ch.get('total_msat')
+                or target_ch.get('capacity_msat')
+                or (spendable_msat + receivable_msat)
+            )
+            fee_base = (
+                local_updates.get('fee_base_msat')
+                or target_ch.get('fee_base_msat', 0)
+            )
+            fee_ppm = (
+                local_updates.get('fee_proportional_millionths')
+                or target_ch.get('fee_proportional_millionths', 0)
+            )
+            channel_info = {
+                'channel_id': scid,
+                'peer_id': peer_id,
+                'capacity': total_msat // 1000 if total_msat else 0,
+                'spendable_msat': spendable_msat,
+                'receivable_msat': receivable_msat,
+                'fee_base_msat': fee_base,
+                'fee_proportional_millionths': fee_ppm,
+            }
+
+            # ── Policy check ──────────────────────────────────────────
+            if self.policy_manager:
+                policy = self.policy_manager.get_policy(peer_id)
+
+                if policy.strategy == FeeStrategy.PASSIVE:
+                    self.plugin.log(
+                        f"INITIAL_FEE: Skipping {scid[:16]}... (PASSIVE policy)",
+                        level='debug'
+                    )
+                    return None
+
+                if policy.strategy == FeeStrategy.STATIC and policy.fee_ppm_target is not None:
+                    self.plugin.log(
+                        f"INITIAL_FEE: {scid[:16]}... -> {policy.fee_ppm_target} PPM (STATIC policy)"
+                    )
+                    return self.set_channel_fee(
+                        scid, policy.fee_ppm_target,
+                        reason="Initial fee: STATIC policy",
+                        reason_code=FeeReasonCode.POLICY_STATIC.value,
+                        channel_info=channel_info
+                    )
+
+                if policy.strategy == FeeStrategy.HIVE:
+                    hive_fee = cfg.hive_fee_ppm
+                    self.plugin.log(
+                        f"INITIAL_FEE: {scid[:16]}... -> {hive_fee} PPM (HIVE policy)"
+                    )
+                    return self.set_channel_fee(
+                        scid, hive_fee,
+                        reason="Initial fee: HIVE policy",
+                        reason_code=FeeReasonCode.POLICY_HIVE.value,
+                        enforce_limits=False,
+                        channel_info=channel_info
+                    )
+
+            # ── DYNAMIC: Thompson prior sample ────────────────────────
+            if self.ENABLE_THOMPSON_AIMD:
+                ts = self._initialize_thompson_from_hive(scid, peer_id)
+                initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
+            else:
+                # Fallback: use the configured prior mean, clamped to bounds
+                initial_fee = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, 200))
+
+            self.plugin.log(
+                f"INITIAL_FEE: {scid[:16]}... -> {initial_fee} PPM "
+                f"(Thompson prior sample)"
+            )
+            return self.set_channel_fee(
+                scid, initial_fee,
+                reason="Initial fee: channel open",
+                reason_code=FeeReasonCode.CHANNEL_OPEN.value,
+                channel_info=channel_info
+            )
+
+        except Exception as e:
+            self.plugin.log(
+                f"INITIAL_FEE: Failed for {channel_id[:16]}... peer={peer_id[:16]}...: {e}",
+                level='warn'
+            )
+            return None
+
+    def _calculate_floor(self, capacity_sats: int,
                          chain_costs: Optional[Dict[str, int]] = None,
                          peer_id: Optional[str] = None) -> int:
         """
