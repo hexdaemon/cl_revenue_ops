@@ -37,6 +37,7 @@ import time
 import random
 import math
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple, Union, TYPE_CHECKING
 from enum import Enum
@@ -371,11 +372,6 @@ class HistoricalResponseCurve:
                     # Validate the prediction is within reasonable bounds
                     if floor_ppm <= optimal_fee <= ceiling_ppm:
                         return optimal_fee
-
-                    # If outside bounds, clamp to the better boundary
-                    # Evaluate revenue at boundaries to pick better one
-                    rev_floor = a * floor_ppm**2 + b * floor_ppm + c
-                    rev_ceiling = a * ceiling_ppm**2 + b * ceiling_ppm + c
 
                     if optimal_fee < floor_ppm:
                         return floor_ppm  # Optimal is below floor, use floor
@@ -886,10 +882,14 @@ class ThompsonSamplingState:
         else:
             self.betas[arm] += 1.0
 
-        # Bound parameters to prevent overflow
+        # Bound parameters to prevent overflow (proportional rescaling preserves ratio)
         max_param = 100.0
-        self.alphas = [min(a, max_param) for a in self.alphas]
-        self.betas = [min(b, max_param) for b in self.betas]
+        for i in range(len(self.alphas)):
+            total = self.alphas[i] + self.betas[i]
+            if total > max_param * 2:
+                factor = (max_param * 2) / total
+                self.alphas[i] *= factor
+                self.betas[i] *= factor
 
         self.cycles_completed += 1
         self.last_revenue_rate = revenue_rate
@@ -1441,14 +1441,14 @@ class GaussianThompsonState:
             self._update_related_time_contexts(context_key, fee, revenue_rate, time_bucket)
 
         # Prune contextual posteriors to prevent memory bloat
-        if len(self.contextual_posteriors) > 50:
+        if len(self.contextual_posteriors) > 130:
             # Keep only the most used contexts
             sorted_contexts = sorted(
                 self.contextual_posteriors.items(),
                 key=lambda x: x[1][2],  # Sort by count
                 reverse=True
             )
-            self.contextual_posteriors = dict(sorted_contexts[:40])
+            self.contextual_posteriors = dict(sorted_contexts[:104])
 
     def _update_related_time_contexts(
         self,
@@ -1534,28 +1534,20 @@ class GaussianThompsonState:
             weighted_sq_sum += fee * fee * weight
 
         if total_weight > 0.1:
-            # Posterior mean: weighted average of observations blended with prior
+            # Normal-Normal conjugate update (proper Bayesian posterior)
             obs_mean = weighted_sum / total_weight
-
-            # Prior weight decreases as we get more observations
-            prior_weight = max(0.1, 1.0 / (1 + len(self.observations) / 10.0))
-
-            self.posterior_mean = (
-                obs_mean * (1 - prior_weight) +
-                self.prior_mean_fee * prior_weight
-            )
-
-            # Posterior std: derived from variance of observations
             variance = (weighted_sq_sum / total_weight) - (obs_mean ** 2)
             variance = max(self.MIN_STD ** 2, variance)
-            obs_std = math.sqrt(variance)
 
-            # Blend with prior std, decreasing as observations accumulate
-            self.posterior_std = (
-                obs_std * (1 - prior_weight) +
-                self.prior_std_fee * prior_weight
-            )
-            self.posterior_std = max(self.MIN_STD, self.posterior_std)
+            # Posterior precision = prior precision + data precision
+            prior_precision = 1.0 / (self.prior_std_fee ** 2)
+            data_precision = total_weight / variance
+            posterior_precision = prior_precision + data_precision
+
+            self.posterior_mean = (
+                prior_precision * self.prior_mean_fee + data_precision * obs_mean
+            ) / posterior_precision
+            self.posterior_std = max(self.MIN_STD, 1.0 / math.sqrt(posterior_precision))
         else:
             # Not enough weighted observations, use prior
             self.posterior_mean = float(self.prior_mean_fee)
@@ -2010,7 +2002,7 @@ class ThompsonAIMDState:
 
     # Preserved from HillClimbState for hysteresis and tracking
     last_revenue_rate: float = 0.0      # Raw revenue rate
-    ema_revenue_rate: float = 0.0       # EMA-smoothed revenue rate
+    ema_revenue_rate: Optional[float] = None  # EMA-smoothed revenue rate
     last_fee_ppm: int = 0               # Last fee we set
     last_broadcast_fee_ppm: int = 0     # Last fee broadcasted to network
     last_update: int = 0                # Timestamp of last update
@@ -2071,7 +2063,7 @@ class ThompsonAIMDState:
         Returns:
             Updated EMA revenue rate
         """
-        if self.ema_revenue_rate == 0:
+        if self.ema_revenue_rate is None:
             self.ema_revenue_rate = current_rate
         else:
             self.ema_revenue_rate = (
@@ -2150,7 +2142,7 @@ class ThompsonAIMDState:
                 state.thompson.prior_std_fee = int(100 * (1 - confidence * 0.3))
 
         # Load common fields
-        state.ema_revenue_rate = d.get("ema_revenue_rate", 0.0)
+        state.ema_revenue_rate = d.get("ema_revenue_rate") or None
         state.historical_curve_data = d.get("historical_curve", {})
         state.elasticity_data = d.get("elasticity", {})
         state.thompson_data = d.get("thompson", {})
@@ -2207,7 +2199,7 @@ class HillClimbState:
         thompson_state: Thompson Sampling exploration state
     """
     last_revenue_rate: float = 0.0  # Revenue rate in sats/hour (raw, unsmoothed)
-    ema_revenue_rate: float = 0.0   # Issue #28: EMA-smoothed revenue rate
+    ema_revenue_rate: Optional[float] = None  # Issue #28: EMA-smoothed revenue rate
     last_fee_ppm: int = 0
     trend_direction: int = 1  # 1 = try increasing fee, -1 = try decreasing
     step_ppm: int = 50  # Current step size (decays on reversal)
@@ -2281,7 +2273,7 @@ class HillClimbState:
         Returns:
             The updated EMA revenue rate
         """
-        if self.ema_revenue_rate == 0:
+        if self.ema_revenue_rate is None:
             # First observation - seed with raw value
             self.ema_revenue_rate = current_rate
         else:
@@ -2332,13 +2324,17 @@ class VegasReflexState:
             ma_sat_vb = 1.0  # Prevent division by zero
         
         spike_ratio = current_sat_vb / ma_sat_vb
-        
+
+        # Decay FIRST (before spike check) so a spike setting intensity to 1.0
+        # is not immediately reduced in the same cycle
+        self.intensity *= self.decay_rate
+
         # Track consecutive spikes for confirmation window
         if spike_ratio >= 2.0:
             self.consecutive_spikes += 1
         else:
             self.consecutive_spikes = 0
-        
+
         if spike_ratio >= 4.0:
             # Immediate trigger: set intensity to max (>400% spike)
             self.intensity = 1.0
@@ -2346,12 +2342,9 @@ class VegasReflexState:
             # HIGH-03 Defense: Probabilistic boost for 200-400% spikes
             # Either 2 consecutive spikes OR random chance proportional to spike
             boost = (spike_ratio - 2.0) / 2.0  # 0.0 to 1.0
-            
+
             if self.consecutive_spikes >= 2 or random.random() < boost * 0.5:
                 self.intensity = min(1.0, self.intensity + boost * 0.3)
-        
-        # Always decay toward zero (CRITICAL-01 defense)
-        self.intensity *= self.decay_rate
         self.last_sat_vb = current_sat_vb
         self.last_update = int(time.time())
     
@@ -2688,6 +2681,9 @@ class HillClimbingFeeController:
 
         # Thompson+AIMD state cache (v1.7.0)
         self._thompson_aimd_states: Dict[str, ThompsonAIMDState] = {}
+
+        # Lock protecting state dict access across threads
+        self._state_lock = threading.Lock()
 
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
@@ -3811,7 +3807,11 @@ class HillClimbingFeeController:
         now = int(time.time())
 
         # Wake in-memory Hill Climbing states
-        for channel_id, state in self._hill_climb_states.items():
+        with self._state_lock:
+            hc_items = list(self._hill_climb_states.items())
+            ts_items = list(self._thompson_aimd_states.items())
+
+        for channel_id, state in hc_items:
             if state.is_sleeping:
                 state.is_sleeping = False
                 state.sleep_until = 0
@@ -3820,7 +3820,7 @@ class HillClimbingFeeController:
                 woken += 1
 
         # Wake in-memory Thompson+AIMD states
-        for channel_id, ts_state in self._thompson_aimd_states.items():
+        for channel_id, ts_state in ts_items:
             if ts_state.is_sleeping:
                 ts_state.is_sleeping = False
                 ts_state.sleep_until = 0
@@ -4317,10 +4317,29 @@ class HillClimbingFeeController:
         # DEADBAND HYSTERESIS: Sleep Status Check (Phase 4: Stability & Scaling)
         # Reduces gossip noise by suppressing fee updates when the market is stable
         # =====================================================================
-        if hc_state.is_sleeping:
+        # When Thompson+AIMD is active, use ts_state for sleep decisions so both
+        # algorithms share a single sleep/wake state
+        if self.ENABLE_THOMPSON_AIMD:
+            _ts_sleep_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+            _sleep_is_sleeping = _ts_sleep_state.is_sleeping
+            _sleep_until = _ts_sleep_state.sleep_until
+            _sleep_last_update = _ts_sleep_state.last_update
+            _sleep_last_revenue_rate = _ts_sleep_state.last_revenue_rate
+        else:
+            _sleep_is_sleeping = hc_state.is_sleeping
+            _sleep_until = hc_state.sleep_until
+            _sleep_last_update = hc_state.last_update
+            _sleep_last_revenue_rate = hc_state.last_revenue_rate
+
+        if _sleep_is_sleeping:
             # Check if it's time to wake up (sleep timer expired)
-            if now > hc_state.sleep_until:
+            if now > _sleep_until:
                 # Timer expired - wake up
+                if self.ENABLE_THOMPSON_AIMD:
+                    _ts_sleep_state.is_sleeping = False
+                    _ts_sleep_state.sleep_until = 0
+                    _ts_sleep_state.stable_cycles = 0
+                    self._save_thompson_aimd_state(channel_id, _ts_sleep_state)
                 hc_state.is_sleeping = False
                 hc_state.sleep_until = 0
                 hc_state.stable_cycles = 0
@@ -4333,23 +4352,28 @@ class HillClimbingFeeController:
                 # Still within sleep period - check for revenue spike that should wake us
                 # Calculate current revenue rate to detect significant changes
                 if cfg.enable_reputation:
-                    volume_since_sats = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
+                    volume_since_sats = self.database.get_weighted_volume_since(channel_id, _sleep_last_update)
                 else:
-                    volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
-                
-                hours_elapsed = (now - hc_state.last_update) / 3600.0 if hc_state.last_update > 0 else 1.0
+                    volume_since_sats = self.database.get_volume_since(channel_id, _sleep_last_update)
+
+                hours_elapsed = (now - _sleep_last_update) / 3600.0 if _sleep_last_update > 0 else 1.0
                 hours_elapsed = max(hours_elapsed, 0.1)  # Prevent division by zero
-                
+
                 revenue_sats = (volume_since_sats * current_fee_ppm) // 1_000_000
                 current_revenue_rate = revenue_sats / hours_elapsed
-                
+
                 # Calculate percent change from last known rate
-                last_rate = max(1.0, hc_state.last_revenue_rate)  # Avoid division by zero
-                delta = abs(current_revenue_rate - hc_state.last_revenue_rate)
+                last_rate = max(1.0, _sleep_last_revenue_rate)  # Avoid division by zero
+                delta = abs(current_revenue_rate - _sleep_last_revenue_rate)
                 percent_change = delta / last_rate
-                
+
                 if percent_change > self.WAKE_UP_THRESHOLD:
                     # Significant revenue spike detected - wake up immediately!
+                    if self.ENABLE_THOMPSON_AIMD:
+                        _ts_sleep_state.is_sleeping = False
+                        _ts_sleep_state.sleep_until = 0
+                        _ts_sleep_state.stable_cycles = 0
+                        self._save_thompson_aimd_state(channel_id, _ts_sleep_state)
                     hc_state.is_sleeping = False
                     hc_state.sleep_until = 0
                     hc_state.stable_cycles = 0
@@ -4523,6 +4547,11 @@ class HillClimbingFeeController:
         # Apply flow state to floor (sinks can go lower)
         base_floor_ppm = int(base_floor_ppm * flow_state_multiplier)
         base_floor_ppm = max(base_floor_ppm, 1)  # Never go below 1 ppm
+
+        # Apply Vegas Reflex floor multiplier (mempool spike defense)
+        vegas_multiplier = self._vegas_state.get_floor_multiplier()
+        if vegas_multiplier > 1.0:
+            base_floor_ppm = int(base_floor_ppm * vegas_multiplier)
 
         # =====================================================================
         # Issue #19: Balance-Based Minimum Fee Floor
@@ -5053,6 +5082,9 @@ class HillClimbingFeeController:
                         level='debug'
                     )
 
+                # Differentiation offset (computed below, applied to sampled fee)
+                differentiation_offset = 0
+
                 # Query fleet posteriors for competition avoidance
                 try:
                     fleet_posteriors = self.hive_bridge.query_fleet_posteriors(peer_id)
@@ -5082,14 +5114,13 @@ class HillClimbingFeeController:
                                 break
 
                         if crowded_region:
-                            # Apply differentiation to posterior mean (temporary adjustment)
+                            # Compute differentiation offset (applied to sampled fee, NOT posterior)
                             diff_amount = int(ts_state.thompson.posterior_std * 0.3)
-                            original_mean = ts_state.thompson.posterior_mean
-                            ts_state.thompson.posterior_mean += differentiation_direction * diff_amount
+                            differentiation_offset = differentiation_direction * diff_amount
                             self.plugin.log(
                                 f"P2_COMPETE: {channel_id[:12]}... differentiating "
-                                f"from crowded region (mean: {original_mean:.0f} -> "
-                                f"{ts_state.thompson.posterior_mean:.0f}, role={corridor_role})",
+                                f"from crowded region (mean: {ts_state.thompson.posterior_mean:.0f}, "
+                                f"offset={differentiation_offset:+d}, role={corridor_role})",
                                 level='info'
                             )
                 except Exception as e:
@@ -5118,6 +5149,10 @@ class HillClimbingFeeController:
                 floor=floor_ppm,
                 ceiling=ceiling_ppm
             )
+
+            # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
+            if differentiation_offset != 0:
+                thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
 
             # =====================================================================
             # P2 PROFITABILITY-WEIGHTED THOMPSON SAMPLING
@@ -5254,7 +5289,8 @@ class HillClimbingFeeController:
                         f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... suppressing scarcity.",
                         level='info'
                     )
-                else:
+                elif not self.ENABLE_BOUNDS_MULTIPLIERS:
+                    # Only apply direct scarcity if floor multiplier wasn't already used
                     scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
                     original_fee = new_fee_ppm
                     new_fee_ppm = int(new_fee_ppm * scarcity_mult)
@@ -5296,8 +5332,8 @@ class HillClimbingFeeController:
                         )
                         new_fee_ppm = blended_fee
 
-            # Defense multiplier
-            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION:
+            # Defense multiplier -- skip in Thompson path: already applied inside aimd.apply_to_fee()
+            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not self.ENABLE_THOMPSON_AIMD:
                 defense_fee = self._apply_defense_multiplier(peer_id, new_fee_ppm)
                 if defense_fee != new_fee_ppm:
                     new_fee_ppm = max(floor_ppm, defense_fee)
@@ -5643,7 +5679,8 @@ class HillClimbingFeeController:
                         f"Suppressing Scarcity Pricing to encourage break-in.",
                         level='info'
                     )
-                else:
+                elif not self.ENABLE_BOUNDS_MULTIPLIERS:
+                    # Only apply direct scarcity if floor multiplier wasn't already used
                     scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
                     original_fee = new_fee_ppm
                     new_fee_ppm = int(new_fee_ppm * scarcity_mult)
@@ -5899,7 +5936,8 @@ class HillClimbingFeeController:
             channel_id, new_fee_ppm, reason=reason,
             reason_code=fee_reason_code,
             heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None,
-            enforce_limits=(fee_reason_code not in (FeeReasonCode.ZERO_FEE_PROBE.value, FeeReasonCode.POLICY_HIVE.value))
+            enforce_limits=(fee_reason_code not in (FeeReasonCode.ZERO_FEE_PROBE.value, FeeReasonCode.POLICY_HIVE.value)),
+            channel_info=channel_info
         )
         
         if result.get("success"):
@@ -5981,7 +6019,8 @@ class HillClimbingFeeController:
                        reason: str = "manual", manual: bool = False,
                        reason_code: Optional[str] = None,
                        heuristic_modifiers: Optional[HeuristicModifiers] = None,
-                       enforce_limits: bool = True) -> Dict[str, Any]:
+                       enforce_limits: bool = True,
+                       channel_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Set the fee for a channel, handling clboss override.
 
@@ -6055,9 +6094,10 @@ class HillClimbingFeeController:
 
         try:
             # Get channel info to find peer ID and current fee
-            channels = self._get_channels_info()
-            channel_info = channels.get(channel_id)
-            
+            if channel_info is None:
+                channels = self._get_channels_info()
+                channel_info = channels.get(channel_id)
+
             if not channel_info:
                 result["message"] = f"Channel {channel_id} not found"
                 return result
@@ -6389,7 +6429,7 @@ class HillClimbingFeeController:
 
         hc_state = HillClimbState(
             last_revenue_rate=db_state.get("last_revenue_rate", 0.0),
-            ema_revenue_rate=v2_data.get("ema_revenue_rate", 0.0),  # Issue #28
+            ema_revenue_rate=v2_data.get("ema_revenue_rate") or None,  # Issue #28
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
             trend_direction=db_state.get("trend_direction", 1),
             step_ppm=db_state.get("step_ppm", self.STEP_PPM),

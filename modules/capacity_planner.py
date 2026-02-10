@@ -15,6 +15,7 @@ from .config import ChainCostDefaults
 _LOSER_SEVERITY = {
     "ZOMBIE": 3,
     "FIRE SALE": 2,
+    "STAGNANT+HARD_REBAL": 2,
     "STAGNANT": 1,
 }
 

@@ -128,7 +128,10 @@ class ChannelStatistics:
         """Calculate Sharpe ratio for this channel."""
         if self.std_dev < math.sqrt(MIN_VARIANCE):
             return 0.0
-        return (self.expected_return - risk_free_rate) / self.std_dev
+        result = (self.expected_return - risk_free_rate) / self.std_dev
+        if not math.isfinite(result):
+            return 0.0
+        return result
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -785,6 +788,14 @@ class PortfolioOptimizer:
                     row.append(cov)
             cov_matrix.append(row)
 
+        # Ensure positive semi-definite via diagonal dominance (Gershgorin circles)
+        # If any diagonal element is smaller than its row's off-diagonal sum,
+        # increase it to guarantee PSD (diagonally dominant symmetric => PSD)
+        for i in range(n):
+            off_diag_sum = sum(abs(cov_matrix[i][j]) for j in range(n) if j != i)
+            if cov_matrix[i][i] < off_diag_sum:
+                cov_matrix[i][i] = off_diag_sum + REGULARIZATION_LAMBDA
+
         # Current weights (for comparison)
         total_local = sum(s.current_local_sats for s in self._channel_stats.values())
         current_weights = []
@@ -941,6 +952,8 @@ class PortfolioOptimizer:
         )
         current_std = math.sqrt(max(current_variance, MIN_VARIANCE))
         current_sharpe = current_return / current_std if current_std > 0 else 0.0
+        if not math.isfinite(current_sharpe):
+            current_sharpe = 0.0
 
         # Optimal portfolio metrics
         optimal_return = sum(optimal_weights[i] * returns[i] for i in range(n))
@@ -950,6 +963,8 @@ class PortfolioOptimizer:
         )
         optimal_std = math.sqrt(max(optimal_variance, MIN_VARIANCE))
         optimal_sharpe = optimal_return / optimal_std if optimal_std > 0 else 0.0
+        if not math.isfinite(optimal_sharpe):
+            optimal_sharpe = 0.0
 
         # Diversification ratio = weighted avg std / portfolio std
         weighted_avg_std = sum(

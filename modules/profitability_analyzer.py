@@ -380,6 +380,10 @@ class ChannelProfitabilityAnalyzer:
         # Track last health report to avoid spam
         self._last_health_report: int = 0
         self._health_report_interval: int = 300  # Report every 5 minutes max
+
+        # Bleeder classification cache (avoids re-running full analysis per channel)
+        self._bleeder_cache: Optional[Dict[str, 'BleederClassification']] = None
+        self._bleeder_cache_time: float = 0
         
     def _parse_msat(self, msat_val: Any) -> int:
         """
@@ -1477,6 +1481,7 @@ class ChannelProfitabilityAnalyzer:
         Get bleeder classification for a single channel.
 
         Convenience method for the rebalancer to check a specific channel.
+        Uses a time-limited cache (5 min) to avoid re-running full analysis per channel.
 
         Args:
             channel_id: Channel short ID
@@ -1484,11 +1489,11 @@ class ChannelProfitabilityAnalyzer:
         Returns:
             BleederClassification or None if channel not found
         """
-        classifications = self.identify_bleeders_v2()
-        for c in classifications:
-            if c.channel_id == channel_id:
-                return c
-        return None
+        now = time.time()
+        if self._bleeder_cache is None or now - self._bleeder_cache_time > 300:
+            self._bleeder_cache = {c.channel_id: c for c in self.identify_bleeders_v2()}
+            self._bleeder_cache_time = now
+        return self._bleeder_cache.get(channel_id)
 
     def calculate_roc(self, window_days: int = 30) -> Dict[str, Any]:
         """
@@ -1954,8 +1959,8 @@ class ChannelProfitabilityAnalyzer:
                 if (event.get("type") == "onchain_fee" and 
                     event.get("txid") == funding_txid):
                     found_events = True
-                    total_credit_msat += event.get("credit_msat", 0)
-                    total_debit_msat += event.get("debit_msat", 0)
+                    total_credit_msat += self._parse_msat(event.get("credit_msat", 0))
+                    total_debit_msat += self._parse_msat(event.get("debit_msat", 0))
             
             if found_events:
                 # Net fee = credits - debits

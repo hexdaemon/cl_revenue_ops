@@ -20,6 +20,7 @@ Phase 4: Async Job Queue
 
 import time
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 from enum import Enum
@@ -205,6 +206,7 @@ class JobManager:
 
         # Active jobs indexed by target channel SCID (normalized format)
         self._active_jobs: Dict[str, ActiveJob] = {}
+        self._jobs_lock = threading.Lock()
 
         # Configurable settings
         self.job_timeout_seconds = getattr(config, 'sling_job_timeout_seconds',
@@ -315,8 +317,7 @@ class JobManager:
     
     def _to_sling_scid(self, scid: str) -> str:
         """Normalize SCID to sling's expected 'x' separator format."""
-        # Sling expects format like 930866x2599x2 (with 'x' separators)
-        return scid.replace(':', 'x')
+        return self._normalize_scid(scid)
     
     def _get_channel_local_balance(self, channel_id: str) -> int:
         """Get current local balance of a channel in sats."""
@@ -489,7 +490,8 @@ class JobManager:
                 status=JobStatus.RUNNING,
                 direction=direction,
             )
-            self._active_jobs[normalized_scid] = job
+            with self._jobs_lock:
+                self._active_jobs[normalized_scid] = job
             
             self.plugin.log(
                 f"Sling job started for {to_scid}, tracking as {normalized_scid} "
@@ -548,7 +550,8 @@ class JobManager:
             self.plugin.log(f"Error stopping job {job.scid}: {e}", level='warn')
         
         # Remove from tracking regardless
-        del self._active_jobs[normalized]
+        with self._jobs_lock:
+            self._active_jobs.pop(normalized, None)
         return True
     
     def monitor_jobs(self) -> Dict[str, Any]:
@@ -641,7 +644,7 @@ class JobManager:
                 if amount_transferred <= 0:
                     # We know at least one payment succeeded, but local balance may not reflect it due to
                     # concurrent routing. Use the job's intended chunk as a conservative proxy.
-                    amount_transferred = max(1, int(job.target_amount_sats or 0))
+                    amount_transferred = max(1, min(int(job.target_amount_sats or 0), self.chunk_size_sats))
                 self._handle_job_success(job, amount_transferred, job_stats)
                 summary["completed"] += 1
                 continue
@@ -816,7 +819,7 @@ class JobManager:
         stats: Dict[str, Dict[str, Any]] = {}
 
         # Per-job detailed stats (preferred — returns known schema)
-        for normalized_scid, job in self._active_jobs.items():
+        for normalized_scid, job in list(self._active_jobs.items()):
             try:
                 result = self.plugin.rpc.call("sling-stats", {
                     "scid": job.scid,
@@ -883,8 +886,8 @@ class JobManager:
         
         # Estimate fee from amount if sling doesn't report it
         if fee_sats == 0 and amount_transferred > 0:
-            # Use a conservative estimate based on max_fee_ppm
-            fee_sats = (amount_transferred * job.max_fee_ppm) // 1_000_000
+            # Conservative estimate: half of max_fee_ppm (actual is usually well below max)
+            fee_sats = (amount_transferred * job.max_fee_ppm) // 2_000_000
         
         # Calculate actual profit
         # The expected_profit was calculated with max_budget_sats as the assumed cost.
@@ -1001,12 +1004,21 @@ class JobManager:
             primary_source = job.candidate.source_candidates[0]
             self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
 
+        # Record actual rebalance cost even on budget failure
+        actual_cost_sats = (fee_msat + 999) // 1000
+        if actual_cost_sats > 0 and job.candidate:
+            try:
+                dest_peer_id = job.candidate.to_dict().get("peer_id", "")
+                self.database.record_rebalance_cost(
+                    job.scid_normalized, dest_peer_id,
+                    actual_cost_sats, 0)
+            except Exception:
+                pass
+
         # Release budget reservation - job failed (CRITICAL-01 fix)
         self.database.release_budget_reservation(job.rebalance_id)
 
         # Report outcome to hive for fleet coordination (Phase 7)
-        # Report the actual cost incurred even though job failed
-        actual_cost_sats = (fee_msat + 999) // 1000
         self._report_outcome_to_hive(job, success=False, cost_sats=actual_cost_sats,
                                      amount_transferred=0,
                                      failure_reason=f"exceeded_budget: {msg}")
@@ -1023,15 +1035,28 @@ class JobManager:
         amount_transferred = current_balance - job.initial_local_sats
         
         if amount_transferred > 0:
-            # Partial success - still record the progress
+            # Partial success - try to get actual fee from sling stats
+            job_stats = self._get_sling_stats()
+            stats = job_stats.get(job.scid, {})
+            fee_sats = 0
+            successes = stats.get("successes_in_time_window")
+            if isinstance(successes, dict):
+                fee_sats = self._parse_sats(successes.get("total_spent_sats"))
+            if fee_sats == 0:
+                fee_msat = stats.get("fee_total_msat", 0)
+                fee_sats = fee_msat // 1000 if fee_msat else 0
+            if fee_sats == 0 and amount_transferred > 0:
+                # Conservative estimate: half of max fee
+                fee_sats = (amount_transferred * job.max_fee_ppm) // 2_000_000
+
             self.plugin.log(
                 f"Rebalance TIMEOUT (partial): {job.scid} after {elapsed_hours:.1f}h. "
-                f"Transferred {amount_transferred} sats before timeout."
+                f"Transferred {amount_transferred} sats, fee ~{fee_sats} sats."
             )
             self.database.update_rebalance_result(
                 job.rebalance_id,
                 'partial',
-                actual_fee_sats=0,  # Unknown actual fee on timeout
+                actual_fee_sats=fee_sats,
                 actual_profit_sats=0
             )
         else:
@@ -1317,7 +1342,7 @@ class JobManager:
         """Get status info for all active jobs."""
         # BUG FIX: Avoid calling get_job_status twice per channel
         result = []
-        for scid in self._active_jobs.keys():
+        for scid in list(self._active_jobs.keys()):
             status = self.get_job_status(scid)
             if status:
                 result.append(status)
@@ -1606,10 +1631,10 @@ class EVRebalancer:
                 # After 10+ failures, the channel is likely a "Dead End" and further
                 # attempts waste gossip bandwidth and lock HTLCs.
                 #
-                # Hard Cap: If failed > 10 times, require 48h cooldown before retry
+                # Hard Cap: If failed >= 10 times, require 48h cooldown before retry
                 # =====================================================================
                 fail_count, last_fail = self.database.get_failure_count(dest_id)
-                if fail_count > 10:
+                if fail_count >= 10:
                     now = int(time.time())
                     futility_cooldown = 172800  # 48 hours in seconds
                     if (now - last_fail) < futility_cooldown:
@@ -1643,7 +1668,7 @@ class EVRebalancer:
                         continue
                 
                 candidate = self._analyze_rebalance_ev(
-                    dest_id, dest_info, dest_ratio, source_channels, peer_status
+                    dest_id, dest_info, dest_ratio, source_channels, peer_status, cfg=cfg
                 )
                 if candidate:
                     candidates.append(candidate)
@@ -1714,7 +1739,8 @@ class EVRebalancer:
     def _analyze_rebalance_ev(self, dest_channel: str, dest_info: Dict[str, Any],
                               dest_ratio: float,
                               sources: List[Tuple[str, Dict[str, Any], float]],
-                              peer_status: Optional[Dict] = None) -> Optional[RebalanceCandidate]:
+                              peer_status: Optional[Dict] = None,
+                              cfg=None) -> Optional[RebalanceCandidate]:
         """
         Analyze expected value of rebalancing a channel with multi-source support.
         
@@ -1847,7 +1873,8 @@ class EVRebalancer:
         # rebalanced. We calculate velocity (daily turnover as fraction of
         # capacity) and use conservative targets for low-velocity channels.
         # =====================================================================
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+        if cfg is None:
+            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
 
         velocity = daily_volume / capacity if capacity > 0 else 0.0
 
@@ -2364,22 +2391,6 @@ class EVRebalancer:
                     first_hop = int(first_hop.replace("msat", ""))
                 return int(((first_hop - amount_msat) / amount_msat) * 1_000_000)
         except Exception:
-            pass
-        return None
-
-    def _get_historical_inbound_fee(self, peer_id: str) -> Optional[int]:
-        try:
-            hist = self.database.get_rebalance_history_by_peer(peer_id)
-            if not hist: 
-                return None
-            total_ppm, count = 0, 0
-            for r in hist:
-                if r.get("status") == "success" and r.get("amount_msat", 0) > 0:
-                    total_ppm += int((r["fee_paid_msat"] / r["amount_msat"]) * 1_000_000)
-                    count += 1
-            if count > 0: 
-                return total_ppm // count
-        except Exception: 
             pass
         return None
 
@@ -2931,6 +2942,8 @@ class EVRebalancer:
 
             if res.get("success"):
                 job_started = True
+                # Clean up pending entry - job is now tracked by JobManager
+                self._pending.pop(candidate.to_channel, None)
                 # Update DB status to pending_async
                 self.database.update_rebalance_result(rebalance_id, 'pending_async')
                 result.update({
@@ -3257,9 +3270,10 @@ class EVRebalancer:
                 )
                 return False
                 
+            return True
         except Exception as e:
             self.plugin.log(f"Error checking capital controls: {e}", level='error')
-        return True 
+            return False
     
     def _is_pending_with_backoff(self, channel_id: str) -> bool:
         """Check if channel has a pending operation with exponential backoff."""

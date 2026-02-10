@@ -177,12 +177,6 @@ shutdown_event = threading.Event()
 # =============================================================================
 # THREAD-SAFE RPC WRAPPER (Phase 5.5: High-Uptime Stability)
 # =============================================================================
-# pyln-client's RPC is not inherently thread-safe for concurrent calls.
-# This lock serializes all RPC calls to prevent race conditions when
-# multiple background loops (Fee, Flow, Rebalance) fire simultaneously.
-
-RPC_LOCK = threading.Lock()
-
 
 # =============================================================================
 # CL-HIVE AVAILABILITY CACHE (Performance Optimization)
@@ -535,7 +529,7 @@ class ThreadSafeRpcProxy:
         try:
             # If payload is a list, this came from an attribute-style call like
             # rpc.plugin("list") or rpc.listforwards(status="settled").
-            if isinstance(payload, list) or payload is None and kwargs:
+            if isinstance(payload, list) or (payload is None and kwargs):
                 args = payload if isinstance(payload, list) else []
                 return self._broker.request(
                     kind="attr",
@@ -607,6 +601,7 @@ hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligen
 _scid_to_peer_cache: Dict[str, str] = {}
 _scid_cache_last_cleared: float = 0.0
 _SCID_CACHE_TTL_SECONDS: int = 3600  # Clear cache every hour
+_scid_cache_lock = threading.Lock()
 
 
 # =============================================================================
@@ -1033,7 +1028,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log(f"Connection baseline: {connected_peers} connected peers, snapshotted {snapshot_count} new peers")
     except Exception as e:
         plugin.log(f"Error snapshotting peer connections: {e}", level='warn')
-        import traceback
         plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
     
     # Initialize clboss manager (handles unmanage commands)
@@ -1280,7 +1274,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Startup snapshot: Recorded {snapshot_count} of {connected_count} connected peers")
         except Exception as e:
             plugin.log(f"Error in delayed snapshot: {e}", level='warn')
-            import traceback
             plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
 
     def financial_snapshot_loop():
@@ -1388,7 +1381,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # MAJOR-11 FIX: Clean up database connections on shutdown
         if database:
             try:
-                database.close_all_connections()
+                database.close_main_connection()
             except Exception as e:
                 plugin.log(f"Error closing database: {e}", level='warn')
 
@@ -1687,7 +1680,7 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
 
     # Check capital controls
     try:
-        listfunds = plugin.rpc.listfunds()
+        listfunds = safe_plugin.rpc.listfunds()
         onchain_sats = sum(
             (int(str(o.get("amount_msat", "0")).replace("msat", "")) // 1000)
             for o in listfunds.get("outputs", [])
@@ -1808,7 +1801,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         return {"error": "Plugin not fully initialized"}
 
     # Import fee controller constants for accurate debug output
-    from .modules.fee_controller import HillClimbingFeeController
+    from modules.fee_controller import HillClimbingFeeController
     min_obs_hours = HillClimbingFeeController.MIN_OBSERVATION_HOURS
     min_forwards = HillClimbingFeeController.MIN_FORWARDS_FOR_SIGNAL
     max_obs_hours = HillClimbingFeeController.MAX_OBSERVATION_HOURS
@@ -1978,8 +1971,8 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
     except ValueError:
         return {"status": "error", "error": "fee_ppm must be an integer"}
 
-    # Basic SCID or PeerID format check (simple regex-less check)
-    if not (":" in channel_id or "x" in channel_id or len(channel_id) == 66):
+    # SCID or PeerID format check
+    if not (re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id) or len(channel_id) == 66):
         return {"status": "error", "error": "Invalid channel_id or node_id format"}
 
     # 2. Force Gates
@@ -2547,6 +2540,7 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
 
             try:
                 policies = policy_manager.set_policies_batch(updates)
+                plugin.log(f"Batch policy update: {len(policies)} policies changed (rate limiting bypassed)", level='info')
                 return {
                     "status": "success",
                     "updated": len(policies),
@@ -2987,9 +2981,8 @@ def revenue_portfolio(
         }
 
     except Exception as e:
-        plugin.log(f"Error in portfolio analysis: {e}", level='error')
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc()}
+        plugin.log(f"Error in portfolio analysis: {traceback.format_exc()}", level='error')
+        return {"error": str(e)}
 
 
 @plugin.method("revenue-portfolio-summary")
@@ -3326,42 +3319,45 @@ def on_htlc_accepted(onion: Dict, htlc: Dict, plugin: Plugin, **kwargs) -> Dict[
 def _resolve_scid_to_peer(scid: str) -> Optional[str]:
     """
     Resolve a short_channel_id to its peer_id.
-    
+
     Uses a cache to avoid repeated RPC calls. Cache is refreshed if the
     SCID is not found (channel might be new).
-    
+
     Args:
         scid: Short channel ID (e.g., "123x456x0")
-        
+
     Returns:
         peer_id (node pubkey) or None if not found
     """
     global _scid_to_peer_cache, _scid_cache_last_cleared
 
-    # Expire cache periodically to prevent stale mappings
-    now = time.time()
-    if now - _scid_cache_last_cleared > _SCID_CACHE_TTL_SECONDS:
-        _scid_to_peer_cache.clear()
-        _scid_cache_last_cleared = now
-
     scid_norm = normalize_scid(scid)
 
-    # Check cache first
-    if scid_norm in _scid_to_peer_cache:
-        return _scid_to_peer_cache[scid_norm]
-    
-    # Cache miss - refresh cache from listpeerchannels
-    # Use safe_plugin for thread-safe RPC access
+    with _scid_cache_lock:
+        # Expire cache periodically to prevent stale mappings
+        now = time.time()
+        if now - _scid_cache_last_cleared > _SCID_CACHE_TTL_SECONDS:
+            _scid_to_peer_cache.clear()
+            _scid_cache_last_cleared = now
+
+        # Check cache first
+        if scid_norm in _scid_to_peer_cache:
+            return _scid_to_peer_cache[scid_norm]
+
+    # Cache miss - RPC call outside lock
     try:
         result = safe_plugin.rpc.listpeerchannels()
+        new_cache = {}
         for channel in result.get("channels", []):
             channel_scid = channel.get("short_channel_id") or channel.get("channel_id")
             peer_id = channel.get("peer_id")
             if channel_scid and peer_id:
-                _scid_to_peer_cache[normalize_scid(channel_scid)] = peer_id
+                new_cache[normalize_scid(channel_scid)] = peer_id
 
-        # Try again after refresh
-        return _scid_to_peer_cache.get(scid_norm)
+        with _scid_cache_lock:
+            _scid_to_peer_cache.update(new_cache)
+
+        return new_cache.get(scid_norm)
     except RpcError as e:
         plugin.log(f"Error resolving SCID {scid} to peer: {e}", level='warn')
         return None
@@ -3434,7 +3430,7 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         # Calculate resolution duration (Risk Premium tracking)
         received_time = int(forward_event.get("received_time", 0) or 0)
         resolved_time = int(forward_event.get("resolved_time", 0) or 0)
-        resolution_duration = resolved_time - received_time if resolved_time > 0 else 0
+        resolution_duration = max(0, resolved_time - received_time) if resolved_time > 0 else 0
 
         database.record_forward(
             in_channel or "",
@@ -4175,7 +4171,6 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
 
     except Exception as e:
         plugin.log(f"Error archiving closed channel {channel_id}: {e}", level='error')
-        import traceback
         plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
 
 
@@ -4247,7 +4242,6 @@ def _handle_splice_completion(channel_id: str, peer_id: Optional[str]) -> None:
 
     except Exception as e:
         plugin.log(f"Error handling splice completion for {channel_id}: {e}", level='error')
-        import traceback
         plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
 
 

@@ -196,9 +196,6 @@ class ClbossManager:
             return result
         
         # Check if we've already unmanaged this peer/tag
-        # Import here to avoid circular imports
-        from .database import Database
-        
         try:
             # Check if already unmanaged (via plugin's database reference)
             # Note: We'll need to access the database through plugin context
@@ -373,21 +370,28 @@ class ClbossManager:
     def is_peer_managed(self, peer_id: str, tag: str) -> bool:
         """
         Check if a peer is currently managed by clboss for a specific tag.
-        
+
         Args:
             peer_id: The node ID of the peer
             tag: The management tag to check
-            
+
         Returns:
             True if clboss is managing this peer/tag, False otherwise
         """
         if not self.is_clboss_available():
             return False
-        
+
         try:
-            # Try clboss-status or similar to check
-            # Note: The exact method depends on clboss version
-            # For now, assume managed unless we've explicitly unmanaged
+            # Query clboss for unmanaged peers
+            unmanaged = self.plugin.rpc.call("clboss-unmanaged-list")
+            for entry in unmanaged.get("unmanaged", []):
+                if entry.get("nodeid") == peer_id:
+                    entry_tags = entry.get("tags", "")
+                    if tag in (entry_tags.split(",") if entry_tags else []):
+                        return False  # Peer is unmanaged for this tag
+            return True  # Not in unmanaged list = managed
+        except RpcError:
+            # clboss-unmanaged-list not available, assume managed
             return True
         except Exception:
             return False

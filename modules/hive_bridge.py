@@ -369,7 +369,7 @@ class HiveFeeIntelligenceBridge:
         """
         Return stale data with reduced confidence.
 
-        Confidence decays by 50% per 12 hours of staleness.
+        Confidence decays linearly, reaching 50% at 12 hours and floored at 10%.
 
         Args:
             data: Original cached data
@@ -381,7 +381,7 @@ class HiveFeeIntelligenceBridge:
         result = dict(data)
         age_hours = age_seconds / 3600
 
-        # Reduce confidence by 50% per 12 hours of staleness
+        # Linear decay: confidence drops to 50% at 12 hours, 0% at 24 hours (floored at 10%)
         decay_factor = max(0.1, 1.0 - (age_hours / 24))
         result["confidence"] = result.get("confidence", 0.5) * decay_factor
         result["stale"] = True
@@ -584,6 +584,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to report observation: {e}", level="debug")
+            self._record_failure()
             return False
 
     # =========================================================================
@@ -726,6 +727,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to report health: {e}", level="debug")
+            self._record_failure()
             return False
 
     # =========================================================================
@@ -849,6 +851,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to report liquidity state: {e}", level="debug")
+            self._record_failure()
             return False
 
     def check_rebalance_conflict(self, peer_id: str) -> Dict[str, Any]:
@@ -1181,6 +1184,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to report routing outcome: {e}", level="debug")
+            self._record_failure()
             return False
 
     def query_defense_status(self, peer_id: str = None) -> Optional[Dict[str, Any]]:
@@ -2029,6 +2033,7 @@ class HiveFeeIntelligenceBridge:
         except Exception as e:
             # Method might not exist yet - fail gracefully
             self._log(f"Failed to report Kalman velocity: {e}", level="debug")
+            self._record_failure()
             return True  # Don't block on this
 
     def query_kalman_velocity(
@@ -2135,6 +2140,7 @@ class HiveFeeIntelligenceBridge:
         except Exception as e:
             # Method might not exist yet - fail gracefully
             self._log(f"Failed to report rebalance outcome: {e}", level="debug")
+            self._record_failure()
             return True  # Don't block on this
 
     def report_cost_trends(
@@ -2164,6 +2170,7 @@ class HiveFeeIntelligenceBridge:
             return True
         except Exception as e:
             self._log(f"Failed to report cost trends: {e}", level="debug")
+            self._record_failure()
             return True  # Non-fatal
 
     # =========================================================================
@@ -2294,6 +2301,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to report flow intensity: {e}", level="debug")
+            self._record_failure()
             return True  # Don't block on this
 
     def query_internal_competition(self) -> Optional[Dict[str, Any]]:
@@ -2494,6 +2502,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to report yield metrics: {e}", level="debug")
+            self._record_failure()
             # Return False — callers should not believe metrics were reported
             return False
 
@@ -2734,6 +2743,7 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to report flow observation: {e}", level="debug")
+            self._record_failure()
             return False
 
     def should_preemptive_rebalance(

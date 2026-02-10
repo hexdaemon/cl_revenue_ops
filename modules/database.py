@@ -78,7 +78,13 @@ class Database:
             
             # Enable Write-Ahead Logging for better multi-thread concurrency
             # WAL allows readers and writers to operate concurrently
-            self._local.conn.execute("PRAGMA journal_mode=WAL;")
+            wal_result = self._local.conn.execute("PRAGMA journal_mode=WAL;").fetchone()
+            if wal_result and wal_result[0] != 'wal':
+                self.plugin.log(
+                    f"Database: WAL mode not enabled (got '{wal_result[0]}'), "
+                    f"falling back to default journal mode",
+                    level='warn'
+                )
             
             # Reduce "database is locked" errors under contention
             self._local.conn.execute("PRAGMA busy_timeout=5000;")
@@ -111,7 +117,7 @@ class Database:
             finally:
                 self._local.conn = None
 
-    def close_all_connections(self) -> None:
+    def close_main_connection(self) -> None:
         """
         Close the main thread's connection and checkpoint WAL.
 
@@ -235,7 +241,19 @@ class Database:
     def initialize(self):
         """Create database tables if they don't exist."""
         conn = self._get_connection()
-        
+
+        # Schema version tracking for migrations
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at INTEGER
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO schema_version (id, version, updated_at) VALUES (1, 1, ?)
+        """, (int(time.time()),))
+
         # Channel states table - stores current classification
         conn.execute("""
             CREATE TABLE IF NOT EXISTS channel_states (
@@ -3026,8 +3044,7 @@ class Database:
             VALUES (?, ?, ?, ?, ?)
         """, (channel_id, peer_id, open_cost_sats, capacity_sats, 
               timestamp or int(time.time())))
-        conn.commit()
-    
+
     def get_channel_open_cost(self, channel_id: str) -> Optional[int]:
         """Get the recorded open cost for a channel."""
         conn = self._get_connection()
@@ -3048,8 +3065,7 @@ class Database:
             VALUES (?, ?, ?, ?, ?)
         """, (channel_id, peer_id, cost_sats, amount_sats,
               timestamp or int(time.time())))
-        conn.commit()
-    
+
     def get_channel_rebalance_costs(self, channel_id: str) -> int:
         """Get total rebalance costs for a channel."""
         conn = self._get_connection()
@@ -3317,7 +3333,6 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """, (channel_id, peer_id, close_type, closure_fee_sats, htlc_sweep_fee_sats,
                   penalty_fee_sats, total_closure_cost, funding_txid, closing_txid, now))
-            conn.commit()
 
             self.plugin.log(
                 f"Recorded closure cost for {channel_id}: {total_closure_cost} sats "
@@ -3354,7 +3369,6 @@ class Database:
                     WHERE channel_id = ?
                 """, (additional_fees, additional_fees, channel_id))
 
-            conn.commit()
             return True
 
         except Exception as e:
@@ -3380,7 +3394,6 @@ class Database:
                 SET resolution_complete = 1
                 WHERE channel_id = ?
             """, (channel_id,))
-            conn.commit()
 
             self.plugin.log(f"Marked closure complete for {channel_id}", level='debug')
             return True
@@ -3498,7 +3511,6 @@ class Database:
             """, (channel_id, peer_id, capacity_sats, opened_at, closed_at, close_type,
                   open_cost_sats, closure_cost_sats, total_revenue_sats, total_rebalance_cost_sats,
                   forward_count, net_pnl, days_open, funding_txid, closing_txid, closer))
-            conn.commit()
 
             self.plugin.log(
                 f"Recorded closed channel history for {channel_id}: "
@@ -3607,51 +3619,55 @@ class Database:
 
         try:
             conn = self._get_connection()
-
-            # Remove from channel_states
-            cursor = conn.execute(
-                "DELETE FROM channel_states WHERE channel_id = ?",
-                (channel_id,)
-            )
-            deleted["channel_states"] = cursor.rowcount
-
-            # Remove from channel_failures
-            cursor = conn.execute(
-                "DELETE FROM channel_failures WHERE channel_id = ?",
-                (channel_id,)
-            )
-            deleted["channel_failures"] = cursor.rowcount
-
-            # Remove from channel_probes
-            cursor = conn.execute(
-                "DELETE FROM channel_probes WHERE channel_id = ?",
-                (channel_id,)
-            )
-            deleted["channel_probes"] = cursor.rowcount
-
-            # Remove from clboss_unmanaged if peer_id provided
-            if peer_id:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Remove from channel_states
                 cursor = conn.execute(
-                    "DELETE FROM clboss_unmanaged WHERE peer_id = ?",
-                    (peer_id,)
+                    "DELETE FROM channel_states WHERE channel_id = ?",
+                    (channel_id,)
                 )
-                deleted["clboss_unmanaged"] = cursor.rowcount
+                deleted["channel_states"] = cursor.rowcount
 
-            # Remove Kalman filter state for closed channel
-            cursor = conn.execute(
-                "DELETE FROM kalman_state WHERE channel_id = ?",
-                (channel_id,)
-            )
-            deleted["kalman_state"] = cursor.rowcount
+                # Remove from channel_failures
+                cursor = conn.execute(
+                    "DELETE FROM channel_failures WHERE channel_id = ?",
+                    (channel_id,)
+                )
+                deleted["channel_failures"] = cursor.rowcount
 
-            # Remove flow history for closed channel
-            cursor = conn.execute(
-                "DELETE FROM flow_history WHERE channel_id = ?",
-                (channel_id,)
-            )
-            deleted["flow_history"] = cursor.rowcount
+                # Remove from channel_probes
+                cursor = conn.execute(
+                    "DELETE FROM channel_probes WHERE channel_id = ?",
+                    (channel_id,)
+                )
+                deleted["channel_probes"] = cursor.rowcount
 
-            conn.commit()
+                # Remove from clboss_unmanaged if peer_id provided
+                if peer_id:
+                    cursor = conn.execute(
+                        "DELETE FROM clboss_unmanaged WHERE peer_id = ?",
+                        (peer_id,)
+                    )
+                    deleted["clboss_unmanaged"] = cursor.rowcount
+
+                # Remove Kalman filter state for closed channel
+                cursor = conn.execute(
+                    "DELETE FROM kalman_state WHERE channel_id = ?",
+                    (channel_id,)
+                )
+                deleted["kalman_state"] = cursor.rowcount
+
+                # Remove flow history for closed channel
+                cursor = conn.execute(
+                    "DELETE FROM flow_history WHERE channel_id = ?",
+                    (channel_id,)
+                )
+                deleted["flow_history"] = cursor.rowcount
+
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
             total = sum(deleted.values())
             if total > 0:
@@ -3741,7 +3757,7 @@ class Database:
 
             # Use INSERT OR IGNORE to prevent duplicate records when txid is known
             # The UNIQUE index on (channel_id, txid) WHERE txid IS NOT NULL handles idempotency
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT OR IGNORE INTO splice_costs
                 (channel_id, peer_id, splice_type, amount_sats, fee_sats,
                  old_capacity_sats, new_capacity_sats, txid, timestamp)
@@ -3749,9 +3765,8 @@ class Database:
             """, (channel_id, peer_id, splice_type, amount_sats, fee_sats,
                   old_capacity_sats, new_capacity_sats, txid, now))
 
-            # Check if insert was actually performed (rowcount > 0) or ignored (duplicate)
-            if conn.total_changes > 0:
-                conn.commit()
+            # Check if insert was actually performed via cursor.rowcount
+            if cursor.rowcount > 0:
                 self.plugin.log(
                     f"Recorded splice for {channel_id}: type={splice_type}, "
                     f"amount={amount_sats} sats, fee={fee_sats} sats",
@@ -3879,29 +3894,31 @@ class Database:
     def increment_failure_count(self, channel_id: str) -> int:
         """
         Increment the failure count for a channel and update last failure time.
-        
-        Called when a rebalance attempt fails.
-        
+
+        Called when a rebalance attempt fails. Uses atomic upsert to avoid
+        read-then-write race conditions.
+
         Args:
             channel_id: Channel that failed
-            
+
         Returns:
             New failure count
         """
         conn = self._get_connection()
         now = int(time.time())
-        
-        # Get current count
-        current_count, _ = self.get_failure_count(channel_id)
-        new_count = current_count + 1
-        
+
         conn.execute("""
-            INSERT OR REPLACE INTO channel_failures 
-            (channel_id, failure_count, last_failure_time)
-            VALUES (?, ?, ?)
-        """, (channel_id, new_count, now))
-        
-        return new_count
+            INSERT INTO channel_failures (channel_id, failure_count, last_failure_time)
+            VALUES (?, 1, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                failure_count = failure_count + 1,
+                last_failure_time = ?
+        """, (channel_id, now, now))
+
+        row = conn.execute(
+            "SELECT failure_count FROM channel_failures WHERE channel_id = ?",
+            (channel_id,)).fetchone()
+        return row[0] if row else 1
     
     def reset_failure_count(self, channel_id: str) -> None:
         """

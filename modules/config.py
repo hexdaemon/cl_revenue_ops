@@ -10,6 +10,8 @@ Phase 7 additions:
 - Vegas Reflex and Scarcity Pricing settings
 """
 
+import threading
+import dataclasses
 from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any, FrozenSet, TYPE_CHECKING
 
@@ -139,6 +141,16 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'aimd_min_decrease_interval': (300, 86400),  # 5 min to 24 hours
     'hive_prior_weight': (0.0, 1.0),
     'hive_min_confidence_for_prior': (0.0, 1.0),
+    # Additional range validations
+    'flow_interval': (60, 86400),
+    'fee_interval': (60, 86400),
+    'rebalance_interval': (60, 86400),
+    'max_concurrent_jobs': (1, 20),
+    'sling_job_timeout_seconds': (60, 7200),
+    'base_fee_msat': (0, 10000),
+    'rebalance_min_profit': (0, 1000000),
+    'rebalance_min_amount': (1000, 50000000),
+    'rebalance_max_amount': (10000, 100000000),
 }
 
 
@@ -294,6 +306,7 @@ class Config:
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     
     def snapshot(self) -> 'ConfigSnapshot':
         """
@@ -382,9 +395,10 @@ class Config:
         if read_back != value:
             return {"error": "Database write verification failed (Ghost Config prevention)"}
         
-        # 6. UPDATE in-memory
-        setattr(self, key, typed_value)
-        self._version = new_version
+        # 6. UPDATE in-memory (atomic under lock)
+        with self._lock:
+            setattr(self, key, typed_value)
+            self._version = new_version
         
         return {
             "status": "success",
@@ -538,84 +552,15 @@ class ConfigSnapshot:
     
     @classmethod
     def from_config(cls, config: 'Config') -> 'ConfigSnapshot':
-        """Create snapshot from mutable Config."""
-        return cls(
-            db_path=config.db_path,
-            flow_interval=config.flow_interval,
-            fee_interval=config.fee_interval,
-            rebalance_interval=config.rebalance_interval,
-            target_flow=config.target_flow,
-            flow_window_days=config.flow_window_days,
-            source_threshold=config.source_threshold,
-            sink_threshold=config.sink_threshold,
-            min_fee_ppm=config.min_fee_ppm,
-            max_fee_ppm=config.max_fee_ppm,
-            base_fee_msat=config.base_fee_msat,
-            rebalance_min_profit=config.rebalance_min_profit,
-            rebalance_min_profit_ppm=config.rebalance_min_profit_ppm,
-            rebalance_max_amount=config.rebalance_max_amount,
-            rebalance_min_amount=config.rebalance_min_amount,
-            low_liquidity_threshold=config.low_liquidity_threshold,
-            high_liquidity_threshold=config.high_liquidity_threshold,
-            rebalance_cooldown_hours=config.rebalance_cooldown_hours,
-            inbound_fee_estimate_ppm=config.inbound_fee_estimate_ppm,
-            clboss_enabled=config.clboss_enabled,
-            clboss_unmanage_duration_hours=config.clboss_unmanage_duration_hours,
-            rebalancer_plugin=config.rebalancer_plugin,
-            estimated_open_cost_sats=config.estimated_open_cost_sats,
-            daily_budget_sats=config.daily_budget_sats,
-            min_wallet_reserve=config.min_wallet_reserve,
-            enable_proportional_budget=config.enable_proportional_budget,
-            proportional_budget_pct=config.proportional_budget_pct,
-            htlc_congestion_threshold=config.htlc_congestion_threshold,
-            enable_reputation=config.enable_reputation,
-            reputation_decay=config.reputation_decay,
-            enable_kelly=config.enable_kelly,
-            kelly_fraction=config.kelly_fraction,
-            max_concurrent_jobs=config.max_concurrent_jobs,
-            sling_job_timeout_seconds=config.sling_job_timeout_seconds,
-            sling_chunk_size_sats=config.sling_chunk_size_sats,
-            sling_max_hops=config.sling_max_hops,
-            sling_parallel_jobs=config.sling_parallel_jobs,
-            sling_target_sink=config.sling_target_sink,
-            sling_target_source=config.sling_target_source,
-            sling_target_balanced=config.sling_target_balanced,
-            sling_outppm_fallback=config.sling_outppm_fallback,
-            sling_deplete_pct_sink=config.sling_deplete_pct_sink,
-            sling_deplete_pct_source=config.sling_deplete_pct_source,
-            sling_deplete_pct_balanced=config.sling_deplete_pct_balanced,
-            dry_run=config.dry_run,
-            sling_available=config.sling_available,
-            enable_vegas_reflex=config.enable_vegas_reflex,
-            vegas_decay_rate=config.vegas_decay_rate,
-            enable_scarcity_pricing=config.enable_scarcity_pricing,
-            scarcity_threshold=config.scarcity_threshold,
-            enable_flow_asymmetry=config.enable_flow_asymmetry,
-            enable_peer_sync=config.enable_peer_sync,
-            rpc_timeout_seconds=config.rpc_timeout_seconds,
-            rpc_circuit_breaker_seconds=config.rpc_circuit_breaker_seconds,
-            reservation_timeout_hours=config.reservation_timeout_hours,
-            hive_enabled=config.hive_enabled,
-            hive_fee_ppm=config.hive_fee_ppm,
-            hive_rebalance_tolerance=config.hive_rebalance_tolerance,
-            ema_smoothing_alpha=config.ema_smoothing_alpha,
-            enable_velocity_gate=config.enable_velocity_gate,
-            min_velocity_threshold=config.min_velocity_threshold,
-            new_channel_grace_days=config.new_channel_grace_days,
-            # Thompson Sampling + AIMD (v1.7.0)
-            thompson_prior_std_fee=config.thompson_prior_std_fee,
-            thompson_observation_decay_hours=config.thompson_observation_decay_hours,
-            thompson_max_observations=config.thompson_max_observations,
-            thompson_min_observations=config.thompson_min_observations,
-            aimd_failure_threshold=config.aimd_failure_threshold,
-            aimd_success_threshold=config.aimd_success_threshold,
-            aimd_multiplicative_decrease=config.aimd_multiplicative_decrease,
-            aimd_additive_increase_ppm=config.aimd_additive_increase_ppm,
-            aimd_min_decrease_interval=config.aimd_min_decrease_interval,
-            hive_prior_weight=config.hive_prior_weight,
-            hive_min_confidence_for_prior=config.hive_min_confidence_for_prior,
-            version=config._version,
-        )
+        """Create snapshot from mutable Config. Auto-maps matching field names."""
+        field_names = {f.name for f in dataclasses.fields(cls)}
+        kwargs = {}
+        for f in dataclasses.fields(cls):
+            if f.name == 'version':
+                kwargs['version'] = config._version
+            elif hasattr(config, f.name):
+                kwargs[f.name] = getattr(config, f.name)
+        return cls(**kwargs)
 
 
 # Default chain cost assumptions for fee floor calculation
