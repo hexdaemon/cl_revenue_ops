@@ -1335,11 +1335,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         revenue_sats = revenue_msat // 1000
 
         # Record the snapshot
+        local_bal = tlv_data.get("local_balance_sats", 0)
+        remote_bal = tlv_data.get("remote_balance_sats", 0)
         database.record_financial_snapshot(
-            local_balance_sats=tlv_data.get("total_local_sats", 0),
-            remote_balance_sats=tlv_data.get("total_remote_sats", 0),
+            local_balance_sats=local_bal,
+            remote_balance_sats=remote_bal,
             onchain_sats=tlv_data.get("onchain_sats", 0),
-            capacity_sats=tlv_data.get("total_capacity_sats", 0),
+            capacity_sats=local_bal + remote_bal,
             revenue_accumulated_sats=revenue_sats,
             rebalance_cost_accumulated_sats=lifetime_stats.get("total_rebalance_cost_sats", 0),
             channel_count=tlv_data.get("channel_count", 0)
