@@ -167,7 +167,7 @@ class Config:
     
     # Timer intervals (in seconds)
     flow_interval: int = 3600      # 1 hour
-    fee_interval: int = 1800       # 30 minutes
+    fee_interval: int = 600        # 10 minutes
     rebalance_interval: int = 900  # 15 minutes
     
     # Flow analysis parameters
@@ -179,7 +179,7 @@ class Config:
     sink_threshold: float = -0.5    # FlowRatio < -0.5 = Sink (filling)
     
     # Fee parameters
-    min_fee_ppm: int = 10          # Floor fee in PPM
+    min_fee_ppm: int = 25          # Floor fee in PPM
     max_fee_ppm: int = 5000        # Ceiling fee in PPM
     base_fee_msat: int = 0         # Base fee (we focus on PPM)
     
@@ -227,8 +227,8 @@ class Config:
                                      # 0.98^24 ≈ 0.61, meaning old data loses ~40% weight daily
 
     # Kelly Criterion Position Sizing (Phase 4: Risk Management)
-    enable_kelly: bool = False       # If True, scale rebalance budget by Kelly fraction
-    kelly_fraction: float = 0.5      # Multiplier for Kelly fraction ("Half Kelly" is standard)
+    enable_kelly: bool = True        # If True, scale rebalance budget by Kelly fraction
+    kelly_fraction: float = 0.6      # Multiplier for Kelly fraction (0.6 = "Half-Plus Kelly")
                                       # Full Kelly (1.0) maximizes growth but has high volatility
                                       # Half Kelly (0.5) reduces volatility drag significantly
     
@@ -240,7 +240,7 @@ class Config:
     # Enhanced Sling Integration (Phase 6)
     sling_max_hops: int = 5                   # Max route hops (shorter = faster, more reliable)
     sling_parallel_jobs: int = 1              # Concurrent route attempts per job
-    sling_target_sink: float = 0.35           # Balance target for sink channels (want more inbound)
+    sling_target_sink: float = 0.40           # Balance target for sink channels (want more inbound)
     sling_target_source: float = 0.65         # Balance target for source channels (want more outbound)
     sling_target_balanced: float = 0.50       # Balance target for balanced channels
     sling_outppm_fallback: int = 500          # Max fee PPM for outppm fallback (0 = disabled)
