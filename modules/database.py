@@ -2210,6 +2210,7 @@ class Database:
             SELECT
                 COALESCE(SUM(CASE WHEN status = 'success' THEN actual_fee_sats ELSE 0 END), 0) as total_spent,
                 COUNT(*) as job_count,
+                SUM(CASE WHEN status IN ('success', 'failed', 'partial', 'timeout') THEN 1 ELSE 0 END) as completed_count,
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_count
             FROM rebalance_history
@@ -2228,12 +2229,13 @@ class Database:
 
         total_spent = stats['total_spent'] if stats else 0
         job_count = stats['job_count'] if stats else 0
+        completed_count = stats['completed_count'] if stats else 0
         success_count = stats['success_count'] if stats else 0
         failed_count = stats['failed_count'] if stats else 0
         total_reserved = reserved['total_reserved'] if reserved else 0
 
-        # Calculate success rate
-        success_rate = (success_count / job_count * 100) if job_count > 0 else 0.0
+        # Calculate success rate based on completed jobs only (exclude pending_async)
+        success_rate = (success_count / completed_count * 100) if completed_count > 0 else 0.0
 
         return {
             'total_spent_sats': total_spent,

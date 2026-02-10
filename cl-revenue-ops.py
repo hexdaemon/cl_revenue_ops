@@ -603,7 +603,10 @@ hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligen
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
+# Cache is cleared periodically to prevent stale mappings from corrupting reputation
 _scid_to_peer_cache: Dict[str, str] = {}
+_scid_cache_last_cleared: float = 0.0
+_SCID_CACHE_TTL_SECONDS: int = 3600  # Clear cache every hour
 
 
 # =============================================================================
@@ -3333,7 +3336,13 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
     Returns:
         peer_id (node pubkey) or None if not found
     """
-    global _scid_to_peer_cache
+    global _scid_to_peer_cache, _scid_cache_last_cleared
+
+    # Expire cache periodically to prevent stale mappings
+    now = time.time()
+    if now - _scid_cache_last_cleared > _SCID_CACHE_TTL_SECONDS:
+        _scid_to_peer_cache.clear()
+        _scid_cache_last_cleared = now
 
     scid_norm = normalize_scid(scid)
 
