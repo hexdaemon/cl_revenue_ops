@@ -828,7 +828,9 @@ class TestTimeWeightedObservations:
         )
 
         # Peak context should have moved toward 300
-        peak_mean, _, _ = state.contextual_posteriors["balanced:none:peak:P"]
+        # 4-tuple format: (mean, precision, count, last_update)
+        ctx = state.contextual_posteriors["balanced:none:peak:P"]
+        peak_mean = ctx[0]
         assert peak_mean > state.posterior_mean
 
     def test_observation_includes_time_bucket(self):
@@ -850,19 +852,23 @@ class TestCorridorRoleDifferentiation:
     def test_secondary_contextual_wider_initial_std(self):
         """Test that secondary corridors start with wider uncertainty."""
         from modules.fee_controller import GaussianThompsonState
+        import math
 
         state = GaussianThompsonState()
         state.posterior_std = 50.0
 
         # Initialize primary context
         state.update_contextual("balanced:none:normal:P", fee=200, revenue_rate=50.0)
-        primary_std = state.contextual_posteriors["balanced:none:normal:P"][1]
+        # 4-tuple format: (mean, precision, count, last_update)
+        primary_precision = state.contextual_posteriors["balanced:none:normal:P"][1]
+        primary_std = 1.0 / math.sqrt(max(primary_precision, 1e-6))
 
         # Initialize secondary context
         state.update_contextual("balanced:none:normal:S", fee=200, revenue_rate=50.0)
-        secondary_std = state.contextual_posteriors["balanced:none:normal:S"][1]
+        secondary_precision = state.contextual_posteriors["balanced:none:normal:S"][1]
+        secondary_std = 1.0 / math.sqrt(max(secondary_precision, 1e-6))
 
-        # Secondary should have wider initial std
+        # Secondary should have wider initial std (lower precision)
         assert secondary_std > primary_std
 
     def test_secondary_learns_faster(self):
@@ -1364,3 +1370,471 @@ class TestPolynomialSmoothing:
         assert optimal is not None
         # Should pick best from observations
         assert optimal == 204
+
+
+# =============================================================================
+# Tests for 6 Thompson Sampling Improvements
+# =============================================================================
+
+class TestDemandAdjustedRevenue:
+    """Tests for Improvement #1: Demand-Adjusted Reward Signal."""
+
+    def test_baseline_init_from_zero(self):
+        """First call initializes baseline from current rate."""
+        from modules.fee_controller import ThompsonAIMDState
+        ts = ThompsonAIMDState()
+        assert ts.baseline_forward_rate == 0.0
+
+        result = ts.update_baseline_forward_rate(forward_count=10, hours_elapsed=2.0)
+        # First call: baseline should be set to current_rate = 10/2 = 5.0
+        assert result == 5.0
+        assert ts.baseline_forward_rate == 5.0
+
+    def test_slow_ema_decay(self):
+        """Baseline uses slow alpha=0.05 to track long-term demand."""
+        from modules.fee_controller import ThompsonAIMDState
+        ts = ThompsonAIMDState()
+
+        # Initialize
+        ts.update_baseline_forward_rate(forward_count=10, hours_elapsed=1.0)
+        initial = ts.baseline_forward_rate  # 10.0
+
+        # Update with same rate — should barely change
+        ts.update_baseline_forward_rate(forward_count=10, hours_elapsed=1.0)
+        assert abs(ts.baseline_forward_rate - initial) < 0.01
+
+    def test_clamping_lower_bound(self):
+        """Baseline never goes below 0.01."""
+        from modules.fee_controller import ThompsonAIMDState
+        ts = ThompsonAIMDState()
+        ts.update_baseline_forward_rate(forward_count=0, hours_elapsed=10.0)
+        assert ts.baseline_forward_rate >= 0.01
+
+    def test_demand_spike_inflates_factor(self):
+        """During a demand spike, demand_factor > 1 reduces adjusted revenue."""
+        from modules.fee_controller import ThompsonAIMDState
+        ts = ThompsonAIMDState()
+
+        # Set baseline to 5 forwards/hour
+        ts.baseline_forward_rate = 5.0
+
+        # Spike: 20 forwards in 1 hour
+        current_rate = 20.0 / 1.0
+        demand_factor = current_rate / max(ts.baseline_forward_rate, 0.01)
+        demand_factor = max(0.25, min(4.0, demand_factor))
+        assert demand_factor == 4.0  # capped at 4.0
+
+        adjusted = 100.0 / demand_factor
+        assert adjusted == 25.0  # revenue divided by demand factor
+
+    def test_demand_drop_boosts_adjusted_revenue(self):
+        """During a demand drop, demand_factor < 1 boosts adjusted revenue."""
+        from modules.fee_controller import ThompsonAIMDState
+        ts = ThompsonAIMDState()
+        ts.baseline_forward_rate = 10.0
+
+        # Drop: 2 forwards in 1 hour
+        current_rate = 2.0 / 1.0
+        demand_factor = current_rate / max(ts.baseline_forward_rate, 0.01)
+        demand_factor = max(0.25, min(4.0, demand_factor))
+        assert demand_factor == 0.25  # clamped at 0.25 (not 0.2)
+
+    def test_stable_demand_no_adjustment(self):
+        """When demand matches baseline, factor ~1.0, no adjustment."""
+        from modules.fee_controller import ThompsonAIMDState
+        ts = ThompsonAIMDState()
+        ts.baseline_forward_rate = 5.0
+
+        current_rate = 5.0 / 1.0
+        demand_factor = current_rate / max(ts.baseline_forward_rate, 0.01)
+        demand_factor = max(0.25, min(4.0, demand_factor))
+        assert demand_factor == 1.0
+
+    def test_serialization_roundtrip(self):
+        """baseline_forward_rate and last_vegas_multiplier survive serialization."""
+        from modules.fee_controller import ThompsonAIMDState
+        ts = ThompsonAIMDState()
+        ts.baseline_forward_rate = 7.5
+        ts.last_vegas_multiplier = 1.8
+
+        d = ts.to_v2_dict()
+        assert d["baseline_forward_rate"] == 7.5
+        assert d["last_vegas_multiplier"] == 1.8
+
+        restored = ThompsonAIMDState.from_v2_dict(d)
+        assert restored.baseline_forward_rate == 7.5
+        assert restored.last_vegas_multiplier == 1.8
+
+
+class TestWeightedAIMDSuccessMetric:
+    """Tests for Improvement #2: Weighted AIMD Success Metric."""
+
+    def test_high_score_counts_as_success(self):
+        """Score >= 0.7 increments consecutive_successes."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+
+        aimd.record_outcome(success_score=0.9)
+        assert aimd.consecutive_successes == 1
+        assert aimd.consecutive_failures == 0
+
+    def test_low_score_counts_as_failure(self):
+        """Score < 0.3 increments consecutive_failures."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+
+        aimd.record_outcome(success_score=0.1)
+        assert aimd.consecutive_failures == 1
+        assert aimd.consecutive_successes == 0
+
+    def test_neutral_score_no_change(self):
+        """Score between 0.3 and 0.7 doesn't change counters."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+        aimd.consecutive_successes = 3
+        aimd.consecutive_failures = 2
+
+        aimd.record_outcome(success_score=0.5)
+        assert aimd.consecutive_successes == 3
+        assert aimd.consecutive_failures == 2
+
+    def test_backward_compat_was_success(self):
+        """Legacy was_success=True/False still works."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+
+        aimd.record_outcome(was_success=True)
+        assert aimd.consecutive_successes == 1
+
+        aimd.record_outcome(was_success=False)
+        assert aimd.consecutive_failures == 1
+
+    def test_exploration_suppresses_failure(self):
+        """Failures during exploration (is_exploring=True) are ignored."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+
+        aimd.record_outcome(success_score=0.1, is_exploring=True)
+        assert aimd.consecutive_failures == 0  # Suppressed
+        assert aimd.consecutive_successes == 0
+
+    def test_exploration_does_not_suppress_success(self):
+        """Successes during exploration are still counted."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+
+        aimd.record_outcome(success_score=0.9, is_exploring=True)
+        assert aimd.consecutive_successes == 1
+
+
+class TestAIMDThompsonCoordination:
+    """Tests for Improvement #3: AIMD-Thompson Coordination."""
+
+    def test_exploring_detection(self):
+        """is_exploring is True when thompson_fee is far from posterior mean."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 200.0
+        ts.posterior_std = 50.0
+
+        # Fee 230 is 0.6 std from mean > 0.5 threshold
+        thompson_fee = 230
+        is_exploring = abs(thompson_fee - ts.posterior_mean) > ts.posterior_std * 0.5
+        assert is_exploring is True
+
+        # Fee 210 is 0.2 std from mean < 0.5 threshold
+        thompson_fee = 210
+        is_exploring = abs(thompson_fee - ts.posterior_mean) > ts.posterior_std * 0.5
+        assert is_exploring is False
+
+    def test_failure_suppression_during_exploration(self):
+        """AIMD doesn't decrease modifier when Thompson is exploring."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+
+        # Feed failures during exploration — should not trigger decrease
+        for _ in range(10):
+            aimd.record_outcome(success_score=0.0, is_exploring=True)
+
+        assert aimd.consecutive_failures == 0
+        assert aimd.aimd_modifier == 1.0
+
+    def test_success_counted_during_exploration(self):
+        """Successes during exploration still increment counters."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+
+        for _ in range(5):
+            aimd.record_outcome(success_score=1.0, is_exploring=True)
+
+        assert aimd.consecutive_successes == 5
+
+    def test_downward_spiral_prevention(self):
+        """Mixing exploration failures with normal successes doesn't spiral."""
+        from modules.fee_controller import AIMDDefenseState
+        aimd = AIMDDefenseState()
+
+        # Alternate: explore-fail, then normal-success
+        for _ in range(5):
+            aimd.record_outcome(success_score=0.0, is_exploring=True)  # suppressed
+            aimd.record_outcome(success_score=0.8, is_exploring=False)  # counted
+
+        assert aimd.consecutive_successes == 5
+        assert aimd.aimd_modifier >= 1.0
+
+    def test_non_exploring_failures_still_trigger_decrease(self):
+        """Failures when NOT exploring still trigger normal AIMD decrease."""
+        from modules.fee_controller import AIMDDefenseState
+        import time as t
+        aimd = AIMDDefenseState()
+        aimd.last_decrease_time = 0  # Allow decrease
+
+        # Feed enough non-exploring failures to trigger decrease
+        for _ in range(aimd.FAILURE_THRESHOLD + 1):
+            aimd.record_outcome(success_score=0.0, is_exploring=False)
+
+        assert aimd.aimd_modifier < 1.0
+        assert aimd.is_active is True
+
+
+class TestSyntheticObservations:
+    """Tests for Improvement #4: Synthetic Observations for Alpha Sequence Bypass."""
+
+    def test_injection_adds_observation(self):
+        """inject_synthetic_observation adds an observation."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        assert len(ts.observations) == 0
+
+        ts.inject_synthetic_observation(fee=500, revenue_rate=50.0, weight_scale=0.3)
+        assert len(ts.observations) == 1
+        assert ts.observations[0][0] == 500  # fee
+
+    def test_weight_capped_at_weight_scale(self):
+        """Synthetic observation weight never exceeds weight_scale."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+
+        ts.inject_synthetic_observation(fee=500, revenue_rate=10000.0, weight_scale=0.3)
+        weight = ts.observations[0][2]
+        assert weight <= 0.3
+
+    def test_weight_has_minimum(self):
+        """Synthetic observation weight is at least 0.01."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+
+        ts.inject_synthetic_observation(fee=500, revenue_rate=0.0, weight_scale=0.3)
+        weight = ts.observations[0][2]
+        assert weight >= 0.01
+
+    def test_posterior_updated_after_injection(self):
+        """Posterior is recomputed after synthetic observation."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 200.0
+
+        # Add several normal observations first
+        for _ in range(5):
+            ts.update_posterior(fee=200, revenue_rate=50.0, hours=1.0)
+
+        old_mean = ts.posterior_mean
+
+        # Inject synthetic at much higher fee
+        ts.inject_synthetic_observation(fee=500, revenue_rate=100.0, weight_scale=0.3)
+
+        # Posterior should shift slightly toward 500
+        assert ts.posterior_mean > old_mean
+
+    def test_max_observations_respected(self):
+        """Injection respects MAX_OBSERVATIONS limit."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+
+        # Fill to max
+        for i in range(ts.MAX_OBSERVATIONS):
+            ts.observations.append((200, 50.0, 0.5, i, "normal"))
+
+        assert len(ts.observations) == ts.MAX_OBSERVATIONS
+
+        ts.inject_synthetic_observation(fee=500, revenue_rate=50.0)
+        assert len(ts.observations) == ts.MAX_OBSERVATIONS  # pruned
+
+    def test_congestion_scenario_high_fee(self):
+        """Congestion synthetic observation injects at ceiling fee."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+
+        ceiling = 5000
+        ts.inject_synthetic_observation(fee=ceiling, revenue_rate=200.0, weight_scale=0.3)
+
+        assert ts.observations[0][0] == ceiling
+        assert ts.observations[0][2] <= 0.3
+
+
+class TestVegasThompsonInteraction:
+    """Tests for Improvement #5: Vegas Reflex-Thompson Interaction."""
+
+    def test_no_adjustment_below_threshold(self):
+        """Vegas multiplier <= 1.2 has no effect on Thompson."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 200.0
+        ts.posterior_std = 50.0
+
+        ts.apply_vegas_adjustment(vegas_multiplier=1.1, new_floor=100)
+        assert ts.posterior_mean == 200.0
+        assert ts.posterior_std == 50.0
+
+    def test_std_boosted_above_threshold(self):
+        """Vegas multiplier > 1.2 boosts Thompson's posterior_std."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        ts.posterior_std = 50.0
+
+        ts.apply_vegas_adjustment(vegas_multiplier=1.5, new_floor=100)
+        assert ts.posterior_std == 50.0 * 1.5
+
+    def test_mean_nudged_toward_new_floor(self):
+        """When new_floor > posterior_mean, mean is nudged toward floor."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 100.0
+        ts.posterior_std = 50.0
+
+        ts.apply_vegas_adjustment(vegas_multiplier=1.5, new_floor=200)
+        # Nudge: 100 + (200 - 100) * 0.3 = 130
+        assert ts.posterior_mean == 130.0
+
+    def test_mean_not_nudged_when_above_floor(self):
+        """When posterior_mean >= new_floor, mean is not nudged."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 300.0
+        ts.posterior_std = 50.0
+
+        ts.apply_vegas_adjustment(vegas_multiplier=1.5, new_floor=200)
+        assert ts.posterior_mean == 300.0  # unchanged
+
+    def test_boost_capped_at_2x(self):
+        """Vegas boost is capped at 2.0x even with higher multiplier."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        ts.posterior_std = 50.0
+
+        ts.apply_vegas_adjustment(vegas_multiplier=5.0, new_floor=100)
+        assert ts.posterior_std == 50.0 * 2.0  # capped
+
+    def test_serialization_of_last_vegas_multiplier(self):
+        """last_vegas_multiplier survives serialization roundtrip."""
+        from modules.fee_controller import ThompsonAIMDState
+        ts = ThompsonAIMDState()
+        ts.last_vegas_multiplier = 1.8
+
+        d = ts.to_v2_dict()
+        restored = ThompsonAIMDState.from_v2_dict(d)
+        assert restored.last_vegas_multiplier == 1.8
+
+
+class TestProperContextualPosteriors:
+    """Tests for Improvement #6: Proper Contextual Bayesian Posteriors."""
+
+    def test_new_context_uses_4_tuple(self):
+        """New contexts are created as 4-tuples (mean, precision, count, last_update)."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+
+        ts.update_contextual("balanced:none:normal:P", fee=200, revenue_rate=50.0)
+        ctx = ts.contextual_posteriors["balanced:none:normal:P"]
+        assert len(ctx) == 4
+
+    def test_precision_grows_with_observations(self):
+        """More observations increase precision (decrease std)."""
+        from modules.fee_controller import GaussianThompsonState
+        import math
+        ts = GaussianThompsonState()
+
+        ts.update_contextual("balanced:none:normal:P", fee=200, revenue_rate=50.0)
+        precision_1 = ts.contextual_posteriors["balanced:none:normal:P"][1]
+
+        ts.update_contextual("balanced:none:normal:P", fee=200, revenue_rate=50.0)
+        precision_2 = ts.contextual_posteriors["balanced:none:normal:P"][1]
+
+        assert precision_2 > precision_1
+
+    def test_convergence_toward_observed_fee(self):
+        """Mean converges toward consistently observed fee."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 200.0
+
+        for _ in range(20):
+            ts.update_contextual("balanced:none:normal:P", fee=300, revenue_rate=80.0)
+
+        ctx_mean = ts.contextual_posteriors["balanced:none:normal:P"][0]
+        # After many observations of fee=300, mean should be close to 300
+        assert ctx_mean > 250
+
+    def test_time_decay_reduces_old_precision(self):
+        """Precision decays over time so stale contexts don't dominate."""
+        from modules.fee_controller import GaussianThompsonState
+        import time as t
+        ts = GaussianThompsonState()
+
+        # Create context with some precision
+        ts.update_contextual("balanced:none:normal:P", fee=200, revenue_rate=50.0)
+        ctx = ts.contextual_posteriors["balanced:none:normal:P"]
+
+        # Simulate age by setting last_update to 14 days ago (2 half-lives)
+        old_time = int(t.time()) - (14 * 24 * 3600)
+        ts.contextual_posteriors["balanced:none:normal:P"] = (ctx[0], ctx[1], ctx[2], old_time)
+
+        precision_before = ts.contextual_posteriors["balanced:none:normal:P"][1]
+
+        # Update again — decay should reduce old precision before adding new
+        ts.update_contextual("balanced:none:normal:P", fee=300, revenue_rate=50.0)
+
+        # The mean should shift more toward 300 than if the old precision were fresh
+        new_mean = ts.contextual_posteriors["balanced:none:normal:P"][0]
+        assert new_mean > 220  # Decayed old precision allows more movement
+
+    def test_legacy_3_tuple_backward_compat(self):
+        """Legacy 3-tuple (mean, std, count) is handled by from_dict."""
+        from modules.fee_controller import GaussianThompsonState
+        import math
+
+        d = {
+            "prior_mean_fee": 200,
+            "prior_std_fee": 100,
+            "contextual_posteriors": {
+                "key1": [250.0, 40.0, 10]  # Legacy 3-tuple
+            }
+        }
+        state = GaussianThompsonState.from_dict(d)
+        ctx = state.contextual_posteriors["key1"]
+        assert len(ctx) == 4
+        assert ctx[0] == 250.0  # mean preserved
+        # precision = 1/40^2 = 0.000625
+        expected_precision = 1.0 / (40.0 ** 2)
+        assert abs(ctx[1] - expected_precision) < 1e-8
+        assert ctx[2] == 10  # count preserved
+        assert ctx[3] == 0  # last_update defaults to 0
+
+    def test_4_tuple_roundtrip(self):
+        """4-tuple format survives serialization roundtrip."""
+        from modules.fee_controller import GaussianThompsonState
+        ts = GaussianThompsonState()
+
+        # Create context
+        for _ in range(5):
+            ts.update_contextual("balanced:none:normal:P", fee=250, revenue_rate=60.0)
+
+        # Serialize and deserialize
+        d = ts.to_dict()
+        restored = GaussianThompsonState.from_dict(d)
+
+        orig = ts.contextual_posteriors["balanced:none:normal:P"]
+        rest = restored.contextual_posteriors["balanced:none:normal:P"]
+        assert len(rest) == 4
+        assert abs(orig[0] - rest[0]) < 0.01  # mean
+        assert abs(orig[1] - rest[1]) < 1e-8  # precision

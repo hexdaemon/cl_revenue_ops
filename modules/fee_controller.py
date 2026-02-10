@@ -1293,7 +1293,15 @@ class GaussianThompsonState:
         explore_mod = self._get_exploration_modifier()
 
         if context_key in self.contextual_posteriors:
-            ctx_mean, ctx_std, ctx_count = self.contextual_posteriors[context_key]
+            ctx = self.contextual_posteriors[context_key]
+
+            # Handle both 3-tuple (legacy: mean, std, count) and
+            # 4-tuple (new: mean, precision, count, last_update) formats
+            if len(ctx) == 4:
+                ctx_mean, ctx_precision, ctx_count, _ = ctx
+                ctx_std = 1.0 / math.sqrt(max(ctx_precision, 1e-6))
+            else:
+                ctx_mean, ctx_std, ctx_count = ctx[:3]
 
             if ctx_count >= self.MIN_OBSERVATIONS:
                 # Use contextual posterior with stigmergic modulation
@@ -1377,75 +1385,92 @@ class GaussianThompsonState:
         time_bucket: str = "normal"
     ) -> None:
         """
-        Update context-specific posterior with time and role aware weighting.
+        Update context-specific posterior using proper Normal-Normal conjugate update.
 
-        Observations from the same time bucket have more influence on that
-        context's posterior. Secondary corridors learn faster (more adaptive).
+        Uses precision-weighted Bayesian inference instead of ad-hoc online averaging.
+        Each context maintains (mean, precision, count, last_update) as a 4-tuple.
+        The global posterior serves as a hierarchical prior for new contexts.
+
+        Time decay: accumulated precision decays with 7-day half-life so stale
+        contexts don't dominate fresh observations.
 
         Args:
-            context_key: Context identifier
+            context_key: Context identifier (e.g., "low:strong:peak:P")
             fee: Fee that was charged
-            revenue_rate: Observed revenue rate
+            revenue_rate: Observed revenue rate (demand-adjusted)
             time_bucket: Current time bucket ("low", "normal", "peak")
         """
+        now = int(time.time())
+
         if context_key not in self.contextual_posteriors:
-            # Initialize from global posterior
-            # Secondary corridors start with wider uncertainty (more exploration)
+            # Initialize from global posterior as hierarchical prior
             parts = context_key.split(":") if ":" in context_key else []
             role = parts[3] if len(parts) >= 4 else "P"
-            initial_std = self.posterior_std
+
+            # Convert global posterior std to precision
+            init_std = self.posterior_std
             if role == "S":
-                initial_std = self.posterior_std * self.SECONDARY_EXPLORE_BOOST
+                init_std = self.posterior_std * self.SECONDARY_EXPLORE_BOOST
+            init_precision = 1.0 / max(init_std ** 2, self.MIN_STD ** 2)
 
             self.contextual_posteriors[context_key] = (
-                self.posterior_mean, initial_std, 0
+                self.posterior_mean, init_precision, 0, now
             )
 
-        ctx_mean, ctx_std, ctx_count = self.contextual_posteriors[context_key]
+        ctx = self.contextual_posteriors[context_key]
 
-        # Simple online update: weighted average toward observed fee
-        # weighted by revenue (good outcomes have more influence)
-        revenue_weight = min(1.0, revenue_rate / 100.0)
+        # Handle legacy 3-tuple format (mean, std, count)
+        if len(ctx) == 3:
+            ctx_mean, ctx_std, ctx_count = ctx
+            ctx_precision = 1.0 / max(ctx_std ** 2, self.MIN_STD ** 2)
+            ctx_last_update = 0
+        else:
+            ctx_mean, ctx_precision, ctx_count, ctx_last_update = ctx
 
-        # Time-aware weighting: boost learning rate for same time bucket
-        # Context key format: "balance:pheromone:time:role"
+        # Apply time decay to accumulated precision (7-day half-life)
+        if ctx_last_update > 0:
+            age_hours = (now - ctx_last_update) / 3600.0
+            decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
+            ctx_precision *= decay
+
+        # Ensure minimum precision (corresponds to max std of ~200)
+        ctx_precision = max(ctx_precision, 1.0 / (200.0 ** 2))
+
+        # Compute observation weight
+        # Time-aware: same time bucket = full weight, adjacent = partial
         parts = context_key.split(":") if ":" in context_key else []
         ctx_time = parts[2] if len(parts) >= 3 else "normal"
         ctx_role = parts[3] if len(parts) >= 4 else "P"
         time_weight = self._time_similarity(time_bucket, ctx_time)
 
-        # Role-aware learning rate: secondary corridors adapt faster
-        # They need to find niche pricing more aggressively
-        role_learning_boost = 1.3 if ctx_role == "S" else 1.0
+        # Revenue-based observation weight
+        revenue_weight = min(1.0, (revenue_rate + 1) / 100.0)
 
-        # Combined learning rate (revenue_weight already incorporated here)
-        learning_rate = 0.1 * (1 + revenue_weight) * time_weight * role_learning_boost
+        # Role boost: secondary corridors learn faster
+        role_boost = 1.3 if ctx_role == "S" else 1.0
 
-        new_mean = ctx_mean + learning_rate * (fee - ctx_mean)
+        # Observation precision (how much to trust this single observation)
+        # Higher revenue + same time bucket + role boost = higher precision
+        obs_variance = max(self.MIN_STD ** 2, self.posterior_std ** 2)
+        obs_precision = (revenue_weight * time_weight * role_boost) / obs_variance
 
-        # Decrease uncertainty as we gather more observations
-        # Faster convergence for same-time observations
-        # Secondary corridors converge slower (maintain exploration)
-        if ctx_role == "S":
-            decay = 0.97 if time_weight == 1.0 else 0.99
-        else:
-            decay = 0.95 if time_weight == 1.0 else 0.98
-        new_std = max(self.MIN_STD, ctx_std * decay)
+        # Normal-Normal conjugate update
+        new_precision = ctx_precision + obs_precision
+        new_mean = (ctx_precision * ctx_mean + obs_precision * fee) / new_precision
         new_count = ctx_count + 1
 
-        self.contextual_posteriors[context_key] = (new_mean, new_std, new_count)
+        self.contextual_posteriors[context_key] = (new_mean, new_precision, new_count, now)
 
         # Also update related time buckets with reduced weight
-        # This allows cross-pollination of learning
         if time_weight == 1.0:
             self._update_related_time_contexts(context_key, fee, revenue_rate, time_bucket)
 
         # Prune contextual posteriors to prevent memory bloat
         if len(self.contextual_posteriors) > 130:
-            # Keep only the most used contexts
+            # Keep only the most used contexts (sort by count, index 2)
             sorted_contexts = sorted(
                 self.contextual_posteriors.items(),
-                key=lambda x: x[1][2],  # Sort by count
+                key=lambda x: x[1][2],
                 reverse=True
             )
             self.contextual_posteriors = dict(sorted_contexts[:104])
@@ -1463,6 +1488,9 @@ class GaussianThompsonState:
         When we observe a good fee at peak time, adjacent time contexts
         (normal) should also learn from it, but with reduced influence.
 
+        Uses very small cross-pollination precision to avoid distorting
+        adjacent contexts while still sharing directional information.
+
         Args:
             context_key: The exact context that was observed
             fee: Fee that was charged
@@ -1474,6 +1502,7 @@ class GaussianThompsonState:
             return
 
         balance, pheromone, _, role = parts
+        now = int(time.time())
 
         # Determine adjacent time buckets
         adjacent = {
@@ -1482,19 +1511,29 @@ class GaussianThompsonState:
             "peak": ["normal"]
         }.get(observed_time, [])
 
-        # Update adjacent time contexts with reduced learning
+        # Update adjacent time contexts with very small cross-pollination precision
         for adj_time in adjacent:
             adj_key = f"{balance}:{pheromone}:{adj_time}:{role}"
             if adj_key in self.contextual_posteriors:
-                adj_mean, adj_std, adj_count = self.contextual_posteriors[adj_key]
+                adj = self.contextual_posteriors[adj_key]
 
-                # Reduced learning rate for cross-pollination
-                revenue_weight = min(1.0, revenue_rate / 100.0)
-                learning_rate = 0.03 * revenue_weight  # Much smaller
+                # Handle both 3-tuple (legacy) and 4-tuple (new) formats
+                if len(adj) == 4:
+                    adj_mean, adj_precision, adj_count, adj_last = adj
+                else:
+                    adj_mean, adj_std, adj_count = adj[:3]
+                    adj_precision = 1.0 / max(adj_std ** 2, self.MIN_STD ** 2)
+                    adj_last = 0
 
-                new_mean = adj_mean + learning_rate * (fee - adj_mean)
-                # Don't reduce std for cross-pollination (keep uncertainty)
-                self.contextual_posteriors[adj_key] = (new_mean, adj_std, adj_count)
+                # Very small cross-pollination precision (10% of normal obs precision)
+                revenue_weight = min(1.0, (revenue_rate + 1) / 100.0)
+                obs_variance = max(self.MIN_STD ** 2, self.posterior_std ** 2)
+                cross_precision = 0.1 * revenue_weight / obs_variance
+
+                new_precision = adj_precision + cross_precision
+                new_mean = (adj_precision * adj_mean + cross_precision * fee) / new_precision
+                # Don't increment count for cross-pollination
+                self.contextual_posteriors[adj_key] = (new_mean, new_precision, adj_count, adj_last)
 
     def _recompute_posterior(self) -> None:
         """
@@ -1638,6 +1677,47 @@ class GaussianThompsonState:
 
         return None
 
+    def apply_vegas_adjustment(self, vegas_multiplier, new_floor):
+        """
+        Adjust Thompson posterior when Vegas Reflex raises the floor significantly.
+
+        When Vegas raises the floor > 1.2x, Thompson's posterior may be below
+        the new floor, causing all samples to clamp and corrupting learning.
+        This boosts uncertainty and nudges the posterior toward the new floor.
+
+        Args:
+            vegas_multiplier: Current Vegas floor multiplier (> 1.0 means active)
+            new_floor: The new effective floor after Vegas adjustment
+        """
+        if vegas_multiplier <= 1.2:
+            return
+        boost = min(vegas_multiplier, 2.0)
+        self.posterior_std = max(self.MIN_STD, self.posterior_std * boost)
+        if new_floor > self.posterior_mean:
+            self.posterior_mean += (new_floor - self.posterior_mean) * 0.3
+
+    def inject_synthetic_observation(self, fee, revenue_rate, weight_scale=0.3, time_bucket="normal"):
+        """
+        Inject a reduced-weight synthetic observation from Alpha Sequence bypasses.
+
+        When congestion or zero-fee probes bypass Thompson entirely, Thompson
+        gets no observations and can't learn. This injects synthetic observations
+        at reduced weight so the posterior still incorporates bypass data.
+
+        Args:
+            fee: Fee that was in effect during bypass (e.g., ceiling for congestion)
+            revenue_rate: Revenue observed during bypass period
+            weight_scale: Maximum weight for synthetic obs (default 0.3 = 30% of normal)
+            time_bucket: Current time bucket
+        """
+        now = int(time.time())
+        weight = min(1.0, 1.0 / 6.0) * min(1.0, (revenue_rate + 1) / 100.0)
+        weight = max(0.01, min(weight_scale, weight))
+        self.observations.append((fee, revenue_rate, weight, now, time_bucket))
+        if len(self.observations) > self.MAX_OBSERVATIONS:
+            self.observations = self.observations[-self.MAX_OBSERVATIONS:]
+        self._recompute_posterior()
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state to dict for database storage."""
         return {
@@ -1668,9 +1748,20 @@ class GaussianThompsonState:
         state.observations = [tuple(o) for o in d.get("observations", [])]
         state.posterior_mean = d.get("posterior_mean", 200.0)
         state.posterior_std = d.get("posterior_std", 100.0)
-        state.contextual_posteriors = {
-            k: tuple(v) for k, v in d.get("contextual_posteriors", {}).items()
-        }
+        # Backward compat: convert legacy 3-tuple (mean, std, count) to
+        # 4-tuple (mean, precision, count, last_update) format
+        raw_ctx = d.get("contextual_posteriors", {})
+        converted_ctx = {}
+        for k, v in raw_ctx.items():
+            t = tuple(v)
+            if len(t) == 3:
+                # Legacy format: (mean, std, count) → (mean, precision, count, 0)
+                legacy_mean, legacy_std, legacy_count = t
+                legacy_precision = 1.0 / max(float(legacy_std) ** 2, cls.MIN_STD ** 2)
+                converted_ctx[k] = (float(legacy_mean), legacy_precision, legacy_count, 0)
+            else:
+                converted_ctx[k] = t
+        state.contextual_posteriors = converted_ctx
         state.fleet_optimal_estimate = d.get("fleet_optimal_estimate")
         state.fleet_confidence = d.get("fleet_confidence", 0.0)
         state.fleet_avg_fee = d.get("fleet_avg_fee")
@@ -1766,19 +1857,35 @@ class AIMDDefenseState:
     fleet_defensive_multiplier: float = 1.0     # From hive defense system
     fleet_threat_expires: int = 0               # When threat warning expires
 
-    def record_outcome(self, was_success: bool) -> None:
+    def record_outcome(self, was_success=None, success_score=None, is_exploring=False) -> None:
         """
-        Record a routing outcome (success or failure).
+        Record a routing outcome using continuous success score or binary flag.
 
-        Success is defined as: forward_count > 0 since last observation.
-        This updates the AIMD state machine.
+        Success score mapping:
+        - >= 0.7: success (increment successes, reset failures)
+        - < 0.3: failure (increment failures, reset successes)
+          UNLESS is_exploring=True — exploration failures are ignored
+        - 0.3–0.7: neutral zone (no counter change)
+
+        Legacy was_success=True/False is still supported for backward compat.
 
         Args:
-            was_success: True if routing succeeded, False if no forwards
+            was_success: Legacy binary flag (True/False). Used if success_score not provided.
+            success_score: Continuous score (forward_rate / baseline_forward_rate).
+                          Values > 1.0 mean above-average demand.
+            is_exploring: If True, failures during Thompson exploration are ignored
+                         to prevent AIMD from creating a downward spiral.
         """
         now = int(time.time())
 
-        if was_success:
+        # Convert legacy binary to score if needed
+        if success_score is None:
+            if was_success is None:
+                return
+            success_score = 1.0 if was_success else 0.0
+
+        if success_score >= 0.7:
+            # Success: forward rate is >= 70% of baseline
             self.consecutive_successes += 1
             self.consecutive_failures = 0
 
@@ -1792,7 +1899,13 @@ class AIMDDefenseState:
                 # Deactivate AIMD mode if we're doing well
                 if self.aimd_modifier >= 1.0:
                     self.is_active = False
-        else:
+        elif success_score < 0.3:
+            # Failure: forward rate is < 30% of baseline
+            # But suppress failure counting during Thompson exploration
+            if is_exploring:
+                # Don't penalize exploratory fee experiments
+                return
+
             self.consecutive_failures += 1
             self.consecutive_successes = 0
 
@@ -1806,6 +1919,7 @@ class AIMDDefenseState:
                     self.consecutive_failures = 0  # Reset counter
                     self.total_decreases += 1
                     self.is_active = True  # Activate defense mode
+        # else: neutral zone (0.3 <= score < 0.7) — no counter change
 
     def apply_to_fee(self, thompson_fee: int, floor: int, ceiling: int) -> int:
         """
@@ -2032,6 +2146,12 @@ class ThompsonAIMDState:
     # Gossip refresh tracking
     last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
 
+    # Demand-adjusted reward signal: EMA of forwards/hour (slow decay)
+    baseline_forward_rate: float = 0.0
+
+    # Vegas-Thompson interaction tracking
+    last_vegas_multiplier: float = 1.0
+
     def get_historical_curve(self) -> HistoricalResponseCurve:
         """Deserialize historical curve from dict."""
         if self.historical_curve_data:
@@ -2072,6 +2192,33 @@ class ThompsonAIMDState:
             )
         return self.ema_revenue_rate
 
+    def update_baseline_forward_rate(self, forward_count: int, hours_elapsed: float,
+                                      alpha: float = 0.05) -> float:
+        """
+        Update EMA of forwards/hour for demand normalization.
+
+        Uses a slow decay (alpha=0.05) so baseline tracks long-term demand,
+        not short-term spikes. Revenue rate is then divided by
+        (current_rate / baseline) to remove demand effects from the reward signal.
+
+        Args:
+            forward_count: Number of forwards since last update
+            hours_elapsed: Hours since last update
+            alpha: Smoothing factor (0.05 = very slow, tracks trend)
+
+        Returns:
+            Updated baseline forward rate
+        """
+        current_rate = forward_count / max(hours_elapsed, 0.1)
+        if self.baseline_forward_rate <= 0:
+            self.baseline_forward_rate = max(current_rate, 0.1)
+        else:
+            self.baseline_forward_rate = (
+                alpha * current_rate + (1 - alpha) * self.baseline_forward_rate
+            )
+        self.baseline_forward_rate = max(self.baseline_forward_rate, 0.01)
+        return self.baseline_forward_rate
+
     def to_v2_dict(self) -> Dict[str, Any]:
         """
         Serialize to v2 JSON format for database storage.
@@ -2087,7 +2234,11 @@ class ThompsonAIMDState:
             "historical_curve": self.historical_curve_data,
             "elasticity": self.elasticity_data,
             # Legacy thompson_data kept for migration path
-            "thompson": self.thompson_data
+            "thompson": self.thompson_data,
+            # Demand-adjusted reward signal
+            "baseline_forward_rate": self.baseline_forward_rate,
+            # Vegas-Thompson interaction
+            "last_vegas_multiplier": self.last_vegas_multiplier
         }
 
     @classmethod
@@ -2147,6 +2298,10 @@ class ThompsonAIMDState:
         state.elasticity_data = d.get("elasticity", {})
         state.thompson_data = d.get("thompson", {})
         state.algorithm_version = d.get("algorithm_version", "migrated")
+        # Demand-adjusted reward signal (default 0.0 for backward compat)
+        state.baseline_forward_rate = d.get("baseline_forward_rate", 0.0)
+        # Vegas-Thompson interaction (default 1.0 for backward compat)
+        state.last_vegas_multiplier = d.get("last_vegas_multiplier", 1.0)
 
         # Load legacy fields from main table if provided
         if legacy_state:
@@ -4714,6 +4869,17 @@ class HillClimbingFeeController:
             previous_rate = hc_state.last_revenue_rate
             target_found = True
 
+            # Synthetic observation: Thompson bypassed, inject at reduced weight
+            if self.ENABLE_THOMPSON_AIMD:
+                try:
+                    ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                    ts_state_synth.thompson.inject_synthetic_observation(
+                        ceiling_ppm, current_revenue_rate, weight_scale=0.3
+                    )
+                    self._save_thompson_aimd_state(channel_id, ts_state_synth)
+                except Exception:
+                    pass  # Synthetic injection is best-effort
+
         # Priority 2: Zero-Fee Probe Logic (Jumpstarting)
         if not target_found and is_under_probe:
             # Calculate current revenue rate (reuse logic from rate calculation below)
@@ -4753,6 +4919,18 @@ class HillClimbingFeeController:
                     f"Exiting probe to floor {new_fee_ppm} ppm.",
                     level='info'
                 )
+
+                # Synthetic observation: probe succeeded at floor fee
+                if self.ENABLE_THOMPSON_AIMD:
+                    try:
+                        ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                        probe_revenue = (v_since * new_fee_ppm) / 1_000_000 if v_since > 0 else 0.0
+                        ts_state_synth.thompson.inject_synthetic_observation(
+                            new_fee_ppm, probe_revenue, weight_scale=0.2
+                        )
+                        self._save_thompson_aimd_state(channel_id, ts_state_synth)
+                    except Exception:
+                        pass  # Synthetic injection is best-effort
             else:
                 # Still probing: force 0 PPM
                 new_fee_ppm = 0
@@ -4764,6 +4942,17 @@ class HillClimbingFeeController:
                 rate_change = 0.0
                 previous_rate = hc_state.last_revenue_rate
                 target_found = True
+
+                # Synthetic observation: probing with 0 fee, no revenue
+                if self.ENABLE_THOMPSON_AIMD:
+                    try:
+                        ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                        ts_state_synth.thompson.inject_synthetic_observation(
+                            0, 0.0, weight_scale=0.1
+                        )
+                        self._save_thompson_aimd_state(channel_id, ts_state_synth)
+                    except Exception:
+                        pass  # Synthetic injection is best-effort
 
         # Priority 4: Fee Discovery Algorithm
         # =====================================================================
@@ -5005,12 +5194,23 @@ class HillClimbingFeeController:
                     ts_state.stable_cycles = 0
 
             # =====================================================================
+            # DEMAND-ADJUSTED REWARD SIGNAL
+            # =====================================================================
+            # Normalize revenue by baseline demand so Thompson learns fee effects,
+            # not demand shocks. A demand surge inflates revenue even if the fee
+            # is unchanged; dividing by the demand factor removes this confound.
+            ts_state.update_baseline_forward_rate(forward_count, hours_elapsed)
+            demand_factor = (forward_count / max(hours_elapsed, 0.1)) / max(ts_state.baseline_forward_rate, 0.01)
+            demand_factor = max(0.25, min(4.0, demand_factor))
+            adjusted_revenue_rate = current_revenue_rate / demand_factor
+
+            # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
             # =====================================================================
-            # Update Thompson posterior with this observation (time-weighted)
+            # Update Thompson posterior with demand-adjusted observation
             ts_state.thompson.update_posterior(
                 fee=current_fee_ppm,
-                revenue_rate=current_revenue_rate,
+                revenue_rate=adjusted_revenue_rate,
                 hours=hours_elapsed,
                 time_bucket=time_bucket
             )
@@ -5019,13 +5219,18 @@ class HillClimbingFeeController:
             ts_state.thompson.update_contextual(
                 context_key=context_key,
                 fee=current_fee_ppm,
-                revenue_rate=current_revenue_rate,
+                revenue_rate=adjusted_revenue_rate,
                 time_bucket=time_bucket
             )
 
-            # Record outcome for AIMD defense
-            was_success = (forward_count > 0)
-            ts_state.aimd.record_outcome(was_success)
+            # =====================================================================
+            # VEGAS-THOMPSON INTERACTION
+            # =====================================================================
+            # When Vegas raises floor significantly, boost Thompson's uncertainty
+            # and nudge posterior toward new floor so samples aren't all clamped.
+            if vegas_multiplier > 1.2:
+                ts_state.thompson.apply_vegas_adjustment(vegas_multiplier, base_floor_ppm)
+                ts_state.last_vegas_multiplier = vegas_multiplier
 
             # =====================================================================
             # BROADCAST FEE DISCOVERIES (P1 Integration)
@@ -5157,6 +5362,16 @@ class HillClimbingFeeController:
             # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
             if differentiation_offset != 0:
                 thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
+
+            # =====================================================================
+            # WEIGHTED AIMD SUCCESS METRIC + AIMD-THOMPSON COORDINATION
+            # =====================================================================
+            # Compute continuous success score (not binary) and detect if Thompson
+            # is exploring so AIMD doesn't penalize exploratory fee experiments.
+            forward_rate = forward_count / max(hours_elapsed, 0.1)
+            success_score = forward_rate / max(ts_state.baseline_forward_rate, 0.1)
+            is_exploring = abs(thompson_fee - ts_state.thompson.posterior_mean) > ts_state.thompson.posterior_std * 0.5
+            ts_state.aimd.record_outcome(success_score=success_score, is_exploring=is_exploring)
 
             # =====================================================================
             # P2 PROFITABILITY-WEIGHTED THOMPSON SAMPLING
