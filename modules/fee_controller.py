@@ -1162,6 +1162,91 @@ class GaussianThompsonState:
         self.posterior_mean = float(self.prior_mean_fee)
         self.posterior_std = float(self.prior_std_fee)
 
+    def apply_routing_intelligence(self, intel: Dict[str, Any]) -> None:
+        """
+        Apply routing intelligence to adjust Thompson sampling prior.
+
+        Uses pheromone levels, trends, and corridor membership to weight the prior:
+        - Hot channels (high pheromone): optimistic prior (can sustain higher fees)
+        - Warm channels: slightly optimistic
+        - Cold channels (no pheromone): pessimistic (needs lower fees to attract flow)
+        - Corridor bonus: channels on proven routes get extra confidence
+
+        This method should be called after initialize_from_hive_profile() if
+        routing intelligence is available.
+
+        Args:
+            intel: Routing intelligence dict from hive-get-routing-intelligence:
+                {
+                    "pheromone_level": 3.98,
+                    "pheromone_trend": "stable",  # rising/falling/stable
+                    "last_forward_age_hours": 2.5,
+                    "marker_count": 3,
+                    "on_active_corridor": true
+                }
+        """
+        if not intel:
+            return
+
+        pheromone = intel.get('pheromone_level', 0.0)
+        trend = intel.get('pheromone_trend', 'stable')
+        on_corridor = intel.get('on_active_corridor', False)
+        marker_count = intel.get('marker_count', 0)
+        last_forward_age = intel.get('last_forward_age_hours')
+
+        # Adjust prior mean based on pheromone level
+        # Hot channels: shift prior mean higher (can sustain higher fees)
+        # Cold channels: shift prior mean lower (needs competitive fees)
+        if pheromone >= 2.0:
+            # Hot channel: +15-25% fee adjustment based on strength
+            pheromone_factor = min(0.25, 0.15 + (pheromone - 2.0) * 0.02)
+            self.prior_mean_fee = int(self.prior_mean_fee * (1 + pheromone_factor))
+        elif pheromone >= 0.5:
+            # Warm channel: +5-15% adjustment
+            pheromone_factor = 0.05 + (pheromone - 0.5) * 0.067
+            self.prior_mean_fee = int(self.prior_mean_fee * (1 + pheromone_factor))
+        elif pheromone < 0.1 and pheromone >= 0:
+            # Cold channel: -10% (needs lower fees to attract flow)
+            self.prior_mean_fee = int(self.prior_mean_fee * 0.90)
+
+        # Trend adjustments
+        if trend == "rising":
+            # Recent activity, confidence is higher
+            self.prior_std_fee = int(self.prior_std_fee * 0.85)
+        elif trend == "falling":
+            # Decaying interest, increase uncertainty
+            self.prior_std_fee = int(self.prior_std_fee * 1.15)
+
+        # Corridor bonus: channels on proven routes get extra confidence
+        if on_corridor:
+            # Reduce uncertainty (exploit more)
+            self.prior_std_fee = int(self.prior_std_fee * 0.90)
+            # Slight fee premium for being on a working corridor
+            self.prior_mean_fee = int(self.prior_mean_fee * 1.05)
+
+        # Marker count bonus: more markers = more confident data
+        if marker_count >= 5:
+            self.prior_std_fee = int(self.prior_std_fee * 0.85)
+        elif marker_count >= 2:
+            self.prior_std_fee = int(self.prior_std_fee * 0.92)
+
+        # Recency factor: if last forward was recent, we have better data
+        if last_forward_age is not None:
+            if last_forward_age < 2:
+                # Very recent: high confidence
+                self.prior_std_fee = int(self.prior_std_fee * 0.90)
+            elif last_forward_age > 48:
+                # Stale data: increase uncertainty
+                self.prior_std_fee = int(self.prior_std_fee * 1.10)
+
+        # Enforce bounds
+        self.prior_std_fee = max(self.MIN_STD, min(200, self.prior_std_fee))
+        self.prior_mean_fee = max(1, self.prior_mean_fee)
+
+        # Update posterior to match adjusted prior
+        self.posterior_mean = float(self.prior_mean_fee)
+        self.posterior_std = float(self.prior_std_fee)
+
     def set_context_modulation(
         self,
         pheromone_level: float = 0.0,
@@ -3065,6 +3150,29 @@ class HillClimbingFeeController:
                     f"THOMPSON_INIT: Failed to get hive intel for {peer_id[:12]}...: {e}",
                     level='debug'
                 )
+
+            # Apply routing intelligence if enabled
+            routing_intel_enabled = getattr(cfg, 'routing_intelligence_enabled', False)
+            if routing_intel_enabled:
+                try:
+                    routing_intel = self.hive_bridge.get_channel_routing_intelligence(channel_id)
+                    if routing_intel:
+                        # Apply routing intelligence to adjust priors
+                        state.apply_routing_intelligence(routing_intel)
+
+                        self.plugin.log(
+                            f"THOMPSON_INIT: {channel_id[:12]}... routing intelligence applied "
+                            f"(pheromone={routing_intel.get('pheromone_level', 0):.2f}, "
+                            f"trend={routing_intel.get('pheromone_trend', 'stable')}, "
+                            f"on_corridor={routing_intel.get('on_active_corridor', False)}) -> "
+                            f"prior_mean={state.prior_mean_fee}, prior_std={state.prior_std_fee}",
+                            level='debug'
+                        )
+                except Exception as e:
+                    self.plugin.log(
+                        f"THOMPSON_INIT: Failed to get routing intel for {channel_id[:12]}...: {e}",
+                        level='debug'
+                    )
 
         return state
 

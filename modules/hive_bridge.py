@@ -1411,6 +1411,144 @@ class HiveFeeIntelligenceBridge:
             return None
 
     # =========================================================================
+    # ROUTING INTELLIGENCE INTEGRATION
+    # =========================================================================
+    # Query routing intelligence (pheromones, stigmergic markers, corridors)
+    # for use in Thompson sampling prior initialization.
+
+    def query_routing_intelligence(
+        self,
+        scid: str = None,
+        use_cache: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query routing intelligence for channel(s) from cl-hive.
+
+        Returns pheromone levels, trends, and corridor membership for use
+        in Thompson sampling prior initialization.
+
+        Args:
+            scid: Optional specific channel short_channel_id. If None, returns all.
+            use_cache: Whether to use cached data (default True)
+
+        Returns:
+            Routing intelligence dict or None if unavailable:
+            {
+                "channels": {
+                    "932263x1883x0": {
+                        "pheromone_level": 3.98,
+                        "pheromone_trend": "stable",  # rising/falling/stable
+                        "last_forward_age_hours": 2.5,
+                        "marker_count": 3,
+                        "on_active_corridor": true
+                    },
+                    ...
+                },
+                "timestamp": 1234567890,
+                "total_channels": 15,
+                "channels_with_pheromone": 8,
+                "active_corridors": 5
+            }
+        """
+        # Check cache first (keyed by "_routing_intel" + scid)
+        cache_key = f"_routing_intel_{scid or 'all'}"
+        if use_cache and hasattr(self, '_routing_intel_cache'):
+            cached = self._routing_intel_cache.get(cache_key)
+            if cached:
+                cache_age = time.time() - cached.get('_cache_time', 0)
+                cache_ttl = getattr(self, '_routing_intel_cache_ttl', 300)  # 5 min default
+                if cache_age < cache_ttl:
+                    return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            # Return stale cache if available
+            if hasattr(self, '_routing_intel_cache'):
+                cached = self._routing_intel_cache.get(cache_key)
+                if cached:
+                    cached['_stale'] = True
+                    return cached
+            return None
+
+        try:
+            params = {}
+            if scid:
+                params["scid"] = scid
+
+            result = self.plugin.rpc.call("hive-get-routing-intelligence", params)
+
+            if result.get("error"):
+                self._log(
+                    f"Routing intelligence query error: {result.get('error')}",
+                    level="debug"
+                )
+                return None
+
+            self._record_success()
+
+            # Cache the result
+            if not hasattr(self, '_routing_intel_cache'):
+                self._routing_intel_cache = {}
+            result['_cache_time'] = time.time()
+            result['_stale'] = False
+            self._routing_intel_cache[cache_key] = result
+
+            # Limit cache size
+            if len(self._routing_intel_cache) > 100:
+                # Remove oldest entries
+                oldest_key = min(
+                    self._routing_intel_cache.keys(),
+                    key=lambda k: self._routing_intel_cache[k].get('_cache_time', 0)
+                )
+                del self._routing_intel_cache[oldest_key]
+
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query routing intelligence: {e}", level="debug")
+            self._record_failure()
+
+            # Return stale cache if available
+            if hasattr(self, '_routing_intel_cache'):
+                cached = self._routing_intel_cache.get(cache_key)
+                if cached:
+                    cached['_stale'] = True
+                    return cached
+            return None
+
+    def get_channel_routing_intelligence(self, scid: str) -> Optional[Dict[str, Any]]:
+        """
+        Get routing intelligence for a specific channel.
+
+        Convenience method that extracts single channel data.
+
+        Args:
+            scid: Channel short_channel_id
+
+        Returns:
+            Channel intelligence dict or None:
+            {
+                "pheromone_level": 3.98,
+                "pheromone_trend": "stable",
+                "last_forward_age_hours": 2.5,
+                "marker_count": 3,
+                "on_active_corridor": true
+            }
+        """
+        result = self.query_routing_intelligence(scid=scid)
+        if result and "channels" in result:
+            return result["channels"].get(scid)
+        return None
+
+    def set_routing_intelligence_cache_ttl(self, ttl_seconds: int) -> None:
+        """
+        Set the cache TTL for routing intelligence queries.
+
+        Args:
+            ttl_seconds: Cache time-to-live in seconds (default 300)
+        """
+        self._routing_intel_cache_ttl = max(60, min(3600, ttl_seconds))
+
+    # =========================================================================
     # P2 Integration: Elasticity Sharing
     # =========================================================================
 

@@ -92,6 +92,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'aimd_min_decrease_interval': int,
     'hive_prior_weight': float,
     'hive_min_confidence_for_prior': float,
+    # Routing Intelligence Integration
+    'routing_intelligence_enabled': bool,
+    'routing_intelligence_cache_seconds': int,
 }
 
 # Range constraints for numeric fields
@@ -141,6 +144,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'aimd_min_decrease_interval': (300, 86400),  # 5 min to 24 hours
     'hive_prior_weight': (0.0, 1.0),
     'hive_min_confidence_for_prior': (0.0, 1.0),
+    # Routing Intelligence Integration
+    'routing_intelligence_cache_seconds': (60, 3600),  # 1 min to 1 hour
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
@@ -303,6 +308,14 @@ class Config:
     # Hive Prior Integration
     hive_prior_weight: float = 0.6            # Weight for hive-informed priors
     hive_min_confidence_for_prior: float = 0.3  # Min confidence to use hive data
+
+    # ==========================================================================
+    # Routing Intelligence Integration (cl-hive pheromone/corridor data)
+    # ==========================================================================
+    # When enabled, Thompson sampling priors are weighted by pheromone data
+    # from cl-hive's routing intelligence system.
+    routing_intelligence_enabled: bool = False    # Opt-in feature (off by default)
+    routing_intelligence_cache_seconds: int = 300  # Cache TTL for routing intel
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -546,6 +559,10 @@ class ConfigSnapshot:
     aimd_min_decrease_interval: int
     hive_prior_weight: float
     hive_min_confidence_for_prior: float
+
+    # Routing Intelligence Integration
+    routing_intelligence_enabled: bool
+    routing_intelligence_cache_seconds: int
 
     # Version tracking
     version: int = 0
