@@ -3545,3 +3545,620 @@ class HiveFeeIntelligenceBridge:
         )
         costs_ok = self.report_period_costs(rebalance_costs_sats)
         return yield_ok and costs_ok
+
+    # =========================================================================
+    # COMPREHENSIVE DATA INTEGRATION (Revenue Ops Enhancement)
+    # =========================================================================
+    # These methods query cl-hive for additional data to improve fee
+    # optimization and rebalancing decisions.
+
+    # Cache TTLs for different data types (seconds)
+    _DEFENSE_STATUS_CACHE_TTL = 60       # 1 minute - attacks are time-sensitive
+    _PEER_QUALITY_CACHE_TTL = 300        # 5 minutes
+    _FEE_HISTORY_CACHE_TTL = 300         # 5 minutes
+    _CHANNEL_FLAGS_CACHE_TTL = 300       # 5 minutes
+    _MCF_TARGETS_CACHE_TTL = 300         # 5 minutes
+    _NNLB_CACHE_TTL = 120                # 2 minutes
+    _CHANNEL_AGES_CACHE_TTL = 3600       # 1 hour - ages change slowly
+
+    def _get_from_cache(self, cache_key: str, ttl: float) -> Optional[Dict[str, Any]]:
+        """Get data from integration cache if fresh."""
+        if not hasattr(self, '_integration_cache'):
+            self._integration_cache = {}
+
+        cached = self._integration_cache.get(cache_key)
+        if cached:
+            age = time.time() - cached.get('_cache_time', 0)
+            if age < ttl:
+                return cached.get('data')
+        return None
+
+    def _set_in_cache(self, cache_key: str, data: Dict[str, Any]) -> None:
+        """Store data in integration cache."""
+        if not hasattr(self, '_integration_cache'):
+            self._integration_cache = {}
+
+        self._integration_cache[cache_key] = {
+            'data': data,
+            '_cache_time': time.time()
+        }
+
+        # Limit cache size
+        if len(self._integration_cache) > 200:
+            # Remove oldest entry
+            oldest_key = min(
+                self._integration_cache.keys(),
+                key=lambda k: self._integration_cache[k].get('_cache_time', 0)
+            )
+            del self._integration_cache[oldest_key]
+
+    def get_defense_status(self, scid: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Get defense status for channel(s) from cl-hive.
+
+        Returns whether channels are under defensive fee protection due to
+        drain attacks, spam, or fee wars. Used to avoid overriding defensive
+        fees during optimization.
+
+        Args:
+            scid: Optional specific channel SCID. If None, returns all channels.
+
+        Returns:
+            Dict with defense status or None if unavailable:
+            {
+                "channels": {
+                    "932263x1883x0": {
+                        "under_defense": false,
+                        "defense_type": null,
+                        "defensive_fee_ppm": null,
+                        "defense_started_at": null,
+                        "defense_reason": null
+                    }
+                }
+            }
+        """
+        cache_key = f"defense_status_{scid or 'all'}"
+        cached = self._get_from_cache(cache_key, self._DEFENSE_STATUS_CACHE_TTL)
+        if cached:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {}
+            if scid:
+                params["scid"] = scid
+
+            result = self.plugin.rpc.call("hive-get-defense-status", params)
+
+            if result.get("error"):
+                self._log(f"Defense status query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            self._set_in_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query defense status: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def get_channel_defense_status(self, scid: str) -> Optional[Dict[str, Any]]:
+        """
+        Get defense status for a specific channel.
+
+        Convenience method that extracts single channel data.
+
+        Args:
+            scid: Channel short_channel_id
+
+        Returns:
+            Channel defense dict or None:
+            {
+                "under_defense": false,
+                "defense_type": null,
+                "defensive_fee_ppm": null,
+                "defense_started_at": null,
+                "defense_reason": null
+            }
+        """
+        result = self.get_defense_status(scid=scid)
+        if result and "channels" in result:
+            return result["channels"].get(scid)
+        return None
+
+    def get_peer_quality(self, peer_id: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Get peer quality assessments from cl-hive.
+
+        Returns quality ratings based on uptime, routing success, fee stability,
+        and fleet-wide reputation. Used to adjust optimization intensity.
+
+        Args:
+            peer_id: Optional specific peer ID. If None, returns all peers.
+
+        Returns:
+            Dict with peer quality or None if unavailable:
+            {
+                "peers": {
+                    "03abc...": {
+                        "quality": "good",
+                        "quality_score": 0.85,
+                        "reasons": ["high_uptime", "good_routing_partner"],
+                        "recommendation": "expand",
+                        "last_assessed": 1707600000
+                    }
+                }
+            }
+        """
+        cache_key = f"peer_quality_{peer_id or 'all'}"
+        cached = self._get_from_cache(cache_key, self._PEER_QUALITY_CACHE_TTL)
+        if cached:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {}
+            if peer_id:
+                params["peer_id"] = peer_id
+
+            result = self.plugin.rpc.call("hive-get-peer-quality", params)
+
+            if result.get("error"):
+                self._log(f"Peer quality query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            self._set_in_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query peer quality: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def get_single_peer_quality(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get quality assessment for a specific peer.
+
+        Convenience method that extracts single peer data.
+
+        Args:
+            peer_id: Peer public key
+
+        Returns:
+            Peer quality dict or None:
+            {
+                "quality": "good",
+                "quality_score": 0.85,
+                "reasons": ["high_uptime", "good_routing_partner"],
+                "recommendation": "expand",
+                "last_assessed": 1707600000
+            }
+        """
+        result = self.get_peer_quality(peer_id=peer_id)
+        if result and "peers" in result:
+            return result["peers"].get(peer_id)
+        return None
+
+    def get_fee_change_outcomes(
+        self,
+        scid: str = None,
+        days: int = 30
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get outcomes of past fee changes from cl-hive for learning.
+
+        Returns historical fee changes with before/after metrics to help
+        learn from past decisions and adjust Thompson priors.
+
+        Args:
+            scid: Optional specific channel SCID. If None, returns all.
+            days: Number of days of history (default: 30, max: 90)
+
+        Returns:
+            Dict with fee change outcomes or None:
+            {
+                "changes": [
+                    {
+                        "scid": "932263x1883x0",
+                        "timestamp": 1707500000,
+                        "old_fee_ppm": 200,
+                        "new_fee_ppm": 300,
+                        "source": "advisor",
+                        "outcome": {
+                            "forwards_before_24h": 5,
+                            "forwards_after_24h": 3,
+                            "revenue_before_24h": 500,
+                            "revenue_after_24h": 600,
+                            "verdict": "positive"
+                        }
+                    }
+                ]
+            }
+        """
+        cache_key = f"fee_outcomes_{scid or 'all'}_{days}"
+        cached = self._get_from_cache(cache_key, self._FEE_HISTORY_CACHE_TTL)
+        if cached:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {"days": days}
+            if scid:
+                params["scid"] = scid
+
+            result = self.plugin.rpc.call("hive-get-fee-change-outcomes", params)
+
+            if result.get("error"):
+                self._log(f"Fee outcomes query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            self._set_in_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query fee change outcomes: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def get_channel_flags(self, scid: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Get special flags for channels from cl-hive.
+
+        Returns flags identifying hive-internal channels that should be excluded
+        from optimization (always 0 fee) or have other special treatment.
+
+        Args:
+            scid: Optional specific channel SCID. If None, returns all.
+
+        Returns:
+            Dict with channel flags or None:
+            {
+                "channels": {
+                    "932263x1883x0": {
+                        "is_hive_internal": false,
+                        "is_hive_member": false,
+                        "fixed_fee": null,
+                        "exclude_from_optimization": false
+                    }
+                }
+            }
+        """
+        cache_key = f"channel_flags_{scid or 'all'}"
+        cached = self._get_from_cache(cache_key, self._CHANNEL_FLAGS_CACHE_TTL)
+        if cached:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {}
+            if scid:
+                params["scid"] = scid
+
+            result = self.plugin.rpc.call("hive-get-channel-flags", params)
+
+            if result.get("error"):
+                self._log(f"Channel flags query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            self._set_in_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query channel flags: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def get_single_channel_flags(self, scid: str) -> Optional[Dict[str, Any]]:
+        """
+        Get flags for a specific channel.
+
+        Convenience method that extracts single channel data.
+
+        Args:
+            scid: Channel short_channel_id
+
+        Returns:
+            Channel flags dict or None
+        """
+        result = self.get_channel_flags(scid=scid)
+        if result and "channels" in result:
+            return result["channels"].get(scid)
+        return None
+
+    def get_mcf_targets(self) -> Optional[Dict[str, Any]]:
+        """
+        Get MCF-computed optimal balance targets from cl-hive.
+
+        Returns the Multi-Commodity Flow computed optimal local balance
+        percentages for each channel. Used to guide rebalancing toward
+        globally optimal distribution.
+
+        Returns:
+            Dict with MCF targets or None:
+            {
+                "targets": {
+                    "932263x1883x0": {
+                        "optimal_local_pct": 45,
+                        "current_local_pct": 30,
+                        "delta_sats": 150000,
+                        "priority": "high"
+                    }
+                },
+                "computed_at": 1707600000
+            }
+        """
+        cache_key = "mcf_targets"
+        cached = self._get_from_cache(cache_key, self._MCF_TARGETS_CACHE_TTL)
+        if cached:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-get-mcf-targets", {})
+
+            if result.get("error"):
+                self._log(f"MCF targets query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            self._set_in_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query MCF targets: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def get_nnlb_opportunities(self, min_amount: int = 50000) -> Optional[Dict[str, Any]]:
+        """
+        Get Nearest-Neighbor Load Balancing opportunities from cl-hive.
+
+        Returns low-cost rebalance opportunities between fleet members where
+        the rebalance can be done at zero or minimal fee.
+
+        Args:
+            min_amount: Minimum amount in sats to consider (default: 50000)
+
+        Returns:
+            Dict with NNLB opportunities or None:
+            {
+                "opportunities": [
+                    {
+                        "source_scid": "932263x1883x0",
+                        "sink_scid": "931308x1256x0",
+                        "amount_sats": 200000,
+                        "estimated_cost_sats": 0,
+                        "path_hops": 1,
+                        "is_hive_internal": true
+                    }
+                ]
+            }
+        """
+        cache_key = f"nnlb_opps_{min_amount}"
+        cached = self._get_from_cache(cache_key, self._NNLB_CACHE_TTL)
+        if cached:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-get-nnlb-opportunities", {
+                "min_amount": min_amount
+            })
+
+            if result.get("error"):
+                self._log(f"NNLB opportunities query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            self._set_in_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query NNLB opportunities: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def get_channel_ages(self, scid: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Get channel age information from cl-hive.
+
+        Returns age and maturity classification for channels. Used to adjust
+        exploration vs exploitation in Thompson sampling - new channels need
+        more exploration, mature channels should exploit known-good fees.
+
+        Args:
+            scid: Optional specific channel SCID. If None, returns all.
+
+        Returns:
+            Dict with channel ages or None:
+            {
+                "channels": {
+                    "932263x1883x0": {
+                        "age_days": 45,
+                        "maturity": "mature",
+                        "first_forward_days_ago": 40,
+                        "total_forwards": 250
+                    }
+                }
+            }
+        """
+        cache_key = f"channel_ages_{scid or 'all'}"
+        cached = self._get_from_cache(cache_key, self._CHANNEL_AGES_CACHE_TTL)
+        if cached:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {}
+            if scid:
+                params["scid"] = scid
+
+            result = self.plugin.rpc.call("hive-get-channel-ages", params)
+
+            if result.get("error"):
+                self._log(f"Channel ages query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            self._set_in_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query channel ages: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def get_single_channel_age(self, scid: str) -> Optional[Dict[str, Any]]:
+        """
+        Get age info for a specific channel.
+
+        Convenience method that extracts single channel data.
+
+        Args:
+            scid: Channel short_channel_id
+
+        Returns:
+            Channel age dict or None:
+            {
+                "age_days": 45,
+                "maturity": "mature",
+                "first_forward_days_ago": 40,
+                "total_forwards": 250
+            }
+        """
+        result = self.get_channel_ages(scid=scid)
+        if result and "channels" in result:
+            return result["channels"].get(scid)
+        return None
+
+    def is_channel_excluded_from_optimization(self, scid: str) -> bool:
+        """
+        Check if a channel should be excluded from fee optimization.
+
+        Convenience method to quickly check if a channel is hive-internal
+        or otherwise flagged for exclusion.
+
+        Args:
+            scid: Channel short_channel_id
+
+        Returns:
+            True if channel should be excluded, False otherwise
+        """
+        flags = self.get_single_channel_flags(scid)
+        if flags:
+            return flags.get('exclude_from_optimization', False)
+        return False
+
+    def is_channel_under_defense(self, scid: str) -> bool:
+        """
+        Check if a channel is currently under defensive fee protection.
+
+        Convenience method to quickly check defense status.
+
+        Args:
+            scid: Channel short_channel_id
+
+        Returns:
+            True if channel is under defense, False otherwise
+        """
+        defense = self.get_channel_defense_status(scid)
+        if defense:
+            return defense.get('under_defense', False)
+        return False
+
+    def get_defensive_fee_floor(self, scid: str) -> Optional[int]:
+        """
+        Get the defensive fee floor for a channel under attack.
+
+        Returns the minimum fee that should be charged to protect against
+        drain attacks or other threats.
+
+        Args:
+            scid: Channel short_channel_id
+
+        Returns:
+            Minimum fee in ppm, or None if not under defense
+        """
+        defense = self.get_channel_defense_status(scid)
+        if defense and defense.get('under_defense'):
+            return defense.get('defensive_fee_ppm')
+        return None
+
+    def should_rebalance_into_peer(self, peer_id: str) -> bool:
+        """
+        Check if we should rebalance liquidity toward a peer.
+
+        Uses peer quality assessment to avoid investing in bad peers.
+
+        Args:
+            peer_id: Peer public key
+
+        Returns:
+            True if okay to rebalance into, False if should avoid
+        """
+        quality = self.get_single_peer_quality(peer_id)
+        if quality:
+            return quality.get('quality') != 'avoid'
+        return True  # Default to allowing if no data
+
+    def get_exploration_rate_for_channel(
+        self,
+        scid: str,
+        default_rate: float = 0.15
+    ) -> float:
+        """
+        Get recommended exploration rate based on channel maturity.
+
+        New channels need more exploration, mature channels should mostly
+        exploit known-good fees.
+
+        Args:
+            scid: Channel short_channel_id
+            default_rate: Default rate if no age data available
+
+        Returns:
+            Exploration rate (0.0-1.0)
+        """
+        age_info = self.get_single_channel_age(scid)
+        if not age_info:
+            return default_rate
+
+        maturity = age_info.get('maturity', 'developing')
+
+        if maturity == 'new':
+            return 0.30   # 30% exploration for new channels
+        elif maturity == 'mature':
+            return 0.05   # 5% exploration for mature channels
+        else:
+            return 0.15   # 15% default for developing channels
+
+    def clear_integration_cache(self) -> int:
+        """
+        Clear the integration data cache.
+
+        Returns:
+            Number of entries cleared
+        """
+        if not hasattr(self, '_integration_cache'):
+            return 0
+        count = len(self._integration_cache)
+        self._integration_cache.clear()
+        return count

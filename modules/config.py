@@ -95,6 +95,21 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Routing Intelligence Integration
     'routing_intelligence_enabled': bool,
     'routing_intelligence_cache_seconds': int,
+    # Comprehensive Hive Data Integration
+    'hive_defense_status_enabled': bool,
+    'hive_defense_status_cache_seconds': int,
+    'hive_peer_quality_enabled': bool,
+    'hive_peer_quality_cache_seconds': int,
+    'hive_decision_history_enabled': bool,
+    'hive_decision_history_days': int,
+    'hive_channel_flags_enabled': bool,
+    'hive_mcf_targets_enabled': bool,
+    'hive_mcf_targets_cache_seconds': int,
+    'hive_nnlb_enabled': bool,
+    'hive_nnlb_min_amount': int,
+    'hive_nnlb_auto_execute': bool,
+    'hive_channel_ages_enabled': bool,
+    'hive_channel_ages_cache_seconds': int,
 }
 
 # Range constraints for numeric fields
@@ -146,6 +161,13 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hive_min_confidence_for_prior': (0.0, 1.0),
     # Routing Intelligence Integration
     'routing_intelligence_cache_seconds': (60, 3600),  # 1 min to 1 hour
+    # Comprehensive Hive Data Integration
+    'hive_defense_status_cache_seconds': (10, 300),    # 10 sec to 5 min
+    'hive_peer_quality_cache_seconds': (60, 1800),     # 1 min to 30 min
+    'hive_decision_history_days': (1, 90),             # 1 to 90 days
+    'hive_mcf_targets_cache_seconds': (60, 1800),      # 1 min to 30 min
+    'hive_nnlb_min_amount': (10000, 10000000),         # 10k to 10M sats
+    'hive_channel_ages_cache_seconds': (300, 86400),   # 5 min to 24 hours
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
@@ -316,6 +338,40 @@ class Config:
     # from cl-hive's routing intelligence system.
     routing_intelligence_enabled: bool = False    # Opt-in feature (off by default)
     routing_intelligence_cache_seconds: int = 300  # Cache TTL for routing intel
+
+    # ==========================================================================
+    # Comprehensive Hive Data Integration (v1.8.0)
+    # ==========================================================================
+    # Integration with cl-hive for enhanced fee optimization and rebalancing.
+    # Each integration can be individually enabled/disabled.
+
+    # Defense status: Prevent overriding defensive fees during attacks
+    hive_defense_status_enabled: bool = True
+    hive_defense_status_cache_seconds: int = 60     # Short TTL - attacks are time-sensitive
+
+    # Peer quality: Adjust optimization intensity based on peer quality
+    hive_peer_quality_enabled: bool = True
+    hive_peer_quality_cache_seconds: int = 300      # 5 minute cache
+
+    # Decision history: Learn from past fee changes
+    hive_decision_history_enabled: bool = True
+    hive_decision_history_days: int = 30            # Days of history to consider
+
+    # Channel flags: Identify hive-internal channels
+    hive_channel_flags_enabled: bool = True
+
+    # MCF targets: Use multi-commodity flow analysis for rebalancing
+    hive_mcf_targets_enabled: bool = False          # Opt-in, may conflict with manual rebalancing
+    hive_mcf_targets_cache_seconds: int = 300       # 5 minute cache
+
+    # NNLB opportunities: Low-cost hive-internal rebalancing
+    hive_nnlb_enabled: bool = False                 # Opt-in
+    hive_nnlb_min_amount: int = 50000               # Minimum sats to consider
+    hive_nnlb_auto_execute: bool = False            # Require manual trigger by default
+
+    # Channel ages: Exploration/exploitation based on maturity
+    hive_channel_ages_enabled: bool = True
+    hive_channel_ages_cache_seconds: int = 3600     # 1 hour cache - ages change slowly
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)

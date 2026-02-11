@@ -7163,6 +7163,234 @@ class HillClimbingFeeController:
         self._save_hill_climb_state(channel_id, hc_state)
         self.plugin.log(f"Reset Hill Climbing state for {channel_id}")
 
+    # =========================================================================
+    # Comprehensive Hive Data Integration (v1.8.0)
+    # =========================================================================
+    # These methods integrate with cl-hive for enhanced fee optimization
+    # and rebalancing decisions.
+
+    def should_skip_optimization(self, scid: str, peer_id: str = None) -> tuple:
+        """
+        Check if channel should be skipped for fee optimization.
+
+        Uses multiple hive data sources:
+        - Defense status: Skip if under defensive fee protection
+        - Channel flags: Skip if hive-internal (always 0 fee)
+
+        Args:
+            scid: Channel short_channel_id
+            peer_id: Optional peer ID for additional checks
+
+        Returns:
+            Tuple of (should_skip: bool, reason: str)
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        # Check defense status
+        if getattr(cfg, 'hive_defense_status_enabled', True) and self.hive_bridge:
+            if self.hive_bridge.is_channel_under_defense(scid):
+                defense = self.hive_bridge.get_channel_defense_status(scid)
+                defense_type = defense.get('defense_type', 'unknown') if defense else 'unknown'
+                return True, f"Under {defense_type} defense"
+
+        # Check channel flags (hive-internal)
+        if getattr(cfg, 'hive_channel_flags_enabled', True) and self.hive_bridge:
+            if self.hive_bridge.is_channel_excluded_from_optimization(scid):
+                return True, "Hive-internal channel"
+
+        return False, ""
+
+    def get_fee_bounds_with_defense(
+        self,
+        scid: str,
+        base_floor: int,
+        base_ceiling: int
+    ) -> tuple:
+        """
+        Get fee bounds adjusted for defensive status.
+
+        If channel is under defense, the floor is raised to the defensive fee.
+
+        Args:
+            scid: Channel short_channel_id
+            base_floor: Base calculated floor
+            base_ceiling: Base calculated ceiling
+
+        Returns:
+            Tuple of (floor: int, ceiling: int)
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        if not getattr(cfg, 'hive_defense_status_enabled', True) or not self.hive_bridge:
+            return base_floor, base_ceiling
+
+        defensive_floor = self.hive_bridge.get_defensive_fee_floor(scid)
+        if defensive_floor and defensive_floor > base_floor:
+            self.plugin.log(
+                f"DEFENSE FLOOR: {scid[:16]}... raising floor from {base_floor} to {defensive_floor} ppm",
+                level='info'
+            )
+            return defensive_floor, max(base_ceiling, defensive_floor + 100)
+
+        return base_floor, base_ceiling
+
+    def get_optimization_intensity(self, scid: str, peer_id: str) -> float:
+        """
+        Get optimization intensity based on peer quality.
+
+        High-quality peers get more aggressive optimization.
+        Avoid-quality peers get skipped or minimal optimization.
+
+        Args:
+            scid: Channel short_channel_id
+            peer_id: Peer public key
+
+        Returns:
+            Optimization intensity multiplier (0.0-1.5)
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        if not getattr(cfg, 'hive_peer_quality_enabled', True) or not self.hive_bridge:
+            return 1.0
+
+        quality = self.hive_bridge.get_single_peer_quality(peer_id)
+        if not quality:
+            return 1.0
+
+        q = quality.get('quality', 'neutral')
+        if q == 'avoid':
+            self.plugin.log(
+                f"PEER QUALITY: {peer_id[:16]}... marked as 'avoid' - reducing optimization",
+                level='debug'
+            )
+            return 0.0  # Don't optimize - flag for review
+        elif q == 'good':
+            return 1.2  # More aggressive optimization
+        return 1.0
+
+    def get_exploration_rate(self, scid: str, default_rate: float = 0.15) -> float:
+        """
+        Get exploration rate for Thompson sampling based on channel maturity.
+
+        New channels need more exploration, mature channels should mostly
+        exploit known-good fees.
+
+        Args:
+            scid: Channel short_channel_id
+            default_rate: Default rate if no data available
+
+        Returns:
+            Exploration rate (0.0-1.0)
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        if not getattr(cfg, 'hive_channel_ages_enabled', True) or not self.hive_bridge:
+            return default_rate
+
+        return self.hive_bridge.get_exploration_rate_for_channel(scid, default_rate)
+
+    def get_channels_to_optimize(
+        self,
+        all_channels: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter channels to exclude hive-internal and defense-protected channels.
+
+        Args:
+            all_channels: List of all channel info dicts
+
+        Returns:
+            Filtered list of channels suitable for optimization
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        if not getattr(cfg, 'hive_channel_flags_enabled', True) or not self.hive_bridge:
+            return all_channels
+
+        filtered = []
+        for ch in all_channels:
+            scid = ch.get('channel_id') or ch.get('short_channel_id')
+            if not scid:
+                filtered.append(ch)
+                continue
+
+            # Check if excluded
+            should_skip, reason = self.should_skip_optimization(scid, ch.get('peer_id'))
+            if should_skip:
+                self.plugin.log(
+                    f"SKIP OPT: {scid[:16]}... - {reason}",
+                    level='debug'
+                )
+                continue
+
+            filtered.append(ch)
+
+        return filtered
+
+    def update_priors_from_history(self, scid: str, thompson_state) -> None:
+        """
+        Update Thompson sampling priors from historical fee change outcomes.
+
+        Uses cl-hive's fee change outcome data to adjust the Thompson
+        posterior based on what's worked in the past.
+
+        Args:
+            scid: Channel short_channel_id
+            thompson_state: The ThompsonAIMDState or GaussianThompsonState to update
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        if not getattr(cfg, 'hive_decision_history_enabled', True) or not self.hive_bridge:
+            return
+
+        days = getattr(cfg, 'hive_decision_history_days', 30)
+        history = self.hive_bridge.get_fee_change_outcomes(scid, days)
+
+        if not history or not history.get('changes'):
+            return
+
+        # Count positive and negative outcomes
+        positive = 0
+        negative = 0
+        total_revenue_gain = 0
+
+        for change in history.get('changes', []):
+            outcome = change.get('outcome', {})
+            verdict = outcome.get('verdict', 'unknown')
+
+            if verdict == 'positive':
+                positive += 1
+                # Learn from the successful fee
+                fee = change.get('new_fee_ppm', 0)
+                revenue_after = outcome.get('revenue_after_24h', 0)
+                if fee > 0 and revenue_after > 0:
+                    total_revenue_gain += revenue_after - outcome.get('revenue_before_24h', 0)
+            elif verdict == 'negative':
+                negative += 1
+
+        if positive + negative == 0:
+            return
+
+        # Adjust Thompson state based on track record
+        # If more positive outcomes, lower the posterior std (more confident)
+        # If more negative outcomes, increase the posterior std (less confident)
+        if hasattr(thompson_state, 'thompson'):
+            ts = thompson_state.thompson
+            if positive > negative * 2:
+                # Strong positive track record - exploit more
+                ts.posterior_std = max(ts.MIN_STD, ts.posterior_std * 0.9)
+                self.plugin.log(
+                    f"HISTORY PRIOR: {scid[:16]}... positive track record, reducing exploration",
+                    level='debug'
+                )
+            elif negative > positive * 2:
+                # Strong negative track record - explore more
+                ts.posterior_std = min(200, ts.posterior_std * 1.1)
+                self.plugin.log(
+                    f"HISTORY PRIOR: {scid[:16]}... negative track record, increasing exploration",
+                    level='debug'
+                )
+
 
 # Keep alias for backward compatibility
 PIDFeeController = HillClimbingFeeController
