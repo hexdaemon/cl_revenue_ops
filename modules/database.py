@@ -2936,6 +2936,30 @@ class Database:
         """, (since,)).fetchone()
         
         return row['total_volume_msat'] // 1000 if row else 0
+
+    def get_total_volume_since(self, since_timestamp: int) -> int:
+        """Get total routing volume since a timestamp (in sats)."""
+        conn = self._get_connection()
+        
+        row = conn.execute("""
+            SELECT COALESCE(SUM(out_msat), 0) as total_volume_msat
+            FROM forwards
+            WHERE timestamp >= ?
+        """, (since_timestamp,)).fetchone()
+        
+        return row['total_volume_msat'] // 1000 if row else 0
+
+    def get_total_forward_count_since(self, since_timestamp: int) -> int:
+        """Get total forward count since a timestamp."""
+        conn = self._get_connection()
+        
+        row = conn.execute("""
+            SELECT COUNT(*) as count
+            FROM forwards
+            WHERE timestamp >= ?
+        """, (since_timestamp,)).fetchone()
+        
+        return row['count'] if row else 0
     
     def get_peer_latency_stats(self, peer_id: str, window_seconds: int = 86400) -> Dict[str, float]:
         """

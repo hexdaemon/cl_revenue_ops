@@ -1253,6 +1253,10 @@ class ChannelProfitabilityAnalyzer:
         # Get revenue (routing fees earned)
         gross_revenue_sats = self.database.get_total_routing_revenue(since_timestamp)
 
+        # Get volume and forward count for dashboard metrics
+        volume_sats = self.database.get_total_volume_since(since_timestamp)
+        forward_count = self.database.get_total_forward_count_since(since_timestamp)
+
         # Get OpEx components (Accounting v2.0: includes closure and splice costs)
         rebalance_cost_sats = self.database.get_total_rebalance_fees(since_timestamp)
         closure_cost_sats = self.database.get_closure_costs_since(since_timestamp)
@@ -1279,7 +1283,9 @@ class ChannelProfitabilityAnalyzer:
             'closure_cost_sats': closure_cost_sats,
             'splice_cost_sats': splice_cost_sats,
             'net_profit_sats': net_profit_sats,
-            'operating_margin_pct': operating_margin_pct
+            'operating_margin_pct': operating_margin_pct,
+            'volume_sats': volume_sats,
+            'forward_count': forward_count
         }
 
     def identify_bleeders(self, window_days: int = 30) -> List[Dict[str, Any]]:

@@ -2886,6 +2886,8 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
                 "rebalance_cost_sats": pnl.get("rebalance_cost_sats", 0),
                 "closure_cost_sats": pnl.get("closure_cost_sats", 0),
                 "splice_cost_sats": pnl.get("splice_cost_sats", 0),
+                "volume_sats": pnl.get("volume_sats", 0),
+                "forward_count": pnl.get("forward_count", 0),
             },
             "warnings": warnings,
             "bleeder_count": len(bleeders)
