@@ -220,6 +220,10 @@ class JobManager:
         self.source_failure_counts: Dict[str, float] = {}
         self.last_decay_time = time.time()
 
+        # Periodic exclusion sync tracking
+        self._last_exclusion_sync: float = 0
+        self._policy_manager_ref = None
+
     def _report_outcome_to_hive(self, job: ActiveJob, success: bool, cost_sats: int,
                                  amount_transferred: int = 0, failure_reason: str = "") -> None:
         """
@@ -581,7 +585,16 @@ class JobManager:
                 if self.source_failure_counts[scid] < 0.1:
                     del self.source_failure_counts[scid]
             self.last_decay_time = now
-            
+
+        # Periodic exclusion sync (every 30 minutes)
+        if now - self._last_exclusion_sync > 1800:
+            try:
+                self.sync_peer_exclusions(self._policy_manager_ref)
+                self.sync_channel_exclusions()
+            except Exception as e:
+                self.plugin.log(f"Periodic exclusion sync error: {e}", level='debug')
+            self._last_exclusion_sync = now
+
         if not self._active_jobs:
             return summary
         
@@ -1151,7 +1164,11 @@ class JobManager:
     def execute_once(self, scid: str, direction: str, amount: int,
                      maxppm: int, onceamount: Optional[int] = None,
                      candidates: Optional[List[str]] = None,
-                     outppm: Optional[int] = None) -> Dict[str, Any]:
+                     outppm: Optional[int] = None,
+                     maxhops: Optional[int] = None,
+                     depleteuptopercent: Optional[float] = None,
+                     depleteuptoamount: Optional[int] = None,
+                     paralleljobs: Optional[int] = None) -> Dict[str, Any]:
         """
         One-shot rebalance via sling-once.  Blocks until complete.
 
@@ -1181,6 +1198,22 @@ class JobManager:
             params["candidates"] = [self._to_sling_scid(c) for c in candidates]
         if outppm and outppm > 0:
             params["outppm"] = outppm
+
+        # Apply config defaults for params not explicitly provided
+        if maxhops is None:
+            maxhops = self.config.sling_max_hops
+        params["maxhops"] = maxhops
+
+        if depleteuptopercent is not None:
+            params["depleteuptopercent"] = depleteuptopercent
+
+        if depleteuptoamount is not None:
+            params["depleteuptoamount"] = depleteuptoamount
+
+        if paralleljobs is None:
+            paralleljobs = self.config.sling_parallel_jobs
+        if paralleljobs > 1:
+            params["paralleljobs"] = paralleljobs
 
         self.plugin.log(
             f"sling-once: {sling_scid} dir={direction} amt={amount} "
@@ -1226,6 +1259,7 @@ class JobManager:
 
             # From policy manager (disabled rebalance mode)
             if policy_manager:
+                self._policy_manager_ref = policy_manager
                 try:
                     from .policy_manager import RebalanceMode
                     for peer_id, policy in policy_manager.get_all_policies().items():
@@ -1233,6 +1267,19 @@ class JobManager:
                             peers_to_exclude.add(peer_id)
                 except Exception as e:
                     self.plugin.log(f"Could not get policies for exclusion sync: {e}", level='debug')
+
+            # From hive defense system (high-severity threats)
+            if self.hive_bridge:
+                try:
+                    defense = self.hive_bridge.query_defense_status()
+                    if defense:
+                        for warning in defense.get("active_warnings", []):
+                            peer_id = warning.get("peer_id")
+                            severity = warning.get("severity", 0)
+                            if peer_id and severity >= 0.7:
+                                peers_to_exclude.add(peer_id)
+                except Exception:
+                    pass  # Non-fatal
 
             # Add new exclusions to sling
             for peer_id in peers_to_exclude:
@@ -1311,6 +1358,112 @@ class JobManager:
             return True
         except RpcError as e:
             self.plugin.log(f"Failed to remove sling peer exclusion: {e}", level='warn')
+            return False
+
+    def sync_channel_exclusions(self) -> int:
+        """
+        Sync channel exclusions with sling's channel exclusion list.
+
+        Excludes channels with high failure counts from sling routing.
+        Removes stale exclusions for channels whose failure counts have decayed.
+
+        Returns:
+            Number of exclusion changes made
+        """
+        changes = 0
+
+        try:
+            # Get current sling channel exclusions
+            try:
+                result = self.plugin.rpc.call("sling-except-chan", {})
+                current_exclusions = set(result.get("channels", []))
+            except (RpcError, KeyError):
+                current_exclusions = set()
+
+            # Channels that should be excluded (high failure count)
+            channels_to_exclude = set()
+            for scid, count in self.source_failure_counts.items():
+                if count >= 5.0:
+                    channels_to_exclude.add(self._to_sling_scid(scid))
+
+            # Channels to un-exclude (failure count decayed)
+            channels_to_remove = set()
+            for scid in current_exclusions:
+                normalized = self._normalize_scid(scid)
+                count = self.source_failure_counts.get(normalized, 0)
+                if count < 2.0:
+                    channels_to_remove.add(scid)
+
+            # Add new exclusions
+            for scid in channels_to_exclude:
+                if scid not in current_exclusions:
+                    if self.add_channel_exclusion(scid):
+                        changes += 1
+
+            # Remove stale exclusions
+            for scid in channels_to_remove:
+                if self.remove_channel_exclusion(scid):
+                    changes += 1
+
+            if changes > 0:
+                self.plugin.log(
+                    f"Sling Channel Exclusion Sync: {changes} changes",
+                    level='info'
+                )
+
+        except Exception as e:
+            self.plugin.log(f"Channel exclusion sync error: {e}", level='warn')
+
+        return changes
+
+    def add_channel_exclusion(self, scid: str) -> bool:
+        """
+        Add a single channel to sling's channel exclusion list.
+
+        Args:
+            scid: The short channel ID to exclude
+
+        Returns:
+            True if successfully added, False otherwise
+        """
+        try:
+            sling_scid = self._to_sling_scid(scid)
+            self.plugin.rpc.call("sling-except-chan", {
+                "scid": sling_scid,
+                "add": True
+            })
+            self.plugin.log(
+                f"Sling Channel Exclusion: Added {sling_scid} to exclusion list",
+                level='debug'
+            )
+            return True
+        except RpcError as e:
+            self.plugin.log(f"Failed to add sling channel exclusion: {e}", level='warn')
+            return False
+
+    def remove_channel_exclusion(self, scid: str) -> bool:
+        """
+        Remove a channel from sling's channel exclusion list.
+
+        Args:
+            scid: The short channel ID to un-exclude
+
+        Returns:
+            True if successfully removed, False otherwise
+        """
+        try:
+            sling_scid = self._to_sling_scid(scid)
+            self.plugin.rpc.call("sling-except-chan", {
+                "scid": sling_scid,
+                "remove": True
+            })
+            self.plugin.log(
+                f"Sling Channel Exclusion: Removed {sling_scid} from exclusion list",
+                level='debug'
+            )
+            return True
+        except RpcError as e:
+            self.plugin.log(f"Failed to remove sling channel exclusion: {e}", level='warn')
             return False
 
     def get_job_status(self, channel_id: str) -> Optional[Dict[str, Any]]:

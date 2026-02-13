@@ -508,13 +508,18 @@ class TestSlingOnce:
         )
 
         assert result["success"] is True
-        mock_plugin.rpc.call.assert_called_once_with("sling-once", {
-            "scid": "123x456x0",
-            "direction": "pull",
-            "amount": 100000,
-            "maxppm": 500,
-            "onceamount": 200000,
-        })
+        mock_plugin.rpc.call.assert_called_once()
+        call_args = mock_plugin.rpc.call.call_args[0]
+        assert call_args[0] == "sling-once"
+        params = call_args[1]
+        assert params["scid"] == "123x456x0"
+        assert params["direction"] == "pull"
+        assert params["amount"] == 100000
+        assert params["maxppm"] == 500
+        assert params["onceamount"] == 200000
+        assert params["maxhops"] == cfg.sling_max_hops
+        # paralleljobs included when > 1 (default is 2)
+        assert params["paralleljobs"] == cfg.sling_parallel_jobs
 
     def test_execute_once_with_candidates(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -1075,3 +1080,241 @@ class TestFleetAwareSpread:
 
         accepted_channels = [cid for cid, _, _, _ in candidates]
         assert "500x1x0" in accepted_channels, "Hive-to-hive should use 0 inbound and pass"
+
+
+class TestSlingOnceNewParams:
+    """Verify execute_once passes maxhops, depleteuptopercent, depleteuptoamount, paralleljobs."""
+
+    def test_execute_once_passes_maxhops(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(sling_max_hops=3)
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        mock_plugin.rpc.call.return_value = {"status": "ok"}
+
+        jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
+
+        params = mock_plugin.rpc.call.call_args[0][1]
+        assert params["maxhops"] == 3
+
+    def test_execute_once_explicit_maxhops_overrides_config(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(sling_max_hops=5)
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        mock_plugin.rpc.call.return_value = {"status": "ok"}
+
+        jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500, maxhops=2)
+
+        params = mock_plugin.rpc.call.call_args[0][1]
+        assert params["maxhops"] == 2
+
+    def test_execute_once_passes_depletion_params(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        mock_plugin.rpc.call.return_value = {"status": "ok"}
+
+        jm.execute_once(
+            scid="123x456x0", direction="pull", amount=100000, maxppm=500,
+            depleteuptopercent=0.15, depleteuptoamount=50000,
+        )
+
+        params = mock_plugin.rpc.call.call_args[0][1]
+        assert params["depleteuptopercent"] == 0.15
+        assert params["depleteuptoamount"] == 50000
+
+    def test_execute_once_omits_depletion_when_none(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        mock_plugin.rpc.call.return_value = {"status": "ok"}
+
+        jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
+
+        params = mock_plugin.rpc.call.call_args[0][1]
+        assert "depleteuptopercent" not in params
+        assert "depleteuptoamount" not in params
+
+    def test_execute_once_passes_paralleljobs(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(sling_parallel_jobs=3)
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        mock_plugin.rpc.call.return_value = {"status": "ok"}
+
+        jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
+
+        params = mock_plugin.rpc.call.call_args[0][1]
+        assert params["paralleljobs"] == 3
+
+    def test_execute_once_omits_paralleljobs_when_one(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(sling_parallel_jobs=1)
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        mock_plugin.rpc.call.return_value = {"status": "ok"}
+
+        jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
+
+        params = mock_plugin.rpc.call.call_args[0][1]
+        assert "paralleljobs" not in params
+
+    def test_execute_once_no_target(self, mock_plugin, mock_database):
+        """Target param is forbidden for sling-once."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        mock_plugin.rpc.call.return_value = {"status": "ok"}
+
+        jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
+
+        params = mock_plugin.rpc.call.call_args[0][1]
+        assert "target" not in params
+
+
+class TestDefenseExclusions:
+    """Verify sync_peer_exclusions queries hive defense warnings."""
+
+    def test_sync_excludes_high_severity_threats(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        threat_peer = "02" + "d" * 64
+        mock_hive = MagicMock()
+        mock_hive.query_defense_status.return_value = {
+            "active_warnings": [
+                {"peer_id": threat_peer, "severity": 0.8, "threat_type": "drain"}
+            ],
+            "warning_count": 1,
+        }
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=mock_hive)
+
+        # No current exclusions
+        mock_plugin.rpc.call.return_value = {"peers": []}
+
+        count = jm.sync_peer_exclusions()
+
+        # Should have called sling-except-peer to add the threat peer
+        add_calls = [
+            c for c in mock_plugin.rpc.call.call_args_list
+            if c[0][0] == "sling-except-peer" and c[0][1].get("add")
+        ]
+        added_peers = [c[0][1]["peer"] for c in add_calls]
+        assert threat_peer in added_peers
+
+    def test_sync_ignores_low_severity(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        low_threat = "02" + "e" * 64
+        mock_hive = MagicMock()
+        mock_hive.query_defense_status.return_value = {
+            "active_warnings": [
+                {"peer_id": low_threat, "severity": 0.3, "threat_type": "unreliable"}
+            ],
+            "warning_count": 1,
+        }
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=mock_hive)
+        mock_plugin.rpc.call.return_value = {"peers": []}
+
+        jm.sync_peer_exclusions()
+
+        # Should NOT have added the low-severity peer
+        add_calls = [
+            c for c in mock_plugin.rpc.call.call_args_list
+            if c[0][0] == "sling-except-peer" and c[0][1].get("add")
+        ]
+        added_peers = [c[0][1]["peer"] for c in add_calls]
+        assert low_threat not in added_peers
+
+    def test_sync_defense_failure_graceful(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        mock_hive = MagicMock()
+        mock_hive.query_defense_status.side_effect = Exception("RPC unavailable")
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=mock_hive)
+        mock_plugin.rpc.call.return_value = {"peers": []}
+
+        # Should not raise
+        count = jm.sync_peer_exclusions()
+        assert count == 0
+
+
+class TestChannelExclusions:
+    """Verify sling-except-chan channel exclusion methods."""
+
+    def test_sync_channel_exclusions_high_failure(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        jm.source_failure_counts["111x222x0"] = 6.0
+
+        mock_plugin.rpc.call.return_value = {"channels": []}
+
+        changes = jm.sync_channel_exclusions()
+
+        add_calls = [
+            c for c in mock_plugin.rpc.call.call_args_list
+            if c[0][0] == "sling-except-chan" and c[0][1].get("add")
+        ]
+        assert len(add_calls) == 1
+        assert add_calls[0][0][1]["scid"] == "111x222x0"
+        assert changes >= 1
+
+    def test_sync_channel_exclusions_low_failure(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        jm.source_failure_counts["111x222x0"] = 2.0
+
+        mock_plugin.rpc.call.return_value = {"channels": []}
+
+        changes = jm.sync_channel_exclusions()
+
+        # No exclusion should be added for count < 5.0
+        add_calls = [
+            c for c in mock_plugin.rpc.call.call_args_list
+            if c[0][0] == "sling-except-chan" and c[0][1].get("add")
+        ]
+        assert len(add_calls) == 0
+        assert changes == 0
+
+    def test_add_remove_channel_exclusion(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        mock_plugin.rpc.call.return_value = {}
+
+        assert jm.add_channel_exclusion("111x222x0") is True
+        mock_plugin.rpc.call.assert_called_with("sling-except-chan", {
+            "scid": "111x222x0", "add": True
+        })
+
+        assert jm.remove_channel_exclusion("111x222x0") is True
+        mock_plugin.rpc.call.assert_called_with("sling-except-chan", {
+            "scid": "111x222x0", "remove": True
+        })

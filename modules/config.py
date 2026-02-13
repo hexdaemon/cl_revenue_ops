@@ -266,7 +266,7 @@ class Config:
 
     # Enhanced Sling Integration (Phase 6)
     sling_max_hops: int = 5                   # Max route hops (shorter = faster, more reliable)
-    sling_parallel_jobs: int = 1              # Concurrent route attempts per job
+    sling_parallel_jobs: int = 2              # Concurrent route attempts per job
     sling_target_sink: float = 0.40           # Balance target for sink channels (want more inbound)
     sling_target_source: float = 0.65         # Balance target for source channels (want more outbound)
     sling_target_balanced: float = 0.50       # Balance target for balanced channels
