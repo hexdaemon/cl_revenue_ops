@@ -2656,6 +2656,12 @@ class EVRebalancer:
                 
                 score += 20
             
+            # HIVE PRIORITY: Prefer fleet channels for zero-fee internal routing
+            # This ensures sling tries hive routes first before external paths
+            if source_is_hive:
+                score += 150
+                self.plugin.log(f"HIVE BONUS: Applying +150 priority to fleet channel {cid[:12]}...", level='debug')
+            
             # RELIABILITY PENALTY: Penalize sources with recent failures
             fails = self.job_manager.get_source_failure_count(cid)
             if fails > 0:
