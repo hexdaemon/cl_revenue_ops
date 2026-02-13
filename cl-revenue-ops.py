@@ -4049,13 +4049,11 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
                 credit_msat = event.get('credit_msat', 0)
                 debit_msat = event.get('debit_msat', 0)
 
-                # Ensure values are numeric
-                if not isinstance(credit_msat, (int, float)):
-                    credit_msat = 0
-                if not isinstance(debit_msat, (int, float)):
-                    debit_msat = 0
+                # Parse msat values safely (handles Millisatoshi objects, strings, ints)
+                credit_msat = parse_msat(credit_msat)
+                debit_msat = parse_msat(debit_msat)
 
-                fee_msat = abs(int(credit_msat)) + abs(int(debit_msat))
+                fee_msat = max(abs(credit_msat), abs(debit_msat))
                 fee_sats = fee_msat // 1000
 
                 # Security: Bounds check (max 50,000 sats per fee event)
@@ -4329,12 +4327,11 @@ def _get_splice_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any
                 credit_msat = event.get('credit_msat', 0)
                 debit_msat = event.get('debit_msat', 0)
 
-                if not isinstance(credit_msat, (int, float)):
-                    credit_msat = 0
-                if not isinstance(debit_msat, (int, float)):
-                    debit_msat = 0
+                # Parse msat values safely (handles Millisatoshi objects, strings, ints)
+                credit_msat = parse_msat(credit_msat)
+                debit_msat = parse_msat(debit_msat)
 
-                fee_msat = abs(int(credit_msat)) + abs(int(debit_msat))
+                fee_msat = max(abs(credit_msat), abs(debit_msat))
                 fee_sats = fee_msat // 1000
 
                 # Security: Bounds check (max 50,000 sats per fee event)
