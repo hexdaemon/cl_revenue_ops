@@ -824,18 +824,18 @@ class FlowAnalyzer:
 
             # Calculate capacity - may be null in some CLN versions
             # Always fetch spendable/receivable first for balance calculation
-            spendable_msat = channel.get("spendable_msat", 0) or 0
-            receivable_msat = channel.get("receivable_msat", 0) or 0
+            spendable_msat = int(channel.get("spendable_msat", 0) or 0)
+            receivable_msat = int(channel.get("receivable_msat", 0) or 0)
 
             capacity_msat = channel.get("capacity_msat")
             if capacity_msat is None or capacity_msat == 0:
                 # Calculate from spendable + receivable (approximate)
                 capacity = (spendable_msat + receivable_msat) // 1000
             else:
-                capacity = capacity_msat // 1000
+                capacity = int(capacity_msat) // 1000
 
             if capacity == 0:
-                capacity = channel.get("capacity", 0)
+                capacity = int(channel.get("capacity", 0))
 
             # Get current balance for fallback inference
             our_balance = spendable_msat // 1000
@@ -975,16 +975,16 @@ class FlowAnalyzer:
 
         # Calculate capacity
         capacity_msat = channel.get("capacity_msat")
-        spendable_msat = channel.get("spendable_msat", 0) or 0
-        receivable_msat = channel.get("receivable_msat", 0) or 0
+        spendable_msat = int(channel.get("spendable_msat", 0) or 0)
+        receivable_msat = int(channel.get("receivable_msat", 0) or 0)
 
         if capacity_msat is None or capacity_msat == 0:
             capacity = (spendable_msat + receivable_msat) // 1000
         else:
-            capacity = capacity_msat // 1000
+            capacity = int(capacity_msat) // 1000
 
         if capacity == 0:
-            capacity = channel.get("capacity", 0)
+            capacity = int(channel.get("capacity", 0))
 
         our_balance = spendable_msat // 1000
 
