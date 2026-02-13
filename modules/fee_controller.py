@@ -6631,14 +6631,10 @@ class HillClimbingFeeController:
                 or target_ch.get('capacity_msat')
                 or (spendable_msat + receivable_msat)
             )
-            fee_base = (
-                local_updates.get('fee_base_msat')
-                or target_ch.get('fee_base_msat', 0)
-            )
-            fee_ppm = (
-                local_updates.get('fee_proportional_millionths')
-                or target_ch.get('fee_proportional_millionths', 0)
-            )
+            fee_base_val = local_updates.get('fee_base_msat')
+            fee_base = fee_base_val if fee_base_val is not None else target_ch.get('fee_base_msat', 0)
+            fee_ppm_val = local_updates.get('fee_proportional_millionths')
+            fee_ppm = fee_ppm_val if fee_ppm_val is not None else target_ch.get('fee_proportional_millionths', 0)
             channel_info = {
                 'channel_id': scid,
                 'peer_id': peer_id,
@@ -7134,8 +7130,10 @@ class HillClimbingFeeController:
                     local_updates = updates.get("local", {})
                     
                     # Try updates.local first, fall back to top-level
-                    fee_base = local_updates.get("fee_base_msat") or channel.get("fee_base_msat", 0)
-                    fee_ppm = local_updates.get("fee_proportional_millionths") or channel.get("fee_proportional_millionths", 0)
+                    fee_base_val = local_updates.get("fee_base_msat")
+                    fee_base = fee_base_val if fee_base_val is not None else channel.get("fee_base_msat", 0)
+                    fee_ppm_val = local_updates.get("fee_proportional_millionths")
+                    fee_ppm = fee_ppm_val if fee_ppm_val is not None else channel.get("fee_proportional_millionths", 0)
                     
                     channels[channel_id] = {
                         "channel_id": channel_id,

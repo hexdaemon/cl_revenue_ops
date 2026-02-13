@@ -3928,9 +3928,7 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
         # DUALOPEND states typically mean we initiated (dual-funded)
         # CHANNELD_AWAITING_LOCKIN typically means remote initiated
         opener = 'unknown'
-        if 'DUALOPEND' in old_state:
-            opener = 'local'  # We typically initiate dual-funded opens
-        elif cause == 'remote':
+        if cause == 'remote':
             opener = 'remote'
         elif cause == 'user':
             opener = 'local'
@@ -4057,7 +4055,7 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
                 if not isinstance(debit_msat, (int, float)):
                     debit_msat = 0
 
-                fee_msat = abs(int(credit_msat) or int(debit_msat))
+                fee_msat = abs(int(credit_msat)) + abs(int(debit_msat))
                 fee_sats = fee_msat // 1000
 
                 # Security: Bounds check (max 50,000 sats per fee event)
@@ -4336,7 +4334,7 @@ def _get_splice_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any
                 if not isinstance(debit_msat, (int, float)):
                     debit_msat = 0
 
-                fee_msat = abs(int(credit_msat) or int(debit_msat))
+                fee_msat = abs(int(credit_msat)) + abs(int(debit_msat))
                 fee_sats = fee_msat // 1000
 
                 # Security: Bounds check (max 50,000 sats per fee event)

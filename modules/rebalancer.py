@@ -1051,7 +1051,7 @@ class JobManager:
         actual_cost_sats = (fee_msat + 999) // 1000
         if actual_cost_sats > 0 and job.candidate:
             try:
-                dest_peer_id = job.candidate.to_dict().get("peer_id", "")
+                dest_peer_id = job.candidate.to_peer_id
                 self.database.record_rebalance_cost(
                     job.scid_normalized, dest_peer_id,
                     actual_cost_sats, 0)

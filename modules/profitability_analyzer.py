@@ -485,6 +485,8 @@ class ChannelProfitabilityAnalyzer:
             self.plugin.log(f"Error in profitability analysis: {e}", level='error')
             # On error, restore old timestamp so next call retries
             self._cache_timestamp = old_timestamp
+            # Return cached data instead of empty results
+            results = self._profitability_cache
         finally:
             self._analysis_lock.release()
 
@@ -2160,8 +2162,8 @@ class ChannelProfitabilityAnalyzer:
                 if (event.get("type") == "onchain_fee" and
                     event.get("txid") == funding_txid):
                     wallet_found = True
-                    wallet_credit_msat += event.get("credit_msat", 0)
-                    wallet_debit_msat += event.get("debit_msat", 0)
+                    wallet_credit_msat += self._parse_msat(event.get("credit_msat", 0))
+                    wallet_debit_msat += self._parse_msat(event.get("debit_msat", 0))
             
             if wallet_found:
                 # For wallet, the fee we paid is typically debits - credits
@@ -2310,8 +2312,8 @@ class ChannelProfitabilityAnalyzer:
             for event in events:
                 if event.get("type") == "channel" and event.get("tag") == "invoice":
                     # Debit on invoice = we paid out (could be rebalance)
-                    fees_msat = event.get("fees_msat", 0)
-                    if fees_msat and fees_msat > 0:
+                    fees_msat = self._parse_msat(event.get("fees_msat", 0))
+                    if fees_msat > 0:
                         # This is a fee we paid - likely a rebalance self-payment
                         total_fees_sats += fees_msat // 1000
             
