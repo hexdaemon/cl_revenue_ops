@@ -29,6 +29,7 @@ does not require it.
 
 import time
 import math
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
@@ -480,6 +481,7 @@ class FlowAnalyzer:
         self.database = database
         # v2.1: Kalman filter state cache (channel_id -> KalmanFlowFilter)
         self._kalman_filters: Dict[str, KalmanFlowFilter] = {}
+        self._kalman_lock = threading.Lock()
 
     # =========================================================================
     # v2.1 KALMAN FILTER METHODS
@@ -491,10 +493,11 @@ class FlowAnalyzer:
 
         Loads persisted state from database if available.
         """
-        if channel_id in self._kalman_filters:
-            return self._kalman_filters[channel_id]
+        with self._kalman_lock:
+            if channel_id in self._kalman_filters:
+                return self._kalman_filters[channel_id]
 
-        # Try to load from database
+        # Try to load from database (outside lock — DB has its own locking)
         state_dict = self.database.get_kalman_state(channel_id)
         if state_dict:
             state = KalmanFlowState.from_dict(state_dict)
@@ -502,8 +505,12 @@ class FlowAnalyzer:
         else:
             kf = KalmanFlowFilter()
 
-        self._kalman_filters[channel_id] = kf
-        return kf
+        with self._kalman_lock:
+            # Double-check: another thread may have created it while we loaded
+            if channel_id in self._kalman_filters:
+                return self._kalman_filters[channel_id]
+            self._kalman_filters[channel_id] = kf
+            return kf
 
     def _save_kalman_filter(self, channel_id: str, kf: KalmanFlowFilter) -> None:
         """Save Kalman filter state to database."""

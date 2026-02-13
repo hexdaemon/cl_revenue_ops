@@ -2082,7 +2082,7 @@ class AIMDDefenseState:
             self.fleet_threat_active = True
             self.fleet_threat_type = threat_info.get("threat_type", "unknown")
             self.fleet_threat_severity = threat_info.get("severity", 0.0)
-            self.fleet_defensive_multiplier = threat_info.get("defensive_multiplier", 1.0)
+            self.fleet_defensive_multiplier = max(1.0, min(3.0, threat_info.get("defensive_multiplier", 1.0)))
             self.fleet_threat_expires = expires
 
             # For drain attacks, also trigger local AIMD defense mode
@@ -3847,7 +3847,7 @@ class HillClimbingFeeController:
             if not peer_threat or not peer_threat.get("is_threat"):
                 return base_fee
 
-            multiplier = peer_threat.get("defensive_multiplier", 1.0)
+            multiplier = max(1.0, min(3.0, peer_threat.get("defensive_multiplier", 1.0)))
             threat_type = peer_threat.get("threat_type", "unknown")
             severity = peer_threat.get("severity", 0)
 

@@ -3059,7 +3059,7 @@ class EVRebalancer:
                 )
                 result["message"] = f"Skipped due to fleet conflict: {reason}"
                 result["fleet_conflict"] = True
-                del self._pending[candidate.to_channel]
+                self._pending.pop(candidate.to_channel, None)
                 return result
 
             # =====================================================================
@@ -3081,7 +3081,7 @@ class EVRebalancer:
                 )
                 result["message"] = "Skipped due to circular flow risk"
                 result["circular_flow_risk"] = True
-                del self._pending[candidate.to_channel]
+                self._pending.pop(candidate.to_channel, None)
                 return result
 
             # =====================================================================
@@ -3180,7 +3180,7 @@ class EVRebalancer:
                             f"({candidate.from_channel[:12]} → {candidate.to_channel[:12]})",
                             level='info'
                         )
-                        del self._pending[candidate.to_channel]
+                        self._pending.pop(candidate.to_channel, None)
                         return result
                 except Exception as e:
                     self.plugin.log(
@@ -3216,7 +3216,7 @@ class EVRebalancer:
                     f"Invalid channel IDs: from={candidate.from_channel}, to={candidate.to_channel}",
                     level='error'
                 )
-                del self._pending[candidate.to_channel]
+                self._pending.pop(candidate.to_channel, None)
                 return {
                     "success": False,
                     "error": "Invalid channel IDs - from_channel or to_channel is empty"
@@ -3249,7 +3249,7 @@ class EVRebalancer:
                 self.database.update_rebalance_result(
                     rebalance_id, 'success', 0, candidate.expected_profit_sats
                 )
-                del self._pending[candidate.to_channel]
+                self._pending.pop(candidate.to_channel, None)
                 return {"success": True, "message": "Dry run", "rebalance_id": rebalance_id}
 
             if enforce_budget:
@@ -3286,7 +3286,7 @@ class EVRebalancer:
                         level='warn'
                     )
                     # Budget exhaustion is global; don't backoff a specific channel.
-                    del self._pending[candidate.to_channel]
+                    self._pending.pop(candidate.to_channel, None)
                     return result
 
             # Async execution via JobManager (sling background jobs)
@@ -3332,10 +3332,7 @@ class EVRebalancer:
                     self.database.release_budget_reservation(rebalance_id)
                 except Exception:
                     pass
-            try:
-                del self._pending[candidate.to_channel]
-            except Exception:
-                pass
+            self._pending.pop(candidate.to_channel, None)
         
         return result
 
@@ -3388,7 +3385,7 @@ class EVRebalancer:
             
             # Estimate inbound fee (we accept a loss here, it's a diagnostic cost)
             # Note: outbound_fee is 0 because we set the probe flag above
-            inbound_fee = self._estimate_inbound_fee(dest_info.get('peer_id'))
+            inbound_fee = self._estimate_inbound_fee(dest_info.get('peer_id', ''))
             
             candidate = RebalanceCandidate(
                 source_candidates=[best_source_id],
@@ -3494,7 +3491,7 @@ class EVRebalancer:
         
         fee_ppm = t_info.get("fee_ppm", 0)
         src_ppm = f_info.get("fee_ppm", 0)
-        est_in = self._estimate_inbound_fee(t_info.get("peer_id"))
+        est_in = self._estimate_inbound_fee(t_info.get("peer_id", ""))
         
         if max_fee_sats is None:
             # Calculate a budget for a manual push based on estimated spread
@@ -3642,7 +3639,7 @@ class EVRebalancer:
         cooldown = base_cooldown * (2 ** min(failure_count, 4))
         
         if int(time.time()) - pending_time > cooldown:
-            del self._pending[channel_id]
+            self._pending.pop(channel_id, None)
             return False
         return True
     
