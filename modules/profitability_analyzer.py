@@ -377,8 +377,9 @@ class ChannelProfitabilityAnalyzer:
         self._cache_ttl: int = 300  # 5 minutes
         self._analysis_lock = threading.Lock()  # Prevent concurrent analysis stampede
 
-        # Track last health report to avoid spam
+        # Track last health/liquidity reports to avoid spam
         self._last_health_report: int = 0
+        self._last_liquidity_report: int = 0
         self._health_report_interval: int = 300  # Report every 5 minutes max
 
         # Bleeder classification cache (avoids re-running full analysis per channel)
@@ -590,18 +591,39 @@ class ChannelProfitabilityAnalyzer:
     def get_profitability(self, channel_id: str) -> Optional[ChannelProfitability]:
         """
         Get profitability data for a channel (uses cache if fresh).
-        
+
         Args:
             channel_id: Channel to look up
-            
+
         Returns:
             ChannelProfitability or None
         """
         # Check cache freshness
         if (int(time.time()) - self._cache_timestamp) > self._cache_ttl:
             self.analyze_all_channels()
-        
+
         return self._profitability_cache.get(channel_id)
+
+    def get_profitability_by_peer(self, peer_id: str) -> Optional[ChannelProfitability]:
+        """
+        Get profitability data for a peer's channel (uses cache if fresh).
+
+        Looks up by peer_id since the cache is keyed by short_channel_id.
+        If a peer has multiple channels, returns the first match.
+
+        Args:
+            peer_id: Peer node ID to look up
+
+        Returns:
+            ChannelProfitability or None
+        """
+        if (int(time.time()) - self._cache_timestamp) > self._cache_ttl:
+            self.analyze_all_channels()
+
+        for prof in self._profitability_cache.values():
+            if prof.peer_id == peer_id:
+                return prof
+        return None
     
     def get_fee_multiplier(self, channel_id: str) -> float:
         """
@@ -894,7 +916,7 @@ class ChannelProfitabilityAnalyzer:
 
         for p in self._profitability_cache.values():
             total_costs += p.costs.total_cost_sats
-            total_revenue += p.revenue.fees_earned_sats
+            total_revenue += p.revenue.total_contribution_sats
             total_volume += p.revenue.volume_routed_sats
             total_sourced_volume += p.revenue.sourced_volume_sats
             total_sourced_contribution += p.revenue.sourced_fee_contribution_sats
@@ -965,7 +987,9 @@ class ChannelProfitabilityAnalyzer:
             revenue_trend = "stable"
 
         # Calculate liquidity score from channel balance distribution
-        liquidity_score = self._calculate_liquidity_score()
+        # Build balance map once — will be reused by _report_liquidity_state_to_hive()
+        self._cached_balance_map = self._build_balance_map()
+        liquidity_score = self._calculate_liquidity_score(self._cached_balance_map)
 
         # Report to hive
         success = self.hive_bridge.report_health_update(
@@ -1002,35 +1026,22 @@ class ChannelProfitabilityAnalyzer:
         if not self.hive_bridge:
             return False
 
-        # Rate limit liquidity reports (use same interval as health)
+        # Rate limit liquidity reports independently from health reports
         now = int(time.time())
-        if (now - self._last_health_report) < self._health_report_interval:
-            return True  # Report health and liquidity together
+        if (now - self._last_liquidity_report) < self._health_report_interval:
+            return True  # Already reported recently
 
         depleted_channels = []
         saturated_channels = []
 
-        # Build balance map from listfunds (actual current balances)
-        # channel_states.sats_in/sats_out are flow totals, not balances
-        balance_map = {}  # short_channel_id -> {local_sats, capacity_sats, peer_id}
-        try:
-            funds = self.plugin.rpc.listfunds()
-            for ch in funds.get("channels", []):
-                if ch.get("state") != "CHANNELD_NORMAL":
-                    continue
-                scid = ch.get("short_channel_id")
-                if not scid:
-                    continue
-                our_msat = self._parse_msat(ch.get("our_amount_msat", 0))
-                total_msat = self._parse_msat(ch.get("amount_msat", 0))
-                balance_map[scid] = {
-                    "local_sats": our_msat // 1000,
-                    "capacity_sats": total_msat // 1000,
-                    "peer_id": ch.get("peer_id", ""),
-                }
-        except Exception as e:
-            self.plugin.log(f"LIQUIDITY: listfunds failed: {e}", level='warn')
-            return False
+        # Reuse balance map from _report_health_to_hive() if available (same cycle),
+        # otherwise build fresh. Avoids duplicate listfunds() RPC calls.
+        balance_map = getattr(self, '_cached_balance_map', None)
+        self._cached_balance_map = None  # Consume once
+        if balance_map is None:
+            balance_map = self._build_balance_map()
+            if balance_map is None:
+                return False
 
         for channel_id, prof in self._profitability_cache.items():
             bal = balance_map.get(channel_id)
@@ -1136,6 +1147,7 @@ class ChannelProfitabilityAnalyzer:
         )
 
         if success:
+            self._last_liquidity_report = now
             self.plugin.log(
                 f"LIQUIDITY: Reported to hive - depleted={len(depleted_channels)}, "
                 f"saturated={len(saturated_channels)}, "
@@ -1145,23 +1157,13 @@ class ChannelProfitabilityAnalyzer:
 
         return success
 
-    def _calculate_liquidity_score(self) -> int:
+    def _build_balance_map(self) -> Optional[Dict[str, Dict[str, Any]]]:
         """
-        Calculate liquidity balance score from channel data.
-
-        A well-balanced node has channels near 50% local balance.
-        Depleted (<20%) or saturated (>80%) channels hurt the score.
+        Build a balance map from listfunds() keyed by short_channel_id.
 
         Returns:
-            Liquidity score (0-100, higher is better)
+            Dict mapping scid -> {local_sats, capacity_sats, peer_id}, or None on failure
         """
-        if not self._profitability_cache:
-            return 50  # Default to neutral
-
-        total_penalty = 0
-        count = 0
-
-        # Build balance map from listfunds (actual current balances)
         balance_map = {}
         try:
             funds = self.plugin.rpc.listfunds()
@@ -1176,9 +1178,37 @@ class ChannelProfitabilityAnalyzer:
                 balance_map[scid] = {
                     "local_sats": our_msat // 1000,
                     "capacity_sats": total_msat // 1000,
+                    "peer_id": ch.get("peer_id", ""),
                 }
-        except Exception:
-            return 50  # Can't compute without balance data
+            return balance_map
+        except Exception as e:
+            self.plugin.log(f"LIQUIDITY: listfunds failed: {e}", level='warn')
+            return None
+
+    def _calculate_liquidity_score(self, balance_map: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
+        """
+        Calculate liquidity balance score from channel data.
+
+        A well-balanced node has channels near 50% local balance.
+        Depleted (<20%) or saturated (>80%) channels hurt the score.
+
+        Args:
+            balance_map: Pre-built balance map to avoid duplicate listfunds() calls.
+                         If None, builds one internally.
+
+        Returns:
+            Liquidity score (0-100, higher is better)
+        """
+        if not self._profitability_cache:
+            return 50  # Default to neutral
+
+        total_penalty = 0
+        count = 0
+
+        if balance_map is None:
+            balance_map = self._build_balance_map()
+            if balance_map is None:
+                return 50  # Can't compute without balance data
 
         for channel_id, prof in self._profitability_cache.items():
             bal = balance_map.get(channel_id)
@@ -1453,7 +1483,7 @@ class ChannelProfitabilityAnalyzer:
                             'direct_forward_count': pnl.get('direct_forward_count', 0),
                             'sourced_forward_count': pnl.get('sourced_forward_count', 0),
                             'total_forward_count': total_activity,
-                            'loss_per_forward': abs(net_pnl) // max(total_activity, 1),
+                            'loss_per_forward': round(abs(net_pnl) / max(total_activity, 1)),
                             # Legacy fields for backward compatibility
                             'revenue_sats': pnl.get('direct_revenue_sats', 0),
                             'forward_count': pnl.get('direct_forward_count', 0)
