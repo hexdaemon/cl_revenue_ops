@@ -1566,6 +1566,9 @@ class EVRebalancer:
             if not channels:
                 return candidates
             
+            # Note: _peer_inbound_fees cache is now populated by _get_channels_with_balances()
+            # This provides actual peer fees from listpeerchannels.updates.remote
+            
             # Hoist peer connection status call - do it once instead of per-candidate
             peer_status = self._get_peer_connection_status()
             
@@ -2349,8 +2352,12 @@ class EVRebalancer:
         """
         Get the fee for the last hop from a peer to us.
         
-        Uses memoization via self._fee_cache to avoid repeated listchannels
-        RPC calls within a single find_rebalance_candidates run.
+        ENHANCED: Now prefers actual peer fees from listpeerchannels.updates.remote
+        over gossip-based listchannels data. This is more accurate and avoids
+        stale gossip issues.
+        
+        Uses memoization via self._fee_cache to avoid repeated lookups
+        within a single find_rebalance_candidates run.
         """
         # Check cache first (memoization for this run)
         cache_key = (peer_id, int(amount_msat or 0))
@@ -2358,21 +2365,42 @@ class EVRebalancer:
             return self._fee_cache[cache_key]
         
         result = None
-        try:
-            our_id = self._get_our_node_id()
-            if not our_id: 
-                return None
-            channels = self.plugin.rpc.listchannels(source=peer_id)
-            for ch in channels.get("channels", []):
-                if ch.get("destination") == our_id:
-                    ppm = int(ch.get("fee_per_millionth", 0) or 0)
-                    base_fee_msat = int(ch.get("base_fee_millisatoshi", 0) or 0)
-                    # Convert the base fee (msat) into a ppm-equivalent at amount_msat.
-                    base_ppm = int((base_fee_msat * 1_000_000) // max(int(amount_msat or 0), 1))
-                    result = ppm + base_ppm
-                    break
-        except Exception: 
-            pass
+        
+        # PRIORITY 1: Use actual peer inbound fee from listpeerchannels.updates.remote
+        # This is the most accurate source - directly from our channel state, not gossip
+        if hasattr(self, '_peer_inbound_fees') and peer_id in self._peer_inbound_fees:
+            peer_fee_info = self._peer_inbound_fees[peer_id]
+            ppm = int(peer_fee_info.get("fee_ppm", 0) or 0)
+            base_msat = int(peer_fee_info.get("base_msat", 0) or 0)
+            # Convert base fee to ppm-equivalent at amount_msat
+            base_ppm = int((base_msat * 1_000_000) // max(int(amount_msat or 0), 1))
+            result = ppm + base_ppm
+            self.plugin.log(
+                f"LAST_HOP_FEE [{peer_id[:12]}...]: Using actual peer fee {result} PPM "
+                f"(ppm={ppm}, base_ppm={base_ppm}) from listpeerchannels",
+                level='debug'
+            )
+        else:
+            # PRIORITY 2: Fall back to gossip-based listchannels lookup
+            try:
+                our_id = self._get_our_node_id()
+                if our_id:
+                    channels = self.plugin.rpc.listchannels(source=peer_id)
+                    for ch in channels.get("channels", []):
+                        if ch.get("destination") == our_id:
+                            ppm = int(ch.get("fee_per_millionth", 0) or 0)
+                            base_fee_msat = int(ch.get("base_fee_millisatoshi", 0) or 0)
+                            # Convert the base fee (msat) into a ppm-equivalent at amount_msat.
+                            base_ppm = int((base_fee_msat * 1_000_000) // max(int(amount_msat or 0), 1))
+                            result = ppm + base_ppm
+                            self.plugin.log(
+                                f"LAST_HOP_FEE [{peer_id[:12]}...]: Using gossip fee {result} PPM "
+                                f"(fallback, peer not in channel cache)",
+                                level='debug'
+                            )
+                            break
+            except Exception: 
+                pass
         
         # Cache the result (even if None, to avoid re-querying)
         if hasattr(self, '_fee_cache'):
@@ -2683,21 +2711,29 @@ class EVRebalancer:
         channels = {}
         try:
             listfunds = self.plugin.rpc.listfunds()
-            listpeers = self.plugin.rpc.listpeers()
+            # Use listpeerchannels instead of deprecated listpeers (CLN 23.08+)
+            listpeerchannels = self.plugin.rpc.listpeerchannels()
             
-            # Build peer info map
+            # Build peer info map from listpeerchannels
             peer_info = {}
-            for peer in listpeers.get("peers", []):
-                peer_id = peer.get("id")
-                for ch in peer.get("channels", []):
-                    scid = ch.get("short_channel_id")
-                    if scid and ch.get("state") == "CHANNELD_NORMAL":
-                        peer_info[scid] = {
-                            "peer_id": peer_id,
-                            "fee_ppm": ch.get("fee_proportional_millionths", 0),
-                            "base_fee_msat": ch.get("fee_base_msat", 0),
-                            "htlcs": len(ch.get("htlcs", []))
-                        }
+            for ch in listpeerchannels.get("channels", []):
+                scid = ch.get("short_channel_id")
+                if scid and ch.get("state") == "CHANNELD_NORMAL":
+                    # Extract peer's inbound fee from updates.remote (what they charge us)
+                    updates = ch.get("updates", {})
+                    remote_updates = updates.get("remote", {})
+                    peer_inbound_fee_ppm = remote_updates.get("fee_proportional_millionths")
+                    peer_inbound_base_msat = remote_updates.get("fee_base_msat")
+                    
+                    peer_info[scid] = {
+                        "peer_id": ch.get("peer_id"),
+                        "fee_ppm": ch.get("fee_proportional_millionths", 0),
+                        "base_fee_msat": ch.get("fee_base_msat", 0),
+                        "htlcs": len(ch.get("htlcs", [])),
+                        # Peer's inbound fee - what they charge for last hop to us
+                        "peer_inbound_fee_ppm": peer_inbound_fee_ppm,
+                        "peer_inbound_base_msat": peer_inbound_base_msat
+                    }
             
             # Get balances from listfunds
             for channel in listfunds.get("channels", []):
@@ -2723,8 +2759,22 @@ class EVRebalancer:
                     "peer_id": info.get("peer_id", channel.get("peer_id", "")),
                     "fee_ppm": info.get("fee_ppm", 0),
                     "base_fee_msat": info.get("base_fee_msat", 0),
-                    "htlcs": info.get("htlcs", 0)
+                    "htlcs": info.get("htlcs", 0),
+                    # Peer's actual inbound fee from updates.remote (None if unavailable)
+                    "peer_inbound_fee_ppm": info.get("peer_inbound_fee_ppm"),
+                    "peer_inbound_base_msat": info.get("peer_inbound_base_msat")
                 }
+            
+            # Populate peer_id -> peer inbound fee cache for _get_last_hop_fee()
+            # This allows _estimate_inbound_fee() to use actual fees instead of gossip
+            self._peer_inbound_fees = {}
+            for scid, info in channels.items():
+                peer_id = info.get("peer_id")
+                if peer_id and info.get("peer_inbound_fee_ppm") is not None:
+                    self._peer_inbound_fees[peer_id] = {
+                        "fee_ppm": info["peer_inbound_fee_ppm"],
+                        "base_msat": info.get("peer_inbound_base_msat", 0) or 0
+                    }
                 
         except Exception as e:
             self.plugin.log(f"Error getting channel balances: {e}", level='error')
