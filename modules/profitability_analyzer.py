@@ -1040,18 +1040,84 @@ class ChannelProfitabilityAnalyzer:
                     "capacity_sats": capacity
                 })
 
+        # Build flow-aware enriched liquidity needs from profitability cache
+        liquidity_needs = []
+        for channel_id, prof in self._profitability_cache.items():
+            state = self.database.get_channel_state(channel_id)
+            if not state:
+                continue
+
+            local = state.get("local_balance_sats", 0)
+            capacity = state.get("capacity_sats", 0)
+            peer_id = state.get("peer_id", "")
+            flow_state = state.get("state", "balanced")
+            flow_ratio = state.get("flow_ratio", 0.5)
+
+            if capacity <= 0 or not peer_id:
+                continue
+
+            local_pct = local / capacity
+
+            # Flow-aware thresholds:
+            # Source channels earn revenue — need more outbound sooner
+            # Sink channels fill naturally — need inbound sooner
+            if flow_state == "source":
+                depleted_thresh, saturated_thresh = 0.30, 0.80
+            elif flow_state == "sink":
+                depleted_thresh, saturated_thresh = 0.20, 0.70
+            else:
+                depleted_thresh, saturated_thresh = 0.20, 0.80
+
+            need = None
+            if local_pct < depleted_thresh:
+                urgency = "critical" if local_pct < 0.10 else "high"
+                amount_needed = int(capacity * 0.5 - local)
+                need = {
+                    "need_type": "outbound",
+                    "target_peer_id": peer_id,
+                    "amount_sats": max(0, amount_needed),
+                    "urgency": urgency,
+                    "reason": "channel_depleted",
+                    "current_balance_pct": round(local_pct, 3),
+                    "flow_state": flow_state,
+                    "flow_ratio": round(flow_ratio, 3),
+                }
+            elif local_pct > saturated_thresh:
+                urgency = "critical" if local_pct > 0.95 else "high"
+                amount_needed = int(local - capacity * 0.5)
+                need = {
+                    "need_type": "inbound",
+                    "target_peer_id": peer_id,
+                    "amount_sats": max(0, amount_needed),
+                    "urgency": urgency,
+                    "reason": "channel_depleted",
+                    "current_balance_pct": round(local_pct, 3),
+                    "flow_state": flow_state,
+                    "flow_ratio": round(flow_ratio, 3),
+                }
+
+            if need:
+                liquidity_needs.append(need)
+
+        # Sort by urgency (critical > high > medium > low), take top 10
+        urgency_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        liquidity_needs.sort(key=lambda n: urgency_order.get(n.get("urgency", "low"), 3))
+        liquidity_needs = liquidity_needs[:10]
+
         # Report to hive
         success = self.hive_bridge.report_liquidity_state(
             depleted_channels=depleted_channels,
             saturated_channels=saturated_channels,
             rebalancing_active=False,  # Will be updated by rebalancer when active
-            rebalancing_peers=[]
+            rebalancing_peers=[],
+            liquidity_needs=liquidity_needs if liquidity_needs else None
         )
 
         if success:
             self.plugin.log(
                 f"LIQUIDITY: Reported to hive - depleted={len(depleted_channels)}, "
-                f"saturated={len(saturated_channels)}",
+                f"saturated={len(saturated_channels)}, "
+                f"enriched_needs={len(liquidity_needs)}",
                 level='debug'
             )
 

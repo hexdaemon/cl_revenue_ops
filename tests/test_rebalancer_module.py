@@ -912,6 +912,7 @@ class TestFleetPathInjection:
         # Set up hive bridge mock
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
         hive_bridge.query_fleet_rebalance_path.return_value = fleet_path_info
         r.hive_bridge = hive_bridge
 
@@ -1501,6 +1502,7 @@ class TestCircularRebalance:
 
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
         hive_bridge.query_fleet_rebalance_path.return_value = {
             "fleet_path_available": True,
             "savings_pct": 80,
@@ -1544,6 +1546,7 @@ class TestCircularRebalance:
 
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
         hive_bridge.query_fleet_rebalance_path.return_value = {
             "fleet_path_available": True,
             "savings_pct": 80,
@@ -1583,6 +1586,7 @@ class TestCircularRebalance:
 
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
         hive_bridge.query_fleet_rebalance_path.return_value = {
             "fleet_path_available": True,
             "savings_pct": 50,
@@ -1610,3 +1614,207 @@ class TestCircularRebalance:
         hive_bridge.execute_circular_rebalance.assert_not_called()
         # Normal sling job should proceed
         assert res["success"] is True
+
+
+# =============================================================================
+# Gap A+C: Rebalancing Activity Reporting
+# =============================================================================
+
+
+class TestGetActiveRebalancingPeers:
+    """Tests for JobManager.get_active_rebalancing_peers()."""
+
+    def test_get_active_rebalancing_peers_empty(self, mock_plugin, mock_database):
+        """No active jobs → empty list."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        assert jm.get_active_rebalancing_peers() == []
+
+    def test_get_active_rebalancing_peers_returns_source_and_dest(self, mock_plugin, mock_database):
+        """Active job → both source and dest peer IDs returned."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager, ActiveJob, JobStatus
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+
+        cand = _candidate(to_peer_id="02" + "b" * 64,
+                          primary_source_peer_id="02" + "a" * 64)
+        job = ActiveJob(
+            scid="222:333:0", scid_normalized="222x333x0",
+            source_candidates=["111:222:0"],
+            start_time=int(time.time()), candidate=cand,
+            rebalance_id=1, target_amount_sats=50000,
+            initial_local_sats=0, max_fee_ppm=2000,
+            status=JobStatus.RUNNING,
+        )
+        jm._active_jobs["222x333x0"] = job
+
+        peers = jm.get_active_rebalancing_peers()
+        assert set(peers) == {"02" + "a" * 64, "02" + "b" * 64}
+
+
+class TestRebalancingActivityReporting:
+    """Tests for _report_rebalancing_activity()."""
+
+    def test_start_job_reports_activity(self, mock_plugin, mock_database):
+        """After start_job, bridge.update_rebalancing_activity should be called."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        hive_bridge = MagicMock()
+        hive_bridge.update_rebalancing_activity.return_value = True
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
+
+        mock_plugin.rpc.listfunds.return_value = {
+            "channels": [{"short_channel_id": "222x333x0", "our_amount_msat": 0}]
+        }
+
+        cand = _candidate()
+        jm.start_job(cand, rebalance_id=1)
+
+        hive_bridge.update_rebalancing_activity.assert_called()
+        call_kwargs = hive_bridge.update_rebalancing_activity.call_args
+        assert call_kwargs[1]["rebalancing_active"] is True
+        assert len(call_kwargs[1]["rebalancing_peers"]) > 0
+
+    def test_stop_job_reports_updated_activity(self, mock_plugin, mock_database):
+        """After stop_job removes last job, activity should report active=False."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager, ActiveJob, JobStatus
+
+        hive_bridge = MagicMock()
+        hive_bridge.update_rebalancing_activity.return_value = True
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
+
+        cand = _candidate()
+        job = ActiveJob(
+            scid="222:333:0", scid_normalized="222x333x0",
+            source_candidates=["111:222:0"],
+            start_time=int(time.time()), candidate=cand,
+            rebalance_id=1, target_amount_sats=50000,
+            initial_local_sats=0, max_fee_ppm=2000,
+            status=JobStatus.RUNNING,
+        )
+        jm._active_jobs["222x333x0"] = job
+
+        jm.stop_job("222x333x0", reason="test")
+
+        # Last call should be with active=False
+        last_call = hive_bridge.update_rebalancing_activity.call_args
+        assert last_call[1]["rebalancing_active"] is False
+        assert last_call[1]["rebalancing_peers"] == []
+
+    def test_report_activity_failure_non_fatal(self, mock_plugin, mock_database):
+        """Bridge exception should not crash start_job."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        hive_bridge = MagicMock()
+        hive_bridge.update_rebalancing_activity.side_effect = Exception("RPC failed")
+
+        cfg = Config()
+        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
+
+        mock_plugin.rpc.listfunds.return_value = {
+            "channels": [{"short_channel_id": "222x333x0", "our_amount_msat": 0}]
+        }
+
+        cand = _candidate()
+        # Should not raise
+        result = jm.start_job(cand, rebalance_id=1)
+        assert result["success"] is True
+
+
+# =============================================================================
+# Gap F: Circular Flow Prevention
+# =============================================================================
+
+
+class TestCircularFlowRisk:
+    """Tests for circular flow risk check in execute_rebalance."""
+
+    def test_circular_flow_risk_skips_rebalance(self, mock_plugin, mock_database):
+        """When risk=True, rebalance should be skipped."""
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        hive_bridge = MagicMock()
+        hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.check_circular_flow_risk.return_value = {
+            "risk": True,
+            "flow_members": ["peer_src", "peer_dest", "peer_x"],
+            "total_cost_sats": 500
+        }
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        mock_database.record_rebalance = MagicMock(return_value=123)
+        mock_database.update_rebalance_result = MagicMock()
+
+        cand = _candidate()
+        result = r.execute_rebalance(cand)
+
+        assert result.get("circular_flow_risk") is True
+        assert "circular flow" in result["message"].lower()
+
+    def test_circular_flow_no_risk_proceeds(self, mock_plugin, mock_database):
+        """When risk=False, rebalance should proceed normally."""
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        hive_bridge = MagicMock()
+        hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
+        hive_bridge.query_fleet_rebalance_path.return_value = None
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        mock_database.record_rebalance = MagicMock(return_value=123)
+        mock_database.update_rebalance_result = MagicMock()
+        r.job_manager.start_job = MagicMock(return_value={"success": True})
+
+        cand = _candidate()
+        result = r.execute_rebalance(cand)
+
+        assert result.get("circular_flow_risk") is not True
+        assert result["success"] is True
+
+    def test_circular_flow_query_failure_proceeds(self, mock_plugin, mock_database):
+        """Bridge error should fail open — rebalance proceeds."""
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        hive_bridge = MagicMock()
+        hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        # Fails open
+        hive_bridge.check_circular_flow_risk.return_value = {"risk": False, "reason": "exception"}
+        hive_bridge.query_fleet_rebalance_path.return_value = None
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        mock_database.record_rebalance = MagicMock(return_value=123)
+        mock_database.update_rebalance_result = MagicMock()
+        r.job_manager.start_job = MagicMock(return_value={"success": True})
+
+        cand = _candidate()
+        result = r.execute_rebalance(cand)
+
+        # Should proceed despite query failure
+        assert result["success"] is True

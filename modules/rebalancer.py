@@ -224,6 +224,29 @@ class JobManager:
         self._last_exclusion_sync: float = 0
         self._policy_manager_ref = None
 
+    def get_active_rebalancing_peers(self) -> List[str]:
+        """Get deduplicated peer IDs from all active jobs (source + dest peers)."""
+        peers = set()
+        with self._jobs_lock:
+            for job in self._active_jobs.values():
+                if job.candidate:
+                    peers.add(job.candidate.to_peer_id)
+                    peers.add(job.candidate.primary_source_peer_id)
+        return list(peers)
+
+    def _report_rebalancing_activity(self):
+        """Push current rebalancing state to cl-hive. Non-fatal on failure."""
+        if not self.hive_bridge:
+            return
+        try:
+            peers = self.get_active_rebalancing_peers()
+            self.hive_bridge.update_rebalancing_activity(
+                rebalancing_active=len(self._active_jobs) > 0,
+                rebalancing_peers=peers
+            )
+        except Exception:
+            pass  # Non-critical reporting, never crash
+
     def _report_outcome_to_hive(self, job: ActiveJob, success: bool, cost_sats: int,
                                  amount_transferred: int = 0, failure_reason: str = "") -> None:
         """
@@ -496,14 +519,17 @@ class JobManager:
             )
             with self._jobs_lock:
                 self._active_jobs[normalized_scid] = job
-            
+
             self.plugin.log(
                 f"Sling job started for {to_scid}, tracking as {normalized_scid} "
                 f"with {len(source_scids_sling)} source candidates"
             )
-            
+
+            # Report updated rebalancing activity to fleet
+            self._report_rebalancing_activity()
+
             return {
-                "success": True, 
+                "success": True,
                 "message": f"Job started for {to_scid} with {len(source_scids_sling)} source candidates"
             }
             
@@ -556,6 +582,10 @@ class JobManager:
         # Remove from tracking regardless
         with self._jobs_lock:
             self._active_jobs.pop(normalized, None)
+
+        # Report updated rebalancing activity to fleet
+        self._report_rebalancing_activity()
+
         return True
     
     def monitor_jobs(self) -> Dict[str, Any]:
@@ -3029,6 +3059,28 @@ class EVRebalancer:
                 )
                 result["message"] = f"Skipped due to fleet conflict: {reason}"
                 result["fleet_conflict"] = True
+                del self._pending[candidate.to_channel]
+                return result
+
+            # =====================================================================
+            # PHASE 9: Circular Flow Prevention
+            # Check if source or dest peer is in a known circular flow pattern.
+            # Fails open — if check fails, rebalance proceeds.
+            # =====================================================================
+            circular_risk = self.hive_bridge.check_circular_flow_risk(
+                source_peer_id=candidate.primary_source_peer_id,
+                dest_peer_id=candidate.to_peer_id
+            )
+            if circular_risk.get("risk"):
+                flow_members = circular_risk.get("flow_members", [])
+                cost = circular_risk.get("total_cost_sats", 0)
+                self.plugin.log(
+                    f"CIRCULAR_FLOW_RISK: Skipping rebalance to {candidate.to_channel[:12]}... "
+                    f"Peers in circular flow: {flow_members}, cost: {cost} sats",
+                    level='info'
+                )
+                result["message"] = "Skipped due to circular flow risk"
+                result["circular_flow_risk"] = True
                 del self._pending[candidate.to_channel]
                 return result
 

@@ -811,7 +811,8 @@ class HiveFeeIntelligenceBridge:
         depleted_channels: List[Dict[str, Any]],
         saturated_channels: List[Dict[str, Any]],
         rebalancing_active: bool = False,
-        rebalancing_peers: List[str] = None
+        rebalancing_peers: List[str] = None,
+        liquidity_needs: List[Dict[str, Any]] = None
     ) -> bool:
         """
         Report our liquidity state to the fleet.
@@ -824,6 +825,7 @@ class HiveFeeIntelligenceBridge:
             saturated_channels: List of {peer_id, local_pct, capacity_sats}
             rebalancing_active: Whether we're currently rebalancing
             rebalancing_peers: Which peers we're rebalancing through
+            liquidity_needs: Flow-aware enriched needs (top 10)
 
         Returns:
             True if reported successfully
@@ -832,12 +834,16 @@ class HiveFeeIntelligenceBridge:
             return False
 
         try:
-            result = self.plugin.rpc.call("hive-report-liquidity-state", {
+            payload = {
                 "depleted_channels": depleted_channels,
                 "saturated_channels": saturated_channels,
                 "rebalancing_active": rebalancing_active,
                 "rebalancing_peers": rebalancing_peers or []
-            })
+            }
+            if liquidity_needs:
+                payload["liquidity_needs"] = liquidity_needs[:10]
+
+            result = self.plugin.rpc.call("hive-report-liquidity-state", payload)
 
             if result.get("error"):
                 self._log(f"Liquidity state report error: {result.get('error')}", level="debug")
@@ -852,6 +858,47 @@ class HiveFeeIntelligenceBridge:
         except Exception as e:
             self._log(f"Failed to report liquidity state: {e}", level="debug")
             self._record_failure()
+            return False
+
+    def update_rebalancing_activity(
+        self,
+        rebalancing_active: bool,
+        rebalancing_peers: List[str]
+    ) -> bool:
+        """
+        Push rebalancing activity to cl-hive (targeted update).
+
+        Only updates rebalancing_active and rebalancing_peers fields,
+        preserving existing depleted/saturated channel data.
+
+        Args:
+            rebalancing_active: Whether we're currently rebalancing
+            rebalancing_peers: Peer IDs involved in active rebalances
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        try:
+            result = self.plugin.rpc.call("hive-update-rebalancing-activity", {
+                "rebalancing_active": rebalancing_active,
+                "rebalancing_peers": rebalancing_peers or []
+            })
+
+            if result.get("error"):
+                self._log(
+                    f"Rebalancing activity update error: {result.get('error')}",
+                    level="debug"
+                )
+                return False
+
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to update rebalancing activity: {e}", level="debug")
+            # Non-critical — don't trip circuit breaker
             return False
 
     def check_rebalance_conflict(self, peer_id: str) -> Dict[str, Any]:
@@ -891,6 +938,62 @@ class HiveFeeIntelligenceBridge:
             self._log(f"Failed to check rebalance conflict: {e}", level="debug")
             self._record_failure()
             return {"conflict": False, "reason": "exception"}
+
+    def query_circular_flow_status(self) -> Dict[str, Any]:
+        """
+        Query hive-circular-flow-status RPC.
+
+        Returns:
+            Circular flow status dict, or {} on failure.
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return {}
+
+        try:
+            result = self.plugin.rpc.call("hive-circular-flow-status", {})
+            self._record_success()
+            return result or {}
+        except Exception as e:
+            self._log(f"Failed to query circular flow status: {e}", level="debug")
+            self._record_failure()
+            return {}
+
+    def check_circular_flow_risk(
+        self,
+        source_peer_id: str,
+        dest_peer_id: str
+    ) -> Dict[str, Any]:
+        """
+        Check if source or dest peer is in a known circular flow pattern.
+
+        Fails open (returns risk=False on any error).
+
+        Args:
+            source_peer_id: Source peer of the rebalance
+            dest_peer_id: Destination peer of the rebalance
+
+        Returns:
+            {"risk": True/False, "flow": {...}} if risk detected
+        """
+        try:
+            status = self.query_circular_flow_status()
+            flows = status.get("circular_flows", [])
+
+            for flow in flows:
+                members = flow.get("members", [])
+                if source_peer_id in members or dest_peer_id in members:
+                    return {
+                        "risk": True,
+                        "source_in_flow": source_peer_id in members,
+                        "dest_in_flow": dest_peer_id in members,
+                        "flow_members": members,
+                        "total_cost_sats": flow.get("total_cost_sats", 0)
+                    }
+
+            return {"risk": False}
+        except Exception as e:
+            self._log(f"Circular flow risk check failed: {e}", level="debug")
+            return {"risk": False, "reason": "exception"}
 
     # =========================================================================
     # PHASE 3: SPLICE COORDINATION
