@@ -1318,3 +1318,295 @@ class TestChannelExclusions:
         mock_plugin.rpc.call.assert_called_with("sling-except-chan", {
             "scid": "111x222x0", "remove": True
         })
+
+
+# =============================================================================
+# Hive-Aware Coordinated Rebalancing Tests
+# =============================================================================
+
+
+class TestMutualBenefitScoring:
+    """Tests for mutual benefit scoring bonuses in _select_source_candidates."""
+
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True, enable_proportional_budget=False,
+                     rebalance_min_profit=0, rebalance_min_profit_ppm=0,
+                     hive_rebalance_tolerance=0.001)
+        clboss = MagicMock()
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+
+        mock_database.get_channel_state.return_value = {
+            "state": "balanced", "sats_in": 0, "sats_out": 0
+        }
+        mock_database.get_peer_uptime_percent.return_value = 99.0
+
+        r.job_manager = MagicMock()
+        r.job_manager.active_channels = set()
+        r.job_manager.get_source_failure_count.return_value = 0
+
+        return r
+
+    def test_mutual_benefit_bonus_dest_applied(self, mock_plugin, mock_database):
+        """When dest hive peer has inbound need toward us, hive sources get +200."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        hive_peer = "02" + "f" * 64
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.return_value = True
+        r.policy_manager.should_rebalance.return_value = True
+
+        # Simulate dest peer needing inbound from us
+        r._fleet_mutual_benefit = {"02" + "b" * 64: {"inbound"}}
+
+        sources = [
+            ("500x1x0", {"peer_id": hive_peer, "spendable_sats": 500_000, "fee_ppm": 0, "capacity": 1_000_000}, 0.7),
+        ]
+
+        candidates = r._select_source_candidates(
+            sources=sources,
+            amount_needed=200_000,
+            dest_channel="999x1x0",
+            dest_outbound_fee_ppm=500,
+            dest_inbound_fee_ppm=0,
+            is_hive_destination=True,
+            dest_mutual_benefit=True
+        )
+
+        assert len(candidates) == 1
+        _, _, score, _ = candidates[0]
+        # Should include: base score + hive bonus (150) + mutual benefit dest (200)
+        # + multi-peer route (100)
+        assert score >= 450, f"Expected score >= 450, got {score}"
+        # Verify the MUTUAL BENEFIT log was emitted
+        log_msgs = [str(c) for c in mock_plugin.log.call_args_list]
+        assert any("MUTUAL BENEFIT" in m for m in log_msgs)
+
+    def test_mutual_benefit_bonus_source_applied(self, mock_plugin, mock_database):
+        """When source hive peer has outbound need toward us, source gets +200."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        hive_source_peer = "02" + "f" * 64
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.return_value = True
+        r.policy_manager.should_rebalance.return_value = True
+
+        # Source peer is depleted toward us (needs outbound)
+        r._fleet_mutual_benefit = {hive_source_peer: {"outbound"}}
+
+        sources = [
+            ("500x1x0", {"peer_id": hive_source_peer, "spendable_sats": 500_000, "fee_ppm": 0, "capacity": 1_000_000}, 0.7),
+        ]
+
+        candidates = r._select_source_candidates(
+            sources=sources,
+            amount_needed=200_000,
+            dest_channel="999x1x0",
+            dest_outbound_fee_ppm=500,
+            dest_inbound_fee_ppm=0,
+            is_hive_destination=True,
+        )
+
+        assert len(candidates) == 1
+        _, _, score, _ = candidates[0]
+        # Should include hive bonus (150) + source mutual benefit (200)
+        # + multi-peer route (100)
+        assert score >= 450, f"Expected score >= 450, got {score}"
+        log_msgs = [str(c) for c in mock_plugin.log.call_args_list]
+        assert any("depleted toward us" in m for m in log_msgs)
+
+    def test_mutual_benefit_no_fleet_needs(self, mock_plugin, mock_database):
+        """Empty fleet needs should not produce any mutual benefit bonus."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        hive_peer = "02" + "f" * 64
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.return_value = True
+        r.policy_manager.should_rebalance.return_value = True
+
+        # No fleet needs
+        r._fleet_mutual_benefit = {}
+
+        sources = [
+            ("500x1x0", {"peer_id": hive_peer, "spendable_sats": 500_000, "fee_ppm": 0, "capacity": 1_000_000}, 0.7),
+        ]
+
+        candidates_with = r._select_source_candidates(
+            sources=sources,
+            amount_needed=200_000,
+            dest_channel="999x1x0",
+            dest_outbound_fee_ppm=500,
+            dest_inbound_fee_ppm=0,
+            is_hive_destination=True,
+            dest_mutual_benefit=False
+        )
+
+        assert len(candidates_with) == 1
+        _, _, score, _ = candidates_with[0]
+        # Should only have base + hive (150) + multi-peer (100) = ~285
+        # No mutual benefit bonuses
+        log_msgs = [str(c) for c in mock_plugin.log.call_args_list]
+        assert not any("MUTUAL BENEFIT" in m for m in log_msgs)
+
+    def test_multi_peer_bonus_applied(self, mock_plugin, mock_database):
+        """When both source and dest are hive, +100 multi-peer bonus applies."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        hive_peer = "02" + "f" * 64
+        non_hive_peer = "02" + "a" * 64
+
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.side_effect = lambda pid: pid == hive_peer
+        r.policy_manager.should_rebalance.return_value = True
+
+        sources = [
+            ("500x1x0", {"peer_id": hive_peer, "spendable_sats": 500_000, "fee_ppm": 0, "capacity": 1_000_000}, 0.7),
+            ("600x2x0", {"peer_id": non_hive_peer, "spendable_sats": 500_000, "fee_ppm": 0, "capacity": 1_000_000}, 0.7),
+        ]
+
+        candidates = r._select_source_candidates(
+            sources=sources,
+            amount_needed=200_000,
+            dest_channel="999x1x0",
+            dest_outbound_fee_ppm=500,
+            dest_inbound_fee_ppm=0,
+            is_hive_destination=True,
+        )
+
+        # Both should be accepted (dest is hive, has tolerance)
+        scores = {cid: sc for cid, _, sc, _ in candidates}
+        assert "500x1x0" in scores
+        assert "600x2x0" in scores
+        # Hive source should have higher score due to HIVE BONUS + MULTI-PEER
+        assert scores["500x1x0"] > scores["600x2x0"], (
+            f"Hive source ({scores['500x1x0']}) should outscore non-hive ({scores['600x2x0']})"
+        )
+        log_msgs = [str(c) for c in mock_plugin.log.call_args_list]
+        assert any("MULTI-PEER ROUTE" in m for m in log_msgs)
+
+
+class TestCircularRebalance:
+    """Tests for circular rebalance attempt in execute_rebalance."""
+
+    def test_circular_rebalance_attempted_for_hive_peers(self, mock_plugin, mock_database):
+        """When both peers are hive and fleet path is available, circular rebalance is attempted."""
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        hive_bridge = MagicMock()
+        hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.query_fleet_rebalance_path.return_value = {
+            "fleet_path_available": True,
+            "savings_pct": 80,
+            "estimated_fleet_cost_sats": 0,
+            "estimated_external_cost_sats": 100,
+            "source_eligible_members": []
+        }
+        hive_bridge.execute_circular_rebalance.return_value = {
+            "success": True,
+            "cost_sats": 0,
+            "path": ["node1", "node2"],
+            "amount_sats": 50000
+        }
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+
+        # Both peers are hive
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.return_value = True
+
+        cand = _candidate()
+        res = r.execute_rebalance(cand)
+
+        hive_bridge.execute_circular_rebalance.assert_called_once_with(
+            from_channel=cand.from_channel,
+            to_channel=cand.to_channel,
+            amount_sats=cand.amount_sats,
+        )
+        assert res["success"] is True
+        assert res.get("circular_rebalance") is True
+        assert res.get("cost_sats") == 0
+
+    def test_circular_rebalance_fallback_to_sling(self, mock_plugin, mock_database):
+        """When circular rebalance fails, sling job should still start."""
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        hive_bridge = MagicMock()
+        hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.query_fleet_rebalance_path.return_value = {
+            "fleet_path_available": True,
+            "savings_pct": 80,
+            "estimated_fleet_cost_sats": 0,
+            "estimated_external_cost_sats": 100,
+            "source_eligible_members": []
+        }
+        # Circular rebalance fails
+        hive_bridge.execute_circular_rebalance.side_effect = Exception("RPC not available")
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.return_value = True
+
+        mock_database.record_rebalance = MagicMock(return_value=123)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+        r.job_manager.start_job = MagicMock(return_value={"success": True})
+
+        cand = _candidate()
+        res = r.execute_rebalance(cand)
+
+        # Circular was attempted but failed
+        hive_bridge.execute_circular_rebalance.assert_called_once()
+        # Sling job should still proceed
+        assert res["success"] is True
+        assert res.get("circular_rebalance") is not True
+
+    def test_circular_rebalance_skipped_for_non_hive(self, mock_plugin, mock_database):
+        """When dest is not hive, circular rebalance should NOT be attempted."""
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        hive_bridge = MagicMock()
+        hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
+        hive_bridge.query_fleet_rebalance_path.return_value = {
+            "fleet_path_available": True,
+            "savings_pct": 50,
+            "estimated_fleet_cost_sats": 10,
+            "estimated_external_cost_sats": 100,
+            "source_eligible_members": []
+        }
+
+        cand = _candidate()
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+
+        # Dest is NOT hive, source IS hive
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.side_effect = lambda pid: pid == cand.primary_source_peer_id
+
+        mock_database.record_rebalance = MagicMock(return_value=123)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+        r.job_manager.start_job = MagicMock(return_value={"success": True})
+
+        res = r.execute_rebalance(cand)
+
+        # Circular rebalance should NOT have been called
+        hive_bridge.execute_circular_rebalance.assert_not_called()
+        # Normal sling job should proceed
+        assert res["success"] is True

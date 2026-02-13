@@ -2099,6 +2099,72 @@ class HiveFeeIntelligenceBridge:
             self._log(f"Failed to query fleet rebalance path: {e}", level="debug")
             return None
 
+    def execute_circular_rebalance(
+        self,
+        from_channel: str,
+        to_channel: str,
+        amount_sats: int,
+        via_members: list = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Execute a circular rebalance through hive fleet members.
+
+        Attempts a zero-fee circular rebalance where liquidity flows through
+        fleet members who all benefit from the movement. Falls back gracefully
+        if the RPC is not available or the operation fails.
+
+        Args:
+            from_channel: Source channel SCID
+            to_channel: Destination channel SCID
+            amount_sats: Amount to rebalance
+            via_members: Optional list of member pubkeys to route through
+
+        Returns:
+            Result dict or None:
+            {
+                "success": True,
+                "cost_sats": 0,
+                "path": ["node1", "node2"],
+                "amount_sats": 50000
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {
+                "from_channel": from_channel,
+                "to_channel": to_channel,
+                "amount_sats": amount_sats,
+                "dry_run": False
+            }
+            if via_members:
+                params["via_members"] = via_members
+
+            result = self.plugin.rpc.call(
+                "hive-execute-circular-rebalance", params
+            )
+
+            if result.get("error"):
+                if "unknown" in str(result.get("error")).lower():
+                    return None
+                self._log(
+                    f"Circular rebalance error: {result.get('error')}",
+                    level="debug"
+                )
+                self._record_failure()
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(
+                f"Failed to execute circular rebalance: {e}", level="debug"
+            )
+            self._record_failure()
+            return None
+
     def report_kalman_velocity(
         self,
         channel_id: str,

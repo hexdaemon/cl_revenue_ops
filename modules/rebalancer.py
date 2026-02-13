@@ -1572,6 +1572,12 @@ class EVRebalancer:
                 self._our_node_id = ""
         return self._our_node_id
 
+    def _is_hive_peer(self, peer_id: str) -> bool:
+        """Check if a peer is a hive fleet member via policy manager."""
+        if not peer_id or not self.policy_manager:
+            return False
+        return self.policy_manager.is_hive_peer(peer_id)
+
     def _get_channel_age_days(self, channel_id: str, channel_info: Dict = None) -> int:
         """
         Get the age of a channel in days (Issue #30: Velocity Gate).
@@ -1724,7 +1730,22 @@ class EVRebalancer:
             
             # Hoist peer connection status call - do it once instead of per-candidate
             peer_status = self._get_peer_connection_status()
-            
+
+            # Query fleet balance state for mutual-benefit detection
+            self._fleet_mutual_benefit = {}  # {member_peer_id: set of need_types toward us}
+            if self.hive_bridge:
+                try:
+                    fleet_needs = self.hive_bridge.query_fleet_liquidity_needs()
+                    our_id = self._get_our_node_id()
+                    for need in fleet_needs:
+                        if need.get("peer_id") == our_id:
+                            member_id = need.get("member_id", "")
+                            need_type = need.get("need_type", "")
+                            if member_id:
+                                self._fleet_mutual_benefit.setdefault(member_id, set()).add(need_type)
+                except Exception:
+                    pass
+
             # Get set of channels with active jobs
             active_channels = set(self.job_manager.active_channels)
             
@@ -2152,17 +2173,25 @@ class EVRebalancer:
 
         # Check if destination is a hive peer (relax profitability requirements)
         is_hive_destination = False
+        dest_peer_id = dest_info.get("peer_id", "")
         if self.policy_manager:
-            dest_peer_id = dest_info.get("peer_id", "")
             if dest_peer_id:
                 policy = self.policy_manager.get_policy(dest_peer_id)
                 if policy.strategy == FeeStrategy.HIVE:
                     is_hive_destination = True
 
+        # MUTUAL BENEFIT: Check if dest hive peer has complementary imbalance
+        dest_mutual_benefit = False
+        if is_hive_destination and dest_peer_id:
+            dest_needs = getattr(self, '_fleet_mutual_benefit', {}).get(dest_peer_id, set())
+            if "inbound" in dest_needs:
+                dest_mutual_benefit = True
+
         # Get ALL profitable source candidates (sorted by score, best first)
         source_candidates = self._select_source_candidates(
             sources, rebalance_amount, dest_channel, outbound_fee_ppm, inbound_fee_ppm,
-            peer_status=peer_status, is_hive_destination=is_hive_destination
+            peer_status=peer_status, is_hive_destination=is_hive_destination,
+            dest_mutual_benefit=dest_mutual_benefit
         )
         
         if not source_candidates: 
@@ -2583,7 +2612,8 @@ class EVRebalancer:
         dest_outbound_fee_ppm: int,
         dest_inbound_fee_ppm: int,
         peer_status: Optional[Dict] = None,
-        is_hive_destination: bool = False
+        is_hive_destination: bool = False,
+        dest_mutual_benefit: bool = False
     ) -> List[Tuple[str, Dict[str, Any], int, float]]:
         """
         Select all profitable source channels for a rebalance.
@@ -2814,7 +2844,36 @@ class EVRebalancer:
             if source_is_hive:
                 score += 150
                 self.plugin.log(f"HIVE BONUS: Applying +150 priority to fleet channel {cid[:12]}...", level='debug')
-            
+
+            # MUTUAL BENEFIT: Rebalance benefits both us and the destination hive peer
+            if dest_mutual_benefit and source_is_hive:
+                score += 200
+                self.plugin.log(
+                    f"MUTUAL BENEFIT: +200 for {cid[:12]}... "
+                    f"(fleet peer's reverse channel is complementary)",
+                    level='info'
+                )
+
+            # Source-side mutual benefit: source hive peer is depleted toward us
+            if source_is_hive and pid:
+                source_needs = getattr(self, '_fleet_mutual_benefit', {}).get(pid, set())
+                if "outbound" in source_needs:
+                    score += 200
+                    self.plugin.log(
+                        f"MUTUAL BENEFIT: +200 for source {cid[:12]}... "
+                        f"(fleet peer depleted toward us, draining them helps both)",
+                        level='info'
+                    )
+
+            # MULTI-PEER ROUTE: Route traverses 2+ hive members
+            if source_is_hive and is_hive_destination:
+                score += 100
+                self.plugin.log(
+                    f"MULTI-PEER ROUTE: +100 for {cid[:12]}... "
+                    f"(route includes 2+ hive members)",
+                    level='info'
+                )
+
             # RELIABILITY PENALTY: Penalize sources with recent failures
             fails = self.job_manager.get_source_failure_count(cid)
             if fails > 0:
@@ -3044,6 +3103,38 @@ class EVRebalancer:
                             f"for {candidate.to_channel[:12]}..., max_fee_ppm capped to {candidate.max_fee_ppm}",
                             level='info'
                         )
+
+            # =====================================================================
+            # PHASE 8: Circular Rebalance Attempt
+            # When both source and dest are hive peers with a fleet path available,
+            # attempt a zero-fee circular rebalance before falling back to sling.
+            # =====================================================================
+            if (fleet_path_info and fleet_path_info.get("fleet_path_available")
+                    and self._is_hive_peer(candidate.to_peer_id)
+                    and self._is_hive_peer(candidate.primary_source_peer_id)):
+                try:
+                    circular_result = self.hive_bridge.execute_circular_rebalance(
+                        from_channel=candidate.from_channel,
+                        to_channel=candidate.to_channel,
+                        amount_sats=candidate.amount_sats,
+                    )
+                    if circular_result and circular_result.get("success"):
+                        result["success"] = True
+                        result["message"] = "Circular rebalance executed via hive"
+                        result["circular_rebalance"] = True
+                        result["cost_sats"] = circular_result.get("cost_sats", 0)
+                        self.plugin.log(
+                            f"CIRCULAR REBALANCE: {candidate.amount_sats} sats via hive "
+                            f"({candidate.from_channel[:12]} → {candidate.to_channel[:12]})",
+                            level='info'
+                        )
+                        del self._pending[candidate.to_channel]
+                        return result
+                except Exception as e:
+                    self.plugin.log(
+                        f"CIRCULAR REBALANCE: Failed, falling back to sling: {e}",
+                        level='debug'
+                    )
 
         rebalance_id: Optional[int] = None
         reserved_budget = False
