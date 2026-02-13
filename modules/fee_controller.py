@@ -6586,7 +6586,7 @@ class HillClimbingFeeController:
 
         try:
             # Resolve channel via listpeerchannels to get SCID and info
-            result = self.plugin.rpc.listpeerchannels(id=peer_id)
+            result = self.plugin.rpc.listpeerchannels(peer_id)
             target_ch = None
             for ch in result.get('channels', []):
                 if ch.get('state') != 'CHANNELD_NORMAL':
