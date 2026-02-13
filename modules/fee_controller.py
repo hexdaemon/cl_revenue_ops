@@ -2379,7 +2379,8 @@ class ThompsonAIMDState:
                 state.thompson.prior_std_fee = int(100 * (1 - confidence * 0.3))
 
         # Load common fields
-        state.ema_revenue_rate = d.get("ema_revenue_rate") or None
+        ema_val = d.get("ema_revenue_rate")
+        state.ema_revenue_rate = ema_val if ema_val is not None else None
         state.historical_curve_data = d.get("historical_curve", {})
         state.elasticity_data = d.get("elasticity", {})
         state.thompson_data = d.get("thompson", {})
@@ -6905,7 +6906,7 @@ class HillClimbingFeeController:
 
         hc_state = HillClimbState(
             last_revenue_rate=db_state.get("last_revenue_rate", 0.0),
-            ema_revenue_rate=v2_data.get("ema_revenue_rate") or None,  # Issue #28
+            ema_revenue_rate=v2_data.get("ema_revenue_rate"),  # Issue #28: None if absent, preserves 0.0
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
             trend_direction=db_state.get("trend_direction", 1),
             step_ppm=db_state.get("step_ppm", self.STEP_PPM),

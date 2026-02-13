@@ -70,6 +70,9 @@ def _safe_msat_to_sats(value: Any) -> int:
     if value is None:
         return 0
     try:
+        # Handle Millisatoshi objects (pyln-client)
+        if hasattr(value, 'millisatoshis'):
+            return int(value.millisatoshis) // 1000
         if isinstance(value, str):
             # Remove "msat" suffix if present
             value = value.replace("msat", "").strip()

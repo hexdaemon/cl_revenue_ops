@@ -4309,17 +4309,11 @@ def _get_splice_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any
             if 'splice' in tag:
                 splice_txid = event.get('txid')
 
-                # Security: Type check credit/debit values before arithmetic
-                credit = event.get('credit_msat', 0)
-                debit = event.get('debit_msat', 0)
+                # Parse msat values safely (handles Millisatoshi objects, strings, ints)
+                credit = parse_msat(event.get('credit_msat', 0))
+                debit = parse_msat(event.get('debit_msat', 0))
 
-                # Ensure values are numeric
-                if not isinstance(credit, (int, float)):
-                    credit = 0
-                if not isinstance(debit, (int, float)):
-                    debit = 0
-
-                splice_amount = (int(credit) - int(debit)) // 1000  # Convert to sats
+                splice_amount = (credit - debit) // 1000  # Convert to sats
 
             # Accumulate on-chain fees for splice
             if event_type == 'onchain_fee' and 'splice' in tag:
