@@ -1010,15 +1010,36 @@ class ChannelProfitabilityAnalyzer:
         depleted_channels = []
         saturated_channels = []
 
+        # Build balance map from listfunds (actual current balances)
+        # channel_states.sats_in/sats_out are flow totals, not balances
+        balance_map = {}  # short_channel_id -> {local_sats, capacity_sats, peer_id}
+        try:
+            funds = self.plugin.rpc.listfunds()
+            for ch in funds.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                scid = ch.get("short_channel_id")
+                if not scid:
+                    continue
+                our_msat = self._parse_msat(ch.get("our_amount_msat", 0))
+                total_msat = self._parse_msat(ch.get("amount_msat", 0))
+                balance_map[scid] = {
+                    "local_sats": our_msat // 1000,
+                    "capacity_sats": total_msat // 1000,
+                    "peer_id": ch.get("peer_id", ""),
+                }
+        except Exception as e:
+            self.plugin.log(f"LIQUIDITY: listfunds failed: {e}", level='warn')
+            return False
+
         for channel_id, prof in self._profitability_cache.items():
-            # Get channel state for balance info
-            state = self.database.get_channel_state(channel_id)
-            if not state:
+            bal = balance_map.get(channel_id)
+            if not bal:
                 continue
 
-            local = state.get("local_balance_sats", 0)
-            capacity = state.get("capacity_sats", 0)
-            peer_id = state.get("peer_id", "")
+            local = bal["local_sats"]
+            capacity = bal["capacity_sats"]
+            peer_id = bal["peer_id"]
 
             if capacity <= 0 or not peer_id:
                 continue
@@ -1026,37 +1047,38 @@ class ChannelProfitabilityAnalyzer:
             local_pct = local / capacity
 
             if local_pct < 0.20:
-                # Depleted channel - we need outbound
                 depleted_channels.append({
                     "peer_id": peer_id,
                     "local_pct": round(local_pct, 3),
                     "capacity_sats": capacity
                 })
             elif local_pct > 0.80:
-                # Saturated channel - we need inbound
                 saturated_channels.append({
                     "peer_id": peer_id,
                     "local_pct": round(local_pct, 3),
                     "capacity_sats": capacity
                 })
 
-        # Build flow-aware enriched liquidity needs from profitability cache
+        # Build flow-aware enriched liquidity needs
         liquidity_needs = []
         for channel_id, prof in self._profitability_cache.items():
-            state = self.database.get_channel_state(channel_id)
-            if not state:
+            bal = balance_map.get(channel_id)
+            if not bal:
                 continue
 
-            local = state.get("local_balance_sats", 0)
-            capacity = state.get("capacity_sats", 0)
-            peer_id = state.get("peer_id", "")
-            flow_state = state.get("state", "balanced")
-            flow_ratio = state.get("flow_ratio", 0.5)
+            local = bal["local_sats"]
+            capacity = bal["capacity_sats"]
+            peer_id = bal["peer_id"]
 
             if capacity <= 0 or not peer_id:
                 continue
 
             local_pct = local / capacity
+
+            # Get flow state from channel_states (flow analysis data)
+            state = self.database.get_channel_state(channel_id)
+            flow_state = state.get("state", "balanced") if state else "balanced"
+            flow_ratio = state.get("flow_ratio", 0.5) if state else 0.5
 
             # Flow-aware thresholds:
             # Source channels earn revenue — need more outbound sooner
@@ -1090,7 +1112,7 @@ class ChannelProfitabilityAnalyzer:
                     "target_peer_id": peer_id,
                     "amount_sats": max(0, amount_needed),
                     "urgency": urgency,
-                    "reason": "channel_depleted",
+                    "reason": "channel_saturated",
                     "current_balance_pct": round(local_pct, 3),
                     "flow_state": flow_state,
                     "flow_ratio": round(flow_ratio, 3),
@@ -1139,14 +1161,32 @@ class ChannelProfitabilityAnalyzer:
         total_penalty = 0
         count = 0
 
+        # Build balance map from listfunds (actual current balances)
+        balance_map = {}
+        try:
+            funds = self.plugin.rpc.listfunds()
+            for ch in funds.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                scid = ch.get("short_channel_id")
+                if not scid:
+                    continue
+                our_msat = self._parse_msat(ch.get("our_amount_msat", 0))
+                total_msat = self._parse_msat(ch.get("amount_msat", 0))
+                balance_map[scid] = {
+                    "local_sats": our_msat // 1000,
+                    "capacity_sats": total_msat // 1000,
+                }
+        except Exception:
+            return 50  # Can't compute without balance data
+
         for channel_id, prof in self._profitability_cache.items():
-            # Get channel state for balance info
-            state = self.database.get_channel_state(channel_id)
-            if not state:
+            bal = balance_map.get(channel_id)
+            if not bal:
                 continue
 
-            local = state.get("local_balance_sats", 0)
-            capacity = state.get("capacity_sats", 0)
+            local = bal["local_sats"]
+            capacity = bal["capacity_sats"]
             if capacity <= 0:
                 continue
 
