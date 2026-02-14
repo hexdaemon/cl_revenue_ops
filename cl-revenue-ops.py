@@ -1997,6 +1997,79 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
         return {"status": "error", "error": str(e)}
 
 
+@plugin.method("revenue-fee-anchor")
+def revenue_fee_anchor(plugin: Plugin,
+                       action: str,
+                       channel_id: str = "",
+                       target_fee_ppm: int = 0,
+                       confidence: float = 1.0,
+                       base_weight: float = 0.7,
+                       ttl_hours: int = 24,
+                       reason: str = "") -> Dict[str, Any]:
+    """
+    Manage advisor fee anchors (soft fee targets with decaying weight).
+
+    Usage:
+      lightning-cli revenue-fee-anchor action=set channel_id=X target_fee_ppm=N [confidence=0.8] [base_weight=0.7] [ttl_hours=24] [reason="..."]
+      lightning-cli revenue-fee-anchor action=list
+      lightning-cli revenue-fee-anchor action=get channel_id=X
+      lightning-cli revenue-fee-anchor action=clear channel_id=X
+      lightning-cli revenue-fee-anchor action=clear-all
+    """
+    if fee_controller is None:
+        return {"error": "Plugin not fully initialized"}
+
+    if action == "set":
+        if not channel_id:
+            return {"status": "error", "error": "channel_id is required for set"}
+        try:
+            target_fee_ppm = int(target_fee_ppm)
+        except (ValueError, TypeError):
+            return {"status": "error", "error": "target_fee_ppm must be an integer"}
+        if target_fee_ppm < 0:
+            return {"status": "error", "error": "target_fee_ppm must be non-negative"}
+
+        # SCID or PeerID format check
+        if not (re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id) or len(channel_id) == 66):
+            return {"status": "error", "error": "Invalid channel_id format"}
+
+        ttl_seconds = int(ttl_hours) * 3600
+        if ttl_seconds < 1 or ttl_seconds > 604800:
+            return {"status": "error", "error": "ttl must be between 1 second and 7 days"}
+
+        return fee_controller.set_fee_anchor(
+            channel_id=channel_id,
+            target_fee_ppm=target_fee_ppm,
+            base_weight=float(base_weight),
+            confidence=float(confidence),
+            ttl_seconds=ttl_seconds,
+            reason=reason,
+        )
+
+    elif action == "list":
+        anchors = fee_controller.list_fee_anchors()
+        return {"status": "success", "anchors": anchors, "count": len(anchors)}
+
+    elif action == "get":
+        if not channel_id:
+            return {"status": "error", "error": "channel_id is required for get"}
+        anchor = fee_controller.get_fee_anchor(channel_id)
+        if anchor is None:
+            return {"status": "success", "anchor": None, "message": "No active anchor"}
+        return {"status": "success", "anchor": anchor}
+
+    elif action == "clear":
+        if not channel_id:
+            return {"status": "error", "error": "channel_id is required for clear"}
+        return fee_controller.clear_fee_anchor(channel_id)
+
+    elif action == "clear-all":
+        return fee_controller.clear_all_fee_anchors()
+
+    else:
+        return {"status": "error", "error": f"Unknown action: {action}. Use set/list/get/clear/clear-all"}
+
+
 @plugin.method("revenue-rebalance")
 def revenue_rebalance(plugin: Plugin,
                       from_channel: str,

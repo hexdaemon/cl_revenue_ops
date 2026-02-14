@@ -782,6 +782,19 @@ class Database:
         # v2.0 Migration: Add Kalman filter columns and table
         self._migrate_kalman_schema(conn)
 
+        # Fee anchors table: advisor-set soft fee targets with decaying weight
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fee_anchors (
+                channel_id TEXT PRIMARY KEY,
+                target_fee_ppm INTEGER NOT NULL,
+                base_weight REAL NOT NULL DEFAULT 0.7,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                ttl_seconds INTEGER NOT NULL DEFAULT 86400,
+                reason TEXT DEFAULT '',
+                set_at REAL NOT NULL
+            )
+        """)
+
         self.plugin.log("Database initialized successfully")
     
 
@@ -4483,6 +4496,57 @@ class Database:
         ).fetchone()
         return row['avg_fee'] if row and row['avg_fee'] else 1.0
     
+    # =========================================================================
+    # Fee Anchors: Advisor-set soft fee targets with decaying weight
+    # =========================================================================
+
+    def set_fee_anchor(self, channel_id: str, target_fee_ppm: int,
+                       base_weight: float = 0.7, confidence: float = 1.0,
+                       ttl_seconds: int = 86400, reason: str = '') -> None:
+        """Upsert a fee anchor for a channel."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO fee_anchors
+            (channel_id, target_fee_ppm, base_weight, confidence, ttl_seconds, reason, set_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (channel_id, target_fee_ppm, base_weight, confidence,
+              ttl_seconds, reason, time.time()))
+
+    def get_fee_anchor(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Get the fee anchor for a channel, or None if not set/expired."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM fee_anchors WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        if row:
+            return dict(row)
+        return None
+
+    def get_all_fee_anchors(self) -> List[Dict[str, Any]]:
+        """Get all fee anchors."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM fee_anchors").fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_fee_anchor(self, channel_id: str) -> None:
+        """Delete the fee anchor for a channel."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM fee_anchors WHERE channel_id = ?", (channel_id,))
+
+    def delete_all_fee_anchors(self) -> None:
+        """Delete all fee anchors."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM fee_anchors")
+
+    def prune_expired_fee_anchors(self) -> int:
+        """Delete expired fee anchors. Returns count deleted."""
+        conn = self._get_connection()
+        now = time.time()
+        cursor = conn.execute(
+            "DELETE FROM fee_anchors WHERE set_at + ttl_seconds < ?", (now,)
+        )
+        return cursor.rowcount
+
     def close(self):
         """Close the thread-local database connection (if any)."""
         if hasattr(self._local, 'conn') and self._local.conn is not None:

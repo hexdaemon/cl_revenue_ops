@@ -86,6 +86,7 @@ class FeeReasonCode(Enum):
     SCARCITY = "scarcity"                             # Low outbound liquidity premium
     GOSSIP_REFRESH = "gossip_refresh"                 # Minimal nudge to refresh channel_update
     CHANNEL_OPEN = "channel_open"                     # Initial fee set on channel open
+    ANCHOR_BLEND = "anchor_blend"                     # Advisor fee anchor blended in
 
     # Heuristic modifiers (applied on top of algorithm decision)
     YOUNG_CHANNEL_CAP = "young_channel_cap"                   # Step capped for young channel
@@ -150,6 +151,29 @@ class HeuristicModifiers:
         if self.high_failure:
             codes.append(FeeReasonCode.HIGH_FAILURE_CONSERVATIVE)
         return codes
+
+
+@dataclass
+class FeeAnchor:
+    """Advisor-set soft fee target with decaying influence."""
+    channel_id: str
+    target_fee_ppm: int
+    base_weight: float       # 0.7 default (strong anchor)
+    confidence: float        # 0.0-1.0
+    ttl_seconds: int         # default 86400 (24h), max 604800 (7d)
+    reason: str
+    set_at: float            # time.time() when created
+
+    def effective_weight(self) -> float:
+        """Calculate current weight after time decay."""
+        if self.ttl_seconds <= 0:
+            return 0.0
+        age = time.time() - self.set_at
+        decay = max(0.0, 1.0 - age / self.ttl_seconds)
+        return self.base_weight * self.confidence * decay
+
+    def is_expired(self) -> bool:
+        return time.time() - self.set_at >= self.ttl_seconds
 
 
 # =============================================================================
@@ -2931,6 +2955,167 @@ class HillClimbingFeeController:
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
 
+        # Fee anchors: advisor-set soft fee targets (loaded from DB)
+        self._fee_anchors: Dict[str, FeeAnchor] = {}
+        self._load_fee_anchors()
+
+    # =========================================================================
+    # Fee Anchor Methods
+    # =========================================================================
+
+    def _load_fee_anchors(self) -> None:
+        """Load non-expired fee anchors from database into memory."""
+        try:
+            self.database.prune_expired_fee_anchors()
+            rows = self.database.get_all_fee_anchors()
+            for row in rows:
+                anchor = FeeAnchor(
+                    channel_id=row['channel_id'],
+                    target_fee_ppm=row['target_fee_ppm'],
+                    base_weight=row['base_weight'],
+                    confidence=row['confidence'],
+                    ttl_seconds=row['ttl_seconds'],
+                    reason=row.get('reason', ''),
+                    set_at=row['set_at'],
+                )
+                self._fee_anchors[anchor.channel_id] = anchor
+        except Exception as e:
+            self.plugin.log(f"Failed to load fee anchors: {e}", level='warning')
+
+    def _apply_fee_anchor(self, channel_id: str, proposed_fee: int,
+                          floor_ppm: int, ceiling_ppm: int) -> Tuple[int, Optional[str]]:
+        """
+        Blend advisor fee anchor into proposed fee.
+
+        Returns (blended_fee, reason_suffix) or (proposed_fee, None) if no anchor.
+        """
+        anchor = self._fee_anchors.get(channel_id)
+        if anchor is None:
+            return proposed_fee, None
+
+        if anchor.is_expired():
+            del self._fee_anchors[channel_id]
+            try:
+                self.database.delete_fee_anchor(channel_id)
+            except Exception:
+                pass
+            return proposed_fee, None
+
+        ew = anchor.effective_weight()
+        if ew < 0.01:
+            return proposed_fee, None
+
+        blended = int(proposed_fee * (1.0 - ew) + anchor.target_fee_ppm * ew)
+        blended = max(floor_ppm, min(ceiling_ppm, blended))
+
+        if blended != proposed_fee:
+            reason = (
+                f"anchor:{anchor.target_fee_ppm}ppm w={ew:.2f} "
+                f"({anchor.reason})" if anchor.reason else
+                f"anchor:{anchor.target_fee_ppm}ppm w={ew:.2f}"
+            )
+            self.plugin.log(
+                f"FEE_ANCHOR: {channel_id[:12]}... {proposed_fee}->{blended} ppm "
+                f"(target={anchor.target_fee_ppm} weight={ew:.3f})",
+                level='debug'
+            )
+            return blended, reason
+
+        return proposed_fee, None
+
+    def set_fee_anchor(self, channel_id: str, target_fee_ppm: int,
+                       base_weight: float = 0.7, confidence: float = 1.0,
+                       ttl_seconds: int = 86400, reason: str = '') -> Dict[str, Any]:
+        """Public API: set a fee anchor for a channel."""
+        # Validate
+        if target_fee_ppm < 0:
+            return {"error": "target_fee_ppm must be non-negative"}
+        if not (0.0 < base_weight <= 1.0):
+            return {"error": "base_weight must be in (0.0, 1.0]"}
+        if not (0.0 <= confidence <= 1.0):
+            return {"error": "confidence must be in [0.0, 1.0]"}
+        if ttl_seconds < 1 or ttl_seconds > 604800:
+            return {"error": "ttl_seconds must be between 1 and 604800 (7 days)"}
+
+        anchor = FeeAnchor(
+            channel_id=channel_id,
+            target_fee_ppm=target_fee_ppm,
+            base_weight=base_weight,
+            confidence=confidence,
+            ttl_seconds=ttl_seconds,
+            reason=reason,
+            set_at=time.time(),
+        )
+        self._fee_anchors[channel_id] = anchor
+        self.database.set_fee_anchor(
+            channel_id, target_fee_ppm, base_weight, confidence, ttl_seconds, reason
+        )
+        self.plugin.log(
+            f"Fee anchor set: {channel_id} -> {target_fee_ppm} ppm "
+            f"(weight={base_weight}, conf={confidence}, ttl={ttl_seconds}s, reason={reason})",
+            level='info'
+        )
+        return {
+            "status": "success",
+            "channel_id": channel_id,
+            "target_fee_ppm": target_fee_ppm,
+            "base_weight": base_weight,
+            "confidence": confidence,
+            "ttl_seconds": ttl_seconds,
+            "reason": reason,
+        }
+
+    def get_fee_anchor(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Public API: get fee anchor for a channel."""
+        anchor = self._fee_anchors.get(channel_id)
+        if anchor is None or anchor.is_expired():
+            return None
+        return {
+            "channel_id": anchor.channel_id,
+            "target_fee_ppm": anchor.target_fee_ppm,
+            "base_weight": anchor.base_weight,
+            "confidence": anchor.confidence,
+            "ttl_seconds": anchor.ttl_seconds,
+            "reason": anchor.reason,
+            "set_at": anchor.set_at,
+            "effective_weight": anchor.effective_weight(),
+            "remaining_seconds": max(0, anchor.ttl_seconds - (time.time() - anchor.set_at)),
+        }
+
+    def list_fee_anchors(self) -> List[Dict[str, Any]]:
+        """Public API: list all active fee anchors."""
+        result = []
+        for cid, anchor in list(self._fee_anchors.items()):
+            if anchor.is_expired():
+                del self._fee_anchors[cid]
+                continue
+            result.append({
+                "channel_id": anchor.channel_id,
+                "target_fee_ppm": anchor.target_fee_ppm,
+                "base_weight": anchor.base_weight,
+                "confidence": anchor.confidence,
+                "ttl_seconds": anchor.ttl_seconds,
+                "reason": anchor.reason,
+                "set_at": anchor.set_at,
+                "effective_weight": anchor.effective_weight(),
+                "remaining_seconds": max(0, anchor.ttl_seconds - (time.time() - anchor.set_at)),
+            })
+        return result
+
+    def clear_fee_anchor(self, channel_id: str) -> Dict[str, Any]:
+        """Public API: remove fee anchor for a channel."""
+        if channel_id in self._fee_anchors:
+            del self._fee_anchors[channel_id]
+        self.database.delete_fee_anchor(channel_id)
+        return {"status": "success", "channel_id": channel_id}
+
+    def clear_all_fee_anchors(self) -> Dict[str, Any]:
+        """Public API: remove all fee anchors."""
+        count = len(self._fee_anchors)
+        self._fee_anchors.clear()
+        self.database.delete_all_fee_anchors()
+        return {"status": "success", "cleared": count}
+
     # =========================================================================
     # Thompson Sampling + AIMD Helper Methods (v1.7.0)
     # =========================================================================
@@ -4056,6 +4241,18 @@ class HillClimbingFeeController:
                 pruned += db_pruned
         except Exception as e:
             self.plugin.log(f"GC: Error pruning database states: {e}", level='warning')
+
+        # Prune expired fee anchors
+        try:
+            expired = self.database.prune_expired_fee_anchors()
+            if expired > 0:
+                # Also remove from in-memory cache
+                for cid in list(self._fee_anchors.keys()):
+                    if self._fee_anchors[cid].is_expired():
+                        del self._fee_anchors[cid]
+                pruned += expired
+        except Exception as e:
+            self.plugin.log(f"GC: Error pruning fee anchors: {e}", level='warning')
 
         if pruned > 0:
             self.plugin.log(
@@ -5662,6 +5859,13 @@ class HillClimbingFeeController:
                         )
                         new_fee_ppm = blended_fee
 
+            # Fee anchor blend (advisor soft target)
+            new_fee_ppm, anchor_reason = self._apply_fee_anchor(
+                channel_id, new_fee_ppm, floor_ppm, effective_ceiling
+            )
+            if anchor_reason:
+                decision_reason = f"{decision_reason}+{anchor_reason}"
+
             # Defense multiplier -- skip in Thompson path: already applied inside aimd.apply_to_fee()
             if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not self.ENABLE_THOMPSON_AIMD:
                 defense_fee = self._apply_defense_multiplier(peer_id, new_fee_ppm)
@@ -6066,6 +6270,13 @@ class HillClimbingFeeController:
                             level='debug'
                         )
                         new_fee_ppm = blended_fee
+
+            # Fee anchor blend (advisor soft target)
+            new_fee_ppm, anchor_reason = self._apply_fee_anchor(
+                channel_id, new_fee_ppm, floor_ppm, effective_ceiling
+            )
+            if anchor_reason:
+                decision_reason = f"{decision_reason}+{anchor_reason}"
 
             # =================================================================
             # YIELD OPTIMIZATION PHASE 2: Defense Multiplier
