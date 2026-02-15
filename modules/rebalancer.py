@@ -1275,7 +1275,29 @@ class JobManager:
 
         try:
             result = self.plugin.rpc.call("sling-once", params)
-            return {"success": True, "message": "sling-once completed", "raw": result}
+
+            # Try to derive actual fees from sling stats (best-effort)
+            fee_sats = 0
+            try:
+                st = self.plugin.rpc.call("sling-stats", {"scid": sling_scid, "json": True})
+                # sling-stats may return a dict or a list of dicts
+                if isinstance(st, list) and st:
+                    st = st[0]
+                if isinstance(st, dict):
+                    # Preferred: explicit totals
+                    fee_sats = int(st.get("fee_total_sats") or 0)
+                    if not fee_sats:
+                        fee_msat = int(st.get("fee_total_msat") or 0)
+                        fee_sats = fee_msat // 1000 if fee_msat else 0
+                    # Fallback: weighted avg fee ppm
+                    if fee_sats == 0:
+                        w_feeppm = st.get("w_feeppm")
+                        if w_feeppm is not None and amount > 0:
+                            fee_sats = int((amount * int(w_feeppm) + 999_999) // 1_000_000)
+            except Exception:
+                pass
+
+            return {"success": True, "message": "sling-once completed", "raw": result, "actual_fee_sats": fee_sats}
         except RpcError as e:
             err = str(e)
             # Auto-heal: stale job locks. If sling says a job is already running for this scid,
@@ -1285,7 +1307,24 @@ class JobManager:
                     self.plugin.log(f"Sling job lock detected for {sling_scid}. Clearing sling jobs and retrying once.", level='warn')
                     self.plugin.rpc.call("sling-deletejob", {"job": "all"})
                     result = self.plugin.rpc.call("sling-once", params)
-                    return {"success": True, "message": "sling-once completed (after deletejob)", "raw": result}
+                    # best-effort fee calc on retry as well
+                    fee_sats = 0
+                    try:
+                        st = self.plugin.rpc.call("sling-stats", {"scid": sling_scid, "json": True})
+                        if isinstance(st, list) and st:
+                            st = st[0]
+                        if isinstance(st, dict):
+                            fee_sats = int(st.get("fee_total_sats") or 0)
+                            if not fee_sats:
+                                fee_msat = int(st.get("fee_total_msat") or 0)
+                                fee_sats = fee_msat // 1000 if fee_msat else 0
+                            if fee_sats == 0:
+                                w_feeppm = st.get("w_feeppm")
+                                if w_feeppm is not None and amount > 0:
+                                    fee_sats = int((amount * int(w_feeppm) + 999_999) // 1_000_000)
+                    except Exception:
+                        pass
+                    return {"success": True, "message": "sling-once completed (after deletejob)", "raw": result, "actual_fee_sats": fee_sats}
                 except Exception as e2:
                     return {"success": False, "error": f"sling-once RPC error (job lock retry failed): {e2}"}
 
@@ -3525,7 +3564,8 @@ class EVRebalancer:
 
             # Update database with outcome
             if result.get("success"):
-                self.database.update_rebalance_result(rebalance_id, 'success')
+                fee_sats = result.get("actual_fee_sats")
+                self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=fee_sats)
             else:
                 self.database.update_rebalance_result(
                     rebalance_id, 'failed',
@@ -3630,8 +3670,20 @@ class EVRebalancer:
         )
 
         if once_result.get("success"):
-            self.database.update_rebalance_result(rebalance_id, 'success')
-            result = {"success": True, "message": once_result.get("message", "completed")}
+            fee_sats = once_result.get("actual_fee_sats")
+            self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=fee_sats)
+            if fee_sats and fee_sats > 0:
+                try:
+                    self.database.record_rebalance_cost(
+                        channel_id=to_channel,
+                        peer_id=t_info.get("peer_id", ""),
+                        cost_sats=int(fee_sats),
+                        amount_sats=amount_sats,
+                        timestamp=int(time.time())
+                    )
+                except Exception:
+                    pass
+            result = {"success": True, "message": once_result.get("message", "completed"), "actual_fee_sats": fee_sats}
         else:
             self.database.update_rebalance_result(
                 rebalance_id, 'failed',
