@@ -216,6 +216,12 @@ class JobManager:
         # Chunk size for sling rebalances (sats per attempt)
         self.chunk_size_sats = getattr(config, 'sling_chunk_size_sats', 500000)
 
+        # AskRene integration (read-only): use constraints for preflight sizing + intelligence.
+        self._askrene_cache_ts = 0
+        self._askrene_cache: Dict[str, int] = {}  # short_channel_id_dir -> maximum_msat
+        self.askrene_layer = getattr(config, 'askrene_layer', 'xpay')
+        self.askrene_max_age_sec = getattr(config, 'askrene_max_age_sec', 900)
+
         # Source reliability tracking
         self.source_failure_counts: Dict[str, float] = {}
         self.last_decay_time = time.time()
@@ -1251,13 +1257,93 @@ class JobManager:
             level='info'
         )
 
+        # AskRene preflight sizing: if AskRene says the channel/direction has a lower maximum,
+        # shrink the attempt so we fail less and learn faster.
+        try:
+            max_sats = self._askrene_max_sats_for_scid_dir(sling_scid)
+            if max_sats is not None and max_sats > 0 and amount > max_sats:
+                self.plugin.log(
+                    f"AskRene preflight: capping sling-once amount {amount} -> {max_sats} sats for {sling_scid}",
+                    level='info'
+                )
+                amount = max_sats
+                params["amount"] = amount
+                params["onceamount"] = amount
+        except Exception as e:
+            # Never block execution on AskRene parsing issues
+            self.plugin.log(f"AskRene preflight failed (ignored): {e}", level='debug')
+
         try:
             result = self.plugin.rpc.call("sling-once", params)
             return {"success": True, "message": "sling-once completed", "raw": result}
         except RpcError as e:
+            err = str(e)
+            # Auto-heal: stale job locks. If sling says a job is already running for this scid,
+            # clear job registry and retry once.
+            if "already a job for that scid running" in err.lower():
+                try:
+                    self.plugin.log(f"Sling job lock detected for {sling_scid}. Clearing sling jobs and retrying once.", level='warn')
+                    self.plugin.rpc.call("sling-deletejob", {"job": "all"})
+                    result = self.plugin.rpc.call("sling-once", params)
+                    return {"success": True, "message": "sling-once completed (after deletejob)", "raw": result}
+                except Exception as e2:
+                    return {"success": False, "error": f"sling-once RPC error (job lock retry failed): {e2}"}
+
             return {"success": False, "error": f"sling-once RPC error: {e}"}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _askrene_refresh_cache(self) -> None:
+        """Refresh AskRene constraints cache (best-effort).
+
+        Stores short_channel_id_dir -> maximum_msat for the configured layer.
+        Uses a time-based cache to avoid hammering RPC.
+        """
+        now = int(time.time())
+        if self._askrene_cache_ts and (now - self._askrene_cache_ts) < 30:
+            return
+        try:
+            res = self.plugin.rpc.call("askrene-listlayers", {"layer": self.askrene_layer})
+            layers = res.get("layers", [])
+            cache: Dict[str, int] = {}
+            for layer in layers:
+                if layer.get("layer") != self.askrene_layer:
+                    continue
+                for c in layer.get("constraints", []) or []:
+                    scid_dir = c.get("short_channel_id_dir")
+                    ts = int(c.get("timestamp") or 0)
+                    max_msat = int(c.get("maximum_msat") or 0)
+                    if not scid_dir or max_msat <= 0:
+                        continue
+                    # Age filter
+                    if ts and (now - ts) > int(self.askrene_max_age_sec):
+                        continue
+                    # Keep the tightest constraint if multiple
+                    if scid_dir not in cache or max_msat < cache[scid_dir]:
+                        cache[scid_dir] = max_msat
+            self._askrene_cache = cache
+            self._askrene_cache_ts = now
+        except Exception:
+            # Silent: AskRene is optional; sling will still function.
+            return
+
+    def _askrene_max_sats_for_scid_dir(self, sling_scid: str) -> Optional[int]:
+        """Return the tightest AskRene constraint (in sats) for a given scid (either dir).
+
+        We don't always know the correct /0 vs /1 mapping for pull/push here,
+        so we take the minimum across both directions when present.
+        """
+        self._askrene_refresh_cache()
+        best_msat = None
+        for suffix in ("/0", "/1"):
+            key = f"{sling_scid}{suffix}"
+            v = self._askrene_cache.get(key)
+            if v is None:
+                continue
+            best_msat = v if best_msat is None else min(best_msat, v)
+        if best_msat is None:
+            return None
+        return max(0, best_msat // 1000)
 
     def sync_peer_exclusions(self, policy_manager=None) -> int:
         """
