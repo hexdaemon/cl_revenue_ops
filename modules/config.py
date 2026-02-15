@@ -47,6 +47,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'sling_job_timeout_seconds': int,
     'sling_chunk_size_sats': int,
     'sling_max_hops': int,
+    'askrene_layer': str,
+    'askrene_max_age_sec': int,
     'sling_parallel_jobs': int,
     'sling_target_sink': float,
     'sling_target_source': float,
@@ -174,6 +176,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_interval': (60, 86400),
     'max_concurrent_jobs': (1, 20),
     'sling_job_timeout_seconds': (60, 7200),
+    'askrene_max_age_sec': (10, 86400),
     'base_fee_msat': (0, 10000),
     'rebalance_min_profit': (0, 1000000),
     'rebalance_min_amount': (1000, 50000000),
@@ -263,6 +266,10 @@ class Config:
     max_concurrent_jobs: int = 5              # Max number of concurrent sling rebalance jobs
     sling_job_timeout_seconds: int = 7200     # Timeout for sling jobs (2 hours default)
     sling_chunk_size_sats: int = 500000       # Amount per sling rebalance attempt (500k sats)
+
+    # AskRene (xpay) constraint integration
+    askrene_layer: str = 'xpay'               # Layer name for askrene-listlayers
+    askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
 
     # Enhanced Sling Integration (Phase 6)
     sling_max_hops: int = 5                   # Max route hops (shorter = faster, more reliable)
