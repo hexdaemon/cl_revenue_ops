@@ -692,6 +692,30 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-boltz-auto',
+    default='true',
+    description='Enable automatic CLN wallet funding for Boltz loop-in swaps (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-loop-in-max-sats',
+    default='10000000',
+    description='Per-swap auto-funding cap for Boltz loop-ins in sats (default: 10,000,000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-loop-in-daily-cap-sats',
+    default='25000000',
+    description='24h auto-funding cap for Boltz loop-ins in sats (default: 25,000,000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-loop-in-min-conf',
+    default='1',
+    description='Minimum UTXO confirmations for auto-funding Boltz loop-ins (default: 1)'
+)
+
+plugin.add_option(
     name='revenue-ops-proportional-budget',
     default='true',
     description='If true, scale daily budget based on 24h revenue (default: true)'
@@ -838,6 +862,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalancer_plugin=options['revenue-ops-rebalancer'],
         daily_budget_sats=int(options['revenue-ops-daily-budget-sats']),
         min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
+        revenue_boltz_auto=options['revenue-boltz-auto'].lower() == 'true',
+        boltz_loop_in_max_sats=int(options['revenue-ops-boltz-loop-in-max-sats']),
+        boltz_loop_in_daily_cap_sats=int(options['revenue-ops-boltz-loop-in-daily-cap-sats']),
+        boltz_loop_in_min_confirmations=int(options['revenue-ops-boltz-loop-in-min-conf']),
         enable_proportional_budget=options['revenue-ops-proportional-budget'].lower() == 'true',
         proportional_budget_pct=float(options['revenue-ops-proportional-budget-pct']),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',

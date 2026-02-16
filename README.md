@@ -308,6 +308,17 @@ All options can be set in your CLN config file or via `revenue-config set`.
 | `revenue-ops-proportional-budget` | `true` | Scale budget based on revenue |
 | `revenue-ops-proportional-budget-pct` | `0.30` | Percentage of revenue for budget |
 
+### Boltz Loop-In Auto-Funding
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `revenue-boltz-auto` | `true` | Kill-switch for automatic CLN wallet funding of loop-ins |
+| `revenue-ops-boltz-loop-in-max-sats` | `10000000` | Per-swap auto-funding ceiling (sats) |
+| `revenue-ops-boltz-loop-in-daily-cap-sats` | `25000000` | 24h auto-funding cap (sats) |
+| `revenue-ops-boltz-loop-in-min-conf` | `1` | Minimum confirmations for UTXOs used by auto-funding |
+
+Runtime config keys (`revenue-config set`): `revenue_boltz_auto`, `boltz_loop_in_max_sats`, `boltz_loop_in_daily_cap_sats`, `boltz_loop_in_min_confirmations`.
+
 ### Advanced Fee Settings
 
 | Option | Default | Description |

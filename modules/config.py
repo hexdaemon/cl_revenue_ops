@@ -34,6 +34,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'max_fee_ppm': int,
     'daily_budget_sats': int,
     'min_wallet_reserve': int,
+    'revenue_boltz_auto': bool,
+    'boltz_loop_in_max_sats': int,
+    'boltz_loop_in_daily_cap_sats': int,
+    'boltz_loop_in_min_confirmations': int,
     'low_liquidity_threshold': float,
     'high_liquidity_threshold': float,
     'htlc_congestion_threshold': float,
@@ -120,6 +124,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'max_fee_ppm': (1, 100000),
     'daily_budget_sats': (0, 10000000),
     'min_wallet_reserve': (0, 100000000),
+    'boltz_loop_in_max_sats': (25000, 100000000),
+    'boltz_loop_in_daily_cap_sats': (25000, 250000000),
+    'boltz_loop_in_min_confirmations': (1, 100),
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
@@ -237,6 +244,12 @@ class Config:
     # Global Capital Controls
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
+
+    # Boltz loop-in auto-funding safety controls
+    revenue_boltz_auto: bool = True                 # Kill-switch for automatic loop-in funding
+    boltz_loop_in_max_sats: int = 10_000_000        # Per-swap max auto-funded amount
+    boltz_loop_in_daily_cap_sats: int = 25_000_000  # 24h aggregate auto-funding cap
+    boltz_loop_in_min_confirmations: int = 1        # CLN wallet UTXO minconf for withdraw
     
     # Revenue-Proportional Budget (Phase 7: Dynamic Budget Scaling)
     enable_proportional_budget: bool = True   # Scale daily budget based on revenue (Issue #22)
@@ -543,6 +556,10 @@ class ConfigSnapshot:
     # Global Capital Controls
     daily_budget_sats: int
     min_wallet_reserve: int
+    revenue_boltz_auto: bool
+    boltz_loop_in_max_sats: int
+    boltz_loop_in_daily_cap_sats: int
+    boltz_loop_in_min_confirmations: int
     
     # Revenue-Proportional Budget
     enable_proportional_budget: bool

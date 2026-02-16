@@ -15,6 +15,7 @@ import hashlib
 import secrets
 import subprocess
 import tempfile
+from urllib.parse import urlparse
 from typing import Dict, Any, Optional, Tuple, List
 
 try:
@@ -27,6 +28,10 @@ DEFAULT_BOLTZ_API = os.environ.get("BOLTZ_API", "https://api.boltz.exchange/v2")
 
 
 class BoltzSwapManager:
+    DEFAULT_LOOP_IN_MAX_SATS = 10_000_000
+    DEFAULT_LOOP_IN_DAILY_CAP_SATS = 25_000_000
+    DEFAULT_LOOP_IN_MIN_CONF = 1
+
     def __init__(self, database, safe_plugin, config):
         self.db = database
         self.plugin = safe_plugin
@@ -46,6 +51,29 @@ class BoltzSwapManager:
             self.plugin.log(f"Boltz: {msg}", level=level)
         except Exception:
             pass
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        value: Any = default
+        if isinstance(self.config, dict):
+            value = self.config.get(key, default)
+        else:
+            value = getattr(self.config, key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        value: Any = default
+        if isinstance(self.config, dict):
+            value = self.config.get(key, default)
+        else:
+            value = getattr(self.config, key, default)
+        try:
+            return int(value)
+        except Exception:
+            return default
 
     def _http_get(self, path: str, timeout: int = 15) -> Dict[str, Any]:
         if _urlreq is None:
@@ -103,7 +131,15 @@ class BoltzSwapManager:
                 timeout_block INTEGER,
                 lockup_txid TEXT,
                 claim_txid TEXT,
-                error TEXT
+                error TEXT,
+                destination_validated INTEGER NOT NULL DEFAULT 0,
+                destination_validation_note TEXT,
+                auto_funding_status TEXT,
+                auto_funding_txid TEXT,
+                auto_funding_error TEXT,
+                auto_funding_amount_sats INTEGER,
+                auto_funding_min_conf INTEGER,
+                auto_funding_updated_at INTEGER
             )
         """)
         # Keep existing installations forward-compatible with new columns.
@@ -112,9 +148,49 @@ class BoltzSwapManager:
             "target_channel_id": "TEXT",
             "target_peer_id": "TEXT",
             "bolt11_invoice": "TEXT",
+            "destination_validated": "INTEGER NOT NULL DEFAULT 0",
+            "destination_validation_note": "TEXT",
+            "auto_funding_status": "TEXT",
+            "auto_funding_txid": "TEXT",
+            "auto_funding_error": "TEXT",
+            "auto_funding_amount_sats": "INTEGER",
+            "auto_funding_min_conf": "INTEGER",
+            "auto_funding_updated_at": "INTEGER",
         })
         conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_swaps_status ON boltz_swaps(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_swaps_created ON boltz_swaps(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_swaps_auto_funding_status ON boltz_swaps(auto_funding_status)")
+
+        # Audit trail for operational and safety decisions.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS boltz_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                swap_id TEXT,
+                event_type TEXT NOT NULL,
+                level TEXT NOT NULL DEFAULT 'info',
+                message TEXT NOT NULL,
+                details_json TEXT,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_audit_swap_created ON boltz_audit_log(swap_id, created_at)")
+
+        # Ledger of loop-in auto-funding transactions and blocked attempts.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS boltz_funding_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                swap_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                txid TEXT,
+                min_conf INTEGER,
+                destination TEXT,
+                note TEXT,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_ledger_created ON boltz_funding_ledger(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_ledger_swap ON boltz_funding_ledger(swap_id, created_at)")
 
     def _ensure_columns(self, conn, columns: Dict[str, str]) -> None:
         rows = conn.execute("PRAGMA table_info(boltz_swaps)").fetchall()
@@ -139,7 +215,9 @@ class BoltzSwapManager:
             "miner_fee_lockup_sats", "miner_fee_claim_sats", "total_cost_sats",
             "cost_ppm", "status", "preimage_hash", "preimage", "claim_privkey",
             "claim_pubkey", "address", "timeout_block", "lockup_txid", "claim_txid",
-            "error"
+            "error", "destination_validated", "destination_validation_note",
+            "auto_funding_status", "auto_funding_txid", "auto_funding_error",
+            "auto_funding_amount_sats", "auto_funding_min_conf", "auto_funding_updated_at",
         ]
         values = [rec.get(f) for f in fields]
         placeholders = ",".join(["?"] * len(fields))
@@ -162,6 +240,189 @@ class BoltzSwapManager:
         ).fetchall()
         swaps = [dict(r) for r in rows]
         return swaps
+
+    def _record_audit_event(
+        self,
+        event_type: str,
+        message: str,
+        swap_id: Optional[str] = None,
+        level: str = "info",
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        conn = self.db._get_connection()
+        now = self._now_ts()
+        details_json = None
+        if details is not None:
+            try:
+                details_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                details_json = json.dumps({"details": str(details)})
+        conn.execute(
+            """
+            INSERT INTO boltz_audit_log
+            (swap_id, event_type, level, message, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (swap_id, event_type, level, message, details_json, now)
+        )
+        self._log(f"{event_type}: {message} (swap_id={swap_id})", level=level)
+
+    def _record_funding_ledger(
+        self,
+        swap_id: str,
+        amount_sats: int,
+        status: str,
+        txid: Optional[str] = None,
+        min_conf: Optional[int] = None,
+        destination: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> None:
+        conn = self.db._get_connection()
+        conn.execute(
+            """
+            INSERT INTO boltz_funding_ledger
+            (swap_id, amount_sats, status, txid, min_conf, destination, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (swap_id, int(amount_sats), status, txid, min_conf, destination, note, self._now_ts())
+        )
+
+    def _get_recent_swap_audit_events(self, swap_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        conn = self.db._get_connection()
+        rows = conn.execute(
+            """
+            SELECT id, swap_id, event_type, level, message, details_json, created_at
+            FROM boltz_audit_log
+            WHERE swap_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (swap_id, int(limit))
+        ).fetchall()
+        events = []
+        for row in rows:
+            ev = dict(row)
+            if ev.get("details_json"):
+                try:
+                    ev["details"] = json.loads(ev["details_json"])
+                except Exception:
+                    ev["details"] = {"raw": ev["details_json"]}
+            else:
+                ev["details"] = None
+            events.append(ev)
+        return events
+
+    def _get_latest_ledger_entry(self, swap_id: str) -> Optional[Dict[str, Any]]:
+        conn = self.db._get_connection()
+        row = conn.execute(
+            """
+            SELECT *
+            FROM boltz_funding_ledger
+            WHERE swap_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (swap_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _get_daily_loop_in_funded_sats(self) -> int:
+        conn = self.db._get_connection()
+        since = self._now_ts() - 86400
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount_sats), 0) AS total
+            FROM boltz_funding_ledger
+            WHERE created_at >= ? AND status = 'broadcast'
+            """,
+            (since,)
+        ).fetchone()
+        return int(row["total"]) if row and row["total"] is not None else 0
+
+    def _get_loop_in_ledger_totals(self) -> Dict[str, int]:
+        conn = self.db._get_connection()
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS count,
+                COALESCE(SUM(amount_sats), 0) AS total
+            FROM boltz_funding_ledger
+            WHERE status = 'broadcast'
+            """
+        ).fetchone()
+        return {
+            "count": int(row["count"]) if row else 0,
+            "total_sats": int(row["total"]) if row and row["total"] is not None else 0,
+        }
+
+    def _parse_bip21_address(self, bip21: Optional[str]) -> Optional[str]:
+        if not bip21 or not isinstance(bip21, str):
+            return None
+        if not bip21.lower().startswith("bitcoin:"):
+            return None
+        try:
+            parsed = urlparse(bip21)
+            return parsed.path or None
+        except Exception:
+            return None
+
+    def _validate_boltz_funding_destination(
+        self,
+        swap: Dict[str, Any],
+        funding_address: Optional[str]
+    ) -> Tuple[bool, str]:
+        if not funding_address:
+            return False, "Boltz swap missing funding address"
+
+        addr = swap.get("address")
+        lockup = swap.get("lockupAddress")
+        candidates = [v for v in (addr, lockup) if isinstance(v, str) and v.strip()]
+        if not candidates:
+            return False, "Boltz swap did not return an address/lockupAddress"
+
+        unique = {c.strip() for c in candidates}
+        if len(unique) > 1:
+            return False, "Boltz response address mismatch (address vs lockupAddress)"
+        if funding_address.strip() not in unique:
+            return False, "Funding address is not the Boltz-provided destination"
+
+        bip21_addr = self._parse_bip21_address(swap.get("bip21"))
+        if bip21_addr and bip21_addr.strip() != funding_address.strip():
+            return False, "Boltz bip21 address mismatch"
+
+        return True, "validated against Boltz swap response"
+
+    def _auto_funding_runtime_status(self) -> Dict[str, Any]:
+        enabled = self._cfg_bool("revenue_boltz_auto", True)
+        per_swap_cap = self._cfg_int("boltz_loop_in_max_sats", self.DEFAULT_LOOP_IN_MAX_SATS)
+        daily_cap = self._cfg_int("boltz_loop_in_daily_cap_sats", self.DEFAULT_LOOP_IN_DAILY_CAP_SATS)
+        daily_funded = self._get_daily_loop_in_funded_sats()
+        return {
+            "enabled": enabled,
+            "per_swap_cap_sats": per_swap_cap,
+            "daily_cap_sats": daily_cap,
+            "daily_funded_sats": daily_funded,
+            "daily_remaining_sats": max(0, daily_cap - daily_funded),
+            "min_confirmations": self._cfg_int("boltz_loop_in_min_confirmations", self.DEFAULT_LOOP_IN_MIN_CONF),
+        }
+
+    def _build_swap_auto_funding_view(self, swap: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not swap:
+            return {"runtime": self._auto_funding_runtime_status(), "swap": None}
+        return {
+            "runtime": self._auto_funding_runtime_status(),
+            "swap": {
+                "destination_validated": bool(swap.get("destination_validated")),
+                "destination_validation_note": swap.get("destination_validation_note"),
+                "status": swap.get("auto_funding_status"),
+                "txid": swap.get("auto_funding_txid"),
+                "error": swap.get("auto_funding_error"),
+                "amount_sats": swap.get("auto_funding_amount_sats"),
+                "min_conf": swap.get("auto_funding_min_conf"),
+                "updated_at": swap.get("auto_funding_updated_at"),
+                "ledger_latest": self._get_latest_ledger_entry(swap.get("id")),
+            },
+        }
 
     # ---------------------------------------------------------------------
     # Key + preimage generation
@@ -271,7 +532,8 @@ class BoltzSwapManager:
             "total_cost_sats": total_cost,
             "cost_ppm": int(total_cost * 1_000_000 / amount_sats) if amount_sats else 0,
             "limits": limits,
-            "pair_hash": btc_pair.get("hash", "")
+            "pair_hash": btc_pair.get("hash", ""),
+            "auto_funding": self._auto_funding_runtime_status(),
         }
 
     def _get_node_id(self) -> str:
@@ -346,6 +608,170 @@ class BoltzSwapManager:
 
         return {"hints": []}
 
+    def _auto_fund_loop_in_swap(self, rec: Dict[str, Any]) -> Dict[str, Any]:
+        swap_id = rec.get("id")
+        amount_sats = int(rec.get("onchain_amount_sats") or 0)
+        destination = rec.get("address")
+        min_conf = max(1, self._cfg_int("boltz_loop_in_min_confirmations", self.DEFAULT_LOOP_IN_MIN_CONF))
+        rec["auto_funding_min_conf"] = min_conf
+        rec["auto_funding_amount_sats"] = amount_sats
+        rec["auto_funding_updated_at"] = self._now_ts()
+
+        if not self._cfg_bool("revenue_boltz_auto", True):
+            rec["auto_funding_status"] = "disabled"
+            rec["auto_funding_error"] = "automatic funding disabled by revenue_boltz_auto"
+            self._record_swap(rec)
+            self._record_audit_event(
+                "loop_in_auto_funding_disabled",
+                "Auto-funding skipped by kill switch",
+                swap_id=swap_id,
+                details={"amount_sats": amount_sats}
+            )
+            self._record_funding_ledger(
+                swap_id=swap_id,
+                amount_sats=amount_sats,
+                status="disabled",
+                min_conf=min_conf,
+                destination=destination,
+                note="kill-switch revenue_boltz_auto=false"
+            )
+            return {"funded": False, "status": "disabled", "reason": rec["auto_funding_error"]}
+
+        per_swap_cap = self._cfg_int("boltz_loop_in_max_sats", self.DEFAULT_LOOP_IN_MAX_SATS)
+        if amount_sats > per_swap_cap:
+            rec["auto_funding_status"] = "blocked_per_swap_cap"
+            rec["auto_funding_error"] = f"amount {amount_sats} exceeds per-swap cap {per_swap_cap}"
+            self._record_swap(rec)
+            self._record_audit_event(
+                "loop_in_auto_funding_blocked",
+                "Per-swap cap exceeded",
+                swap_id=swap_id,
+                level="warn",
+                details={"amount_sats": amount_sats, "per_swap_cap_sats": per_swap_cap}
+            )
+            self._record_funding_ledger(
+                swap_id=swap_id,
+                amount_sats=amount_sats,
+                status="blocked_per_swap_cap",
+                min_conf=min_conf,
+                destination=destination,
+                note=rec["auto_funding_error"]
+            )
+            return {"funded": False, "status": "blocked_per_swap_cap", "reason": rec["auto_funding_error"]}
+
+        daily_cap = self._cfg_int("boltz_loop_in_daily_cap_sats", self.DEFAULT_LOOP_IN_DAILY_CAP_SATS)
+        daily_total = self._get_daily_loop_in_funded_sats()
+        if daily_total + amount_sats > daily_cap:
+            rec["auto_funding_status"] = "blocked_daily_cap"
+            rec["auto_funding_error"] = (
+                f"daily cap exceeded: {daily_total} + {amount_sats} > {daily_cap}"
+            )
+            self._record_swap(rec)
+            self._record_audit_event(
+                "loop_in_auto_funding_blocked",
+                "Daily cap exceeded",
+                swap_id=swap_id,
+                level="warn",
+                details={
+                    "daily_funded_sats": daily_total,
+                    "attempt_amount_sats": amount_sats,
+                    "daily_cap_sats": daily_cap
+                }
+            )
+            self._record_funding_ledger(
+                swap_id=swap_id,
+                amount_sats=amount_sats,
+                status="blocked_daily_cap",
+                min_conf=min_conf,
+                destination=destination,
+                note=rec["auto_funding_error"]
+            )
+            return {"funded": False, "status": "blocked_daily_cap", "reason": rec["auto_funding_error"]}
+
+        if self._cfg_bool("dry_run", False):
+            rec["auto_funding_status"] = "dry_run"
+            rec["auto_funding_error"] = "dry_run=true (not broadcasting on-chain funding tx)"
+            self._record_swap(rec)
+            self._record_audit_event(
+                "loop_in_auto_funding_dry_run",
+                "Dry run mode prevented on-chain funding",
+                swap_id=swap_id,
+                details={"amount_sats": amount_sats, "min_conf": min_conf}
+            )
+            self._record_funding_ledger(
+                swap_id=swap_id,
+                amount_sats=amount_sats,
+                status="dry_run",
+                min_conf=min_conf,
+                destination=destination,
+                note=rec["auto_funding_error"]
+            )
+            return {"funded": False, "status": "dry_run", "reason": rec["auto_funding_error"]}
+
+        withdraw_result: Dict[str, Any]
+        try:
+            try:
+                withdraw_result = self.rpc.withdraw(
+                    destination=destination,
+                    satoshi=amount_sats,
+                    minconf=min_conf
+                )
+            except Exception:
+                # Backward compatibility for CLN variants accepting sat strings.
+                withdraw_result = self.rpc.withdraw(
+                    destination=destination,
+                    satoshi=f"{amount_sats}sat",
+                    minconf=min_conf
+                )
+        except Exception as e:
+            rec["auto_funding_status"] = "withdraw_failed"
+            rec["auto_funding_error"] = str(e)
+            rec["auto_funding_updated_at"] = self._now_ts()
+            self._record_swap(rec)
+            self._record_funding_ledger(
+                swap_id=swap_id,
+                amount_sats=amount_sats,
+                status="withdraw_failed",
+                min_conf=min_conf,
+                destination=destination,
+                note=str(e)
+            )
+            self._record_audit_event(
+                "loop_in_auto_funding_failed",
+                "CLN wallet withdraw failed",
+                swap_id=swap_id,
+                level="warn",
+                details={"error": str(e), "amount_sats": amount_sats, "min_conf": min_conf}
+            )
+            return {"funded": False, "status": "withdraw_failed", "reason": str(e)}
+
+        txid = (
+            withdraw_result.get("txid")
+            or withdraw_result.get("txid_hex")
+            or withdraw_result.get("id")
+        )
+        rec["auto_funding_status"] = "broadcast"
+        rec["auto_funding_txid"] = txid
+        rec["auto_funding_error"] = None
+        rec["auto_funding_updated_at"] = self._now_ts()
+        self._record_swap(rec)
+        self._record_funding_ledger(
+            swap_id=swap_id,
+            amount_sats=amount_sats,
+            status="broadcast",
+            txid=txid,
+            min_conf=min_conf,
+            destination=destination,
+            note="CLN withdraw broadcast"
+        )
+        self._record_audit_event(
+            "loop_in_auto_funding_broadcast",
+            "Auto-funded loop-in with CLN wallet",
+            swap_id=swap_id,
+            details={"txid": txid, "amount_sats": amount_sats, "min_conf": min_conf}
+        )
+        return {"funded": True, "status": "broadcast", "txid": txid, "withdraw_result": withdraw_result}
+
     def loop_out(self, amount_sats: int, address: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
         if amount_sats < 25000:
             return {"error": "amount_sats must be >= 25,000"}
@@ -361,7 +787,7 @@ class BoltzSwapManager:
             return {"error": f"amount_sats above maximum {limits.get('maximal')}"}
 
         if dry_run:
-            return {"dry_run": True, "quote": quote}
+            return {"dry_run": True, "quote": quote, "auto_funding": self._auto_funding_runtime_status()}
 
         # address from node if not provided
         if not address:
@@ -425,6 +851,14 @@ class BoltzSwapManager:
             "lockup_txid": None,
             "claim_txid": None,
             "error": None,
+            "destination_validated": 0,
+            "destination_validation_note": "not_applicable_loop_out",
+            "auto_funding_status": "not_applicable",
+            "auto_funding_txid": None,
+            "auto_funding_error": None,
+            "auto_funding_amount_sats": None,
+            "auto_funding_min_conf": None,
+            "auto_funding_updated_at": None,
         }
         self._record_swap(rec)
 
@@ -446,7 +880,11 @@ class BoltzSwapManager:
             rec["error"] = str(e)
             rec["updated_at"] = self._now_ts()
             self._record_swap(rec)
-            return {"error": f"payment failed: {e}", "swap_id": swap_id}
+            return {
+                "error": f"payment failed: {e}",
+                "swap_id": swap_id,
+                "auto_funding": self._auto_funding_runtime_status()
+            }
 
         # Wait for lockup
         lockup = self._wait_for_lockup(swap_id)
@@ -455,7 +893,11 @@ class BoltzSwapManager:
             rec["error"] = lockup.get("error")
             rec["updated_at"] = self._now_ts()
             self._record_swap(rec)
-            return {"error": lockup.get("error"), "swap_id": swap_id}
+            return {
+                "error": lockup.get("error"),
+                "swap_id": swap_id,
+                "auto_funding": self._auto_funding_runtime_status()
+            }
         rec["lockup_txid"] = lockup.get("lockup_txid")
         rec["status"] = "locked"
         rec["updated_at"] = self._now_ts()
@@ -475,6 +917,7 @@ class BoltzSwapManager:
                 "cost_ppm": rec["cost_ppm"],
                 "lockup_txid": rec.get("lockup_txid"),
                 "claim_result": claim_res,
+                "auto_funding": self._auto_funding_runtime_status(),
             }
         except Exception as e:
             rec["status"] = "claim_failed"
@@ -488,6 +931,7 @@ class BoltzSwapManager:
                 "preimage": preimage.hex(),
                 "claim_privkey": claim_priv,
                 "claim_pubkey": claim_pub,
+                "auto_funding": self._auto_funding_runtime_status(),
             }
 
     def loop_in(
@@ -496,23 +940,33 @@ class BoltzSwapManager:
         channel_id: Optional[str] = None,
         peer_id: Optional[str] = None
     ) -> Dict[str, Any]:
+        runtime_auto = self._auto_funding_runtime_status()
         if amount_sats < 25000:
-            return {"error": "amount_sats must be >= 25,000"}
+            return {"error": "amount_sats must be >= 25,000", "auto_funding": runtime_auto}
+
+        per_swap_cap = self._cfg_int("boltz_loop_in_max_sats", self.DEFAULT_LOOP_IN_MAX_SATS)
+        if amount_sats > per_swap_cap:
+            return {
+                "error": f"amount_sats exceeds configured per-swap cap ({per_swap_cap})",
+                "auto_funding": runtime_auto
+            }
 
         hint_res = self._collect_invoice_hints(channel_id=channel_id, peer_id=peer_id)
         if hint_res.get("error"):
+            hint_res["auto_funding"] = runtime_auto
             return hint_res
         hints = hint_res.get("hints", [])
 
         limits_info = self._get_submarine_limits()
         if limits_info.get("error"):
+            limits_info["auto_funding"] = runtime_auto
             return limits_info
 
         limits = limits_info.get("limits", {})
         if amount_sats < limits.get("minimal", 25000):
-            return {"error": f"amount_sats below minimum {limits.get('minimal')}"}
+            return {"error": f"amount_sats below minimum {limits.get('minimal')}", "auto_funding": runtime_auto}
         if amount_sats > limits.get("maximal", 25000000):
-            return {"error": f"amount_sats above maximum {limits.get('maximal')}"}
+            return {"error": f"amount_sats above maximum {limits.get('maximal')}", "auto_funding": runtime_auto}
 
         label = f"boltz-loop-in-{self._now_ts()}-{secrets.token_hex(4)}"
         description = "cl-revenue-ops loop-in"
@@ -534,7 +988,7 @@ class BoltzSwapManager:
 
         bolt11 = invoice_res.get("bolt11")
         if not bolt11:
-            return {"error": f"invoice returned unexpected response: {invoice_res}"}
+            return {"error": f"invoice returned unexpected response: {invoice_res}", "auto_funding": runtime_auto}
 
         payment_hash = (
             invoice_res.get("payment_hash")
@@ -555,7 +1009,7 @@ class BoltzSwapManager:
 
         swap = self._http_post("/swap/submarine", payload)
         if not swap.get("id"):
-            return {"error": f"Boltz loop-in creation failed: {swap}"}
+            return {"error": f"Boltz loop-in creation failed: {swap}", "auto_funding": runtime_auto}
 
         swap_id = swap["id"]
         expected_onchain = int(swap.get("expectedAmount", amount_sats))
@@ -563,6 +1017,7 @@ class BoltzSwapManager:
         funding_address = swap.get("address") or swap.get("lockupAddress")
         status = swap.get("status", "created")
         total_cost = max(0, expected_onchain - amount_sats)
+        destination_ok, destination_note = self._validate_boltz_funding_destination(swap, funding_address)
 
         rec = {
             "id": swap_id,
@@ -591,8 +1046,85 @@ class BoltzSwapManager:
             "lockup_txid": None,
             "claim_txid": None,
             "error": None,
+            "destination_validated": 1 if destination_ok else 0,
+            "destination_validation_note": destination_note,
+            "auto_funding_status": "pending",
+            "auto_funding_txid": None,
+            "auto_funding_error": None,
+            "auto_funding_amount_sats": expected_onchain,
+            "auto_funding_min_conf": self._cfg_int(
+                "boltz_loop_in_min_confirmations",
+                self.DEFAULT_LOOP_IN_MIN_CONF
+            ),
+            "auto_funding_updated_at": self._now_ts(),
         }
         self._record_swap(rec)
+        self._record_audit_event(
+            "loop_in_created",
+            "Loop-in swap created; preparing auto-funding",
+            swap_id=swap_id,
+            details={
+                "invoice_amount_sats": amount_sats,
+                "expected_onchain_sats": expected_onchain,
+                "channel_id": channel_id,
+                "peer_id": peer_id
+            }
+        )
+
+        auto_result: Dict[str, Any]
+        if not destination_ok:
+            rec["auto_funding_status"] = "destination_invalid"
+            rec["auto_funding_error"] = destination_note
+            rec["error"] = destination_note
+            rec["auto_funding_updated_at"] = self._now_ts()
+            self._record_swap(rec)
+            self._record_audit_event(
+                "loop_in_destination_invalid",
+                "Boltz destination validation failed",
+                swap_id=swap_id,
+                level="warn",
+                details={"validation_note": destination_note, "funding_address": funding_address}
+            )
+            self._record_funding_ledger(
+                swap_id=swap_id,
+                amount_sats=expected_onchain,
+                status="destination_invalid",
+                min_conf=rec["auto_funding_min_conf"],
+                destination=funding_address,
+                note=destination_note
+            )
+            auto_result = {
+                "funded": False,
+                "status": "destination_invalid",
+                "reason": destination_note,
+            }
+        else:
+            try:
+                auto_result = self._auto_fund_loop_in_swap(rec)
+            except Exception as e:
+                rec["auto_funding_status"] = "withdraw_failed"
+                rec["auto_funding_error"] = str(e)
+                rec["error"] = str(e)
+                rec["auto_funding_updated_at"] = self._now_ts()
+                self._record_swap(rec)
+                self._record_funding_ledger(
+                    swap_id=swap_id,
+                    amount_sats=expected_onchain,
+                    status="withdraw_failed",
+                    min_conf=rec.get("auto_funding_min_conf"),
+                    destination=funding_address,
+                    note=str(e)
+                )
+                self._record_audit_event(
+                    "loop_in_auto_funding_failed",
+                    "CLN wallet auto-funding failed",
+                    swap_id=swap_id,
+                    level="warn",
+                    details={"error": str(e)}
+                )
+                auto_result = {"funded": False, "status": "withdraw_failed", "reason": str(e)}
+
+        rec = self._get_swap(swap_id) or rec
 
         return {
             "status": "awaiting_onchain_funding",
@@ -605,6 +1137,10 @@ class BoltzSwapManager:
             "channel_id": channel_id,
             "peer_id": peer_id,
             "invoice_label": label,
+            "auto_funding": {
+                **self._build_swap_auto_funding_view(rec),
+                "result": auto_result,
+            },
         }
 
     def _is_failed_status(self, status: str) -> bool:
@@ -666,7 +1202,12 @@ class BoltzSwapManager:
                     local["error"] = remote_status
                 self._record_swap(local)
 
-        return {"local": local, "boltz": remote}
+        return {
+            "local": local,
+            "boltz": remote,
+            "auto_funding": self._build_swap_auto_funding_view(local),
+            "audit_events": self._get_recent_swap_audit_events(swap_id, limit=10),
+        }
 
     def history(self, limit: int = 20) -> Dict[str, Any]:
         swaps = self._list_swaps(limit)
@@ -684,6 +1225,7 @@ class BoltzSwapManager:
         total_sent = sum(s.get("invoice_amount_sats", 0) for s in loop_out_completed)
         total_received = sum(s.get("onchain_amount_sats", 0) for s in loop_out_completed)
         total_cost = sum(s.get("total_cost_sats", 0) for s in loop_out_completed)
+        ledger_totals = self._get_loop_in_ledger_totals()
         return {
             "swaps": swaps,
             "totals": {
@@ -696,5 +1238,8 @@ class BoltzSwapManager:
                 "loop_in_completed": len(loop_in_completed),
                 "loop_in_lightning_received_sats": sum(s.get("invoice_amount_sats", 0) for s in loop_in_completed),
                 "loop_in_onchain_sent_sats": sum(s.get("onchain_amount_sats", 0) for s in loop_in_completed),
-            }
+                "loop_in_auto_funding_tx_count": ledger_totals["count"],
+                "loop_in_auto_funded_sats": ledger_totals["total_sats"],
+            },
+            "auto_funding": self._auto_funding_runtime_status(),
         }
