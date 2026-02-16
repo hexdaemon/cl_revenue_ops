@@ -56,6 +56,7 @@ from modules.capacity_planner import CapacityPlanner
 from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
 from modules.hive_bridge import HiveFeeIntelligenceBridge
 from modules.utils import normalize_scid, parse_msat
+from modules.boltz_swaps import BoltzSwapManager
 
 
 # =============================================================================
@@ -597,6 +598,7 @@ rpc_broker: Optional['RpcBroker'] = None  # RPC broker subprocess
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligence
+boltz_swaps: Optional[BoltzSwapManager] = None
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
@@ -817,7 +819,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge
+    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, boltz_swaps
     
     plugin.log("Initializing cl-revenue-ops plugin...")
     
@@ -932,6 +934,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize database
     database = Database(config.db_path, safe_plugin)
     database.initialize()
+
+    # Boltz swaps manager
+    boltz_swaps = BoltzSwapManager(database, safe_plugin, config)
 
     # Issue #24: Clean up stale budget reservations on startup
     # Reservations from crashed jobs should be released immediately
@@ -3192,6 +3197,59 @@ def revenue_portfolio_correlations(
         "concentration_risks": [c for c in filtered if c.get("relationship") == "correlated"],
         "all_correlations": filtered
     }
+
+
+@plugin.method("revenue-boltz-quote")
+def revenue_boltz_quote(plugin: Plugin, amount_sats: int) -> Dict[str, Any]:
+    """Get Boltz reverse swap pricing for a given amount."""
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.quote(amount_sats)
+    except Exception as e:
+        plugin.log(f"Boltz quote error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-loop-out")
+def revenue_boltz_loop_out(
+    plugin: Plugin,
+    amount_sats: int,
+    address: Optional[str] = None,
+    dry_run: bool = False
+) -> Dict[str, Any]:
+    """Execute a Boltz reverse swap (loop-out)."""
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.loop_out(amount_sats, address=address, dry_run=dry_run)
+    except Exception as e:
+        plugin.log(f"Boltz loop-out error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-status")
+def revenue_boltz_status(plugin: Plugin, swap_id: str) -> Dict[str, Any]:
+    """Get status of a Boltz swap."""
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.status(swap_id)
+    except Exception as e:
+        plugin.log(f"Boltz status error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-history")
+def revenue_boltz_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+    """Get Boltz swap history and cost summary."""
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.history(limit=limit)
+    except Exception as e:
+        plugin.log(f"Boltz history error: {e}", level='error')
+        return {"error": str(e)}
 
 
 @plugin.method("revenue-cleanup-closed")

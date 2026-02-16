@@ -496,7 +496,35 @@ class Database:
                 timestamp INTEGER NOT NULL
             )
         """)
-        
+
+        # Boltz swap tracking (loop-outs)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS boltz_swaps (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                node_id TEXT,
+                invoice_amount_sats INTEGER NOT NULL,
+                onchain_amount_sats INTEGER NOT NULL,
+                boltz_fee_pct REAL NOT NULL,
+                boltz_fee_sats INTEGER NOT NULL,
+                miner_fee_lockup_sats INTEGER NOT NULL,
+                miner_fee_claim_sats INTEGER NOT NULL,
+                total_cost_sats INTEGER NOT NULL,
+                cost_ppm INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                preimage_hash TEXT NOT NULL,
+                preimage TEXT,
+                claim_privkey TEXT,
+                claim_pubkey TEXT,
+                address TEXT,
+                timeout_block INTEGER,
+                lockup_txid TEXT,
+                claim_txid TEXT,
+                error TEXT
+            )
+        """)
+
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
