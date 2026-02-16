@@ -1,14 +1,11 @@
 """
-Boltz Reverse Swap (Loop Out) module for cl-revenue-ops
+Boltz swap module for cl-revenue-ops.
 
-Implements Lightning -> on-chain BTC swaps using Boltz v2 API.
+Implements:
+- Loop-out (reverse swap): Lightning -> on-chain BTC
+- Loop-in (submarine swap): on-chain BTC -> Lightning
+
 Tracks costs and swap state in SQLite.
-
-Design goals:
-- No rune requirements (runs inside CLN plugin)
-- Explicit cost tracking
-- Cooperative claim flow (preimage -> Boltz co-sign + broadcast)
-- Safe polling with timeouts
 """
 
 import os
@@ -18,7 +15,7 @@ import hashlib
 import secrets
 import subprocess
 import tempfile
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 try:
     import urllib.request as _urlreq
@@ -85,6 +82,10 @@ class BoltzSwapManager:
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 node_id TEXT,
+                swap_type TEXT NOT NULL DEFAULT 'loop_out',
+                target_channel_id TEXT,
+                target_peer_id TEXT,
+                bolt11_invoice TEXT,
                 invoice_amount_sats INTEGER NOT NULL,
                 onchain_amount_sats INTEGER NOT NULL,
                 boltz_fee_pct REAL NOT NULL,
@@ -105,13 +106,35 @@ class BoltzSwapManager:
                 error TEXT
             )
         """)
+        # Keep existing installations forward-compatible with new columns.
+        self._ensure_columns(conn, {
+            "swap_type": "TEXT NOT NULL DEFAULT 'loop_out'",
+            "target_channel_id": "TEXT",
+            "target_peer_id": "TEXT",
+            "bolt11_invoice": "TEXT",
+        })
         conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_swaps_status ON boltz_swaps(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_swaps_created ON boltz_swaps(created_at)")
+
+    def _ensure_columns(self, conn, columns: Dict[str, str]) -> None:
+        rows = conn.execute("PRAGMA table_info(boltz_swaps)").fetchall()
+        existing = set()
+        for row in rows:
+            if isinstance(row, dict):
+                existing.add(row.get("name"))
+            else:
+                # sqlite3.Row is indexable; name is column #1 in PRAGMA output.
+                existing.add(row[1])
+
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE boltz_swaps ADD COLUMN {name} {ddl}")
 
     def _record_swap(self, rec: Dict[str, Any]):
         conn = self.db._get_connection()
         fields = [
-            "id", "created_at", "updated_at", "node_id", "invoice_amount_sats",
+            "id", "created_at", "updated_at", "node_id", "swap_type",
+            "target_channel_id", "target_peer_id", "bolt11_invoice", "invoice_amount_sats",
             "onchain_amount_sats", "boltz_fee_pct", "boltz_fee_sats",
             "miner_fee_lockup_sats", "miner_fee_claim_sats", "total_cost_sats",
             "cost_ppm", "status", "preimage_hash", "preimage", "claim_privkey",
@@ -149,10 +172,10 @@ class BoltzSwapManager:
         preimage_hash = hashlib.sha256(preimage).digest()
         return preimage, preimage_hash
 
-    def _generate_secp256k1_keypair(self) -> Tuple[str, str]:
+    def _generate_secp256k1_keypair(self, pubkey_format: str = "xonly") -> Tuple[str, str]:
         """
         Generate a secp256k1 keypair using OpenSSL.
-        Returns (privkey_hex, xonly_pubkey_hex).
+        Returns (privkey_hex, pubkey_hex).
 
         This avoids adding Python crypto dependencies.
         """
@@ -201,12 +224,19 @@ class BoltzSwapManager:
         if len(priv_hex) != 64:
             raise RuntimeError("Invalid privkey length from OpenSSL")
 
-        if len(pub_bytes) >= 65 and pub_bytes[0] == 0x04:
-            x_only = pub_bytes[1:33]
-        else:
+        if len(pub_bytes) < 65 or pub_bytes[0] != 0x04:
             raise RuntimeError("Failed to parse pubkey from OpenSSL")
 
-        pub_hex = x_only.hex()
+        x_coord = pub_bytes[1:33]
+        y_coord = pub_bytes[33:65]
+        if pubkey_format == "xonly":
+            pub_hex = x_coord.hex()
+        elif pubkey_format == "compressed":
+            prefix = b"\x02" if (y_coord[-1] % 2 == 0) else b"\x03"
+            pub_hex = (prefix + x_coord).hex()
+        else:
+            raise ValueError(f"Unsupported pubkey_format: {pubkey_format}")
+
         return priv_hex, pub_hex
 
     # ---------------------------------------------------------------------
@@ -250,6 +280,71 @@ class BoltzSwapManager:
             return info.get("id") or ""
         except Exception:
             return ""
+
+    def _get_submarine_limits(self) -> Dict[str, Any]:
+        pairs = self._http_get("/swap/submarine")
+        btc_pair = pairs.get("BTC", {}).get("BTC", {})
+        if not btc_pair:
+            return {"error": "BTC/BTC submarine pair not available"}
+        return {
+            "limits": btc_pair.get("limits", {}),
+            "pair_hash": btc_pair.get("hash", "")
+        }
+
+    def _list_peerchannels(self, peer_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        try:
+            if peer_id:
+                res = self.rpc.listpeerchannels(id=peer_id)
+            else:
+                res = self.rpc.listpeerchannels()
+            return res.get("channels", [])
+        except Exception:
+            return []
+
+    def _channel_matches(self, channel: Dict[str, Any], channel_id: str) -> bool:
+        target = str(channel_id).strip()
+        vals = {
+            str(channel.get("short_channel_id") or ""),
+            str(channel.get("channel_id") or ""),
+        }
+        return target in vals
+
+    def _channel_is_routable(self, channel: Dict[str, Any]) -> bool:
+        state = str(channel.get("state", "")).upper()
+        return (
+            bool(channel.get("short_channel_id"))
+            and "ONCHAIN" not in state
+            and "CLOSED" not in state
+        )
+
+    def _collect_invoice_hints(
+        self,
+        channel_id: Optional[str] = None,
+        peer_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        if channel_id and peer_id:
+            return {"error": "Provide either channel_id or peer_id, not both"}
+
+        if channel_id:
+            channels = self._list_peerchannels()
+            matches = [c for c in channels if self._channel_matches(c, channel_id)]
+            if not matches:
+                return {"error": f"channel_id not found: {channel_id}"}
+            hints = [c.get("short_channel_id") for c in matches if self._channel_is_routable(c)]
+            if not hints:
+                return {"error": f"channel_id has no routable short_channel_id: {channel_id}"}
+            return {"hints": hints}
+
+        if peer_id:
+            channels = self._list_peerchannels(peer_id)
+            if not channels:
+                return {"error": f"peer_id not found or has no channels: {peer_id}"}
+            hints = [c.get("short_channel_id") for c in channels if self._channel_is_routable(c)]
+            if not hints:
+                return {"error": f"peer_id has no routable short_channel_id channels: {peer_id}"}
+            return {"hints": hints}
+
+        return {"hints": []}
 
     def loop_out(self, amount_sats: int, address: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
         if amount_sats < 25000:
@@ -308,6 +403,10 @@ class BoltzSwapManager:
             "created_at": self._now_ts(),
             "updated_at": self._now_ts(),
             "node_id": self._get_node_id(),
+            "swap_type": "loop_out",
+            "target_channel_id": None,
+            "target_peer_id": None,
+            "bolt11_invoice": invoice,
             "invoice_amount_sats": amount_sats,
             "onchain_amount_sats": onchain_amount,
             "boltz_fee_pct": quote["boltz_fee_pct"],
@@ -391,6 +490,143 @@ class BoltzSwapManager:
                 "claim_pubkey": claim_pub,
             }
 
+    def loop_in(
+        self,
+        amount_sats: int,
+        channel_id: Optional[str] = None,
+        peer_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        if amount_sats < 25000:
+            return {"error": "amount_sats must be >= 25,000"}
+
+        hint_res = self._collect_invoice_hints(channel_id=channel_id, peer_id=peer_id)
+        if hint_res.get("error"):
+            return hint_res
+        hints = hint_res.get("hints", [])
+
+        limits_info = self._get_submarine_limits()
+        if limits_info.get("error"):
+            return limits_info
+
+        limits = limits_info.get("limits", {})
+        if amount_sats < limits.get("minimal", 25000):
+            return {"error": f"amount_sats below minimum {limits.get('minimal')}"}
+        if amount_sats > limits.get("maximal", 25000000):
+            return {"error": f"amount_sats above maximum {limits.get('maximal')}"}
+
+        label = f"boltz-loop-in-{self._now_ts()}-{secrets.token_hex(4)}"
+        description = "cl-revenue-ops loop-in"
+        invoice_kwargs: Dict[str, Any] = {
+            "amount_msat": f"{amount_sats * 1000}msat",
+            "label": label,
+            "description": description,
+            "expiry": 3600,
+        }
+        if hints:
+            invoice_kwargs["exposeprivatechannels"] = hints
+
+        try:
+            invoice_res = self.rpc.invoice(**invoice_kwargs)
+        except Exception:
+            # Older CLN versions may prefer integer amount_msat.
+            invoice_kwargs["amount_msat"] = amount_sats * 1000
+            invoice_res = self.rpc.invoice(**invoice_kwargs)
+
+        bolt11 = invoice_res.get("bolt11")
+        if not bolt11:
+            return {"error": f"invoice returned unexpected response: {invoice_res}"}
+
+        payment_hash = (
+            invoice_res.get("payment_hash")
+            or invoice_res.get("paymentHash")
+            or hashlib.sha256(bolt11.encode()).hexdigest()
+        )
+
+        refund_priv, refund_pub = self._generate_secp256k1_keypair(pubkey_format="compressed")
+        payload: Dict[str, Any] = {
+            "from": "BTC",
+            "to": "BTC",
+            "invoice": bolt11,
+            "refundPublicKey": refund_pub,
+        }
+        pair_hash = limits_info.get("pair_hash")
+        if pair_hash:
+            payload["pairHash"] = pair_hash
+
+        swap = self._http_post("/swap/submarine", payload)
+        if not swap.get("id"):
+            return {"error": f"Boltz loop-in creation failed: {swap}"}
+
+        swap_id = swap["id"]
+        expected_onchain = int(swap.get("expectedAmount", amount_sats))
+        timeout_block = int(swap.get("timeoutBlockHeight", 0))
+        funding_address = swap.get("address") or swap.get("lockupAddress")
+        status = swap.get("status", "created")
+        total_cost = max(0, expected_onchain - amount_sats)
+
+        rec = {
+            "id": swap_id,
+            "created_at": self._now_ts(),
+            "updated_at": self._now_ts(),
+            "node_id": self._get_node_id(),
+            "swap_type": "loop_in",
+            "target_channel_id": channel_id,
+            "target_peer_id": peer_id,
+            "bolt11_invoice": bolt11,
+            "invoice_amount_sats": amount_sats,
+            "onchain_amount_sats": expected_onchain,
+            "boltz_fee_pct": 0.0,
+            "boltz_fee_sats": 0,
+            "miner_fee_lockup_sats": 0,
+            "miner_fee_claim_sats": 0,
+            "total_cost_sats": total_cost,
+            "cost_ppm": int(total_cost * 1_000_000 / amount_sats) if amount_sats else 0,
+            "status": status,
+            "preimage_hash": payment_hash,
+            "preimage": None,
+            "claim_privkey": refund_priv,
+            "claim_pubkey": refund_pub,
+            "address": funding_address,
+            "timeout_block": timeout_block,
+            "lockup_txid": None,
+            "claim_txid": None,
+            "error": None,
+        }
+        self._record_swap(rec)
+
+        return {
+            "status": "awaiting_onchain_funding",
+            "swap_id": swap_id,
+            "boltz_status": status,
+            "amount_sats": amount_sats,
+            "expected_onchain_sats": expected_onchain,
+            "funding_address": funding_address,
+            "bip21": swap.get("bip21"),
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "invoice_label": label,
+        }
+
+    def _is_failed_status(self, status: str) -> bool:
+        st = (status or "").lower()
+        return (
+            st.startswith("transaction.failed")
+            or st.startswith("swap.error")
+            or st.startswith("invoice.failed")
+            or st == "swap.expired"
+            or st == "failed"
+        )
+
+    def _is_completed_status(self, status: str, swap_type: str) -> bool:
+        st = (status or "").lower()
+        if swap_type == "loop_in":
+            return (
+                st in ("completed", "invoice.paid", "invoice.settled", "transaction.claimed")
+                or st.startswith("invoice.paid")
+                or st.startswith("transaction.claimed")
+            )
+        return st == "completed"
+
     def _wait_for_lockup(self, swap_id: str, timeout: int = 600, interval: int = 10) -> Dict[str, Any]:
         start = time.time()
         while time.time() - start < timeout:
@@ -420,22 +656,45 @@ class BoltzSwapManager:
             remote = self._http_get(f"/swap/status?id={swap_id}")
         except Exception as e:
             remote = {"error": str(e)}
+
+        if local and remote.get("status"):
+            remote_status = remote.get("status")
+            if remote_status and remote_status != local.get("status"):
+                local["status"] = remote_status
+                local["updated_at"] = self._now_ts()
+                if self._is_failed_status(remote_status):
+                    local["error"] = remote_status
+                self._record_swap(local)
+
         return {"local": local, "boltz": remote}
 
     def history(self, limit: int = 20) -> Dict[str, Any]:
         swaps = self._list_swaps(limit)
-        completed = [s for s in swaps if s.get("status") == "completed"]
-        total_sent = sum(s.get("invoice_amount_sats", 0) for s in completed)
-        total_received = sum(s.get("onchain_amount_sats", 0) for s in completed)
-        total_cost = sum(s.get("total_cost_sats", 0) for s in completed)
+        loop_out_completed = [
+            s for s in swaps
+            if self._is_completed_status(s.get("status", ""), s.get("swap_type", "loop_out") or "loop_out")
+            and (s.get("swap_type") or "loop_out") != "loop_in"
+        ]
+        loop_in_completed = [
+            s for s in swaps
+            if self._is_completed_status(s.get("status", ""), s.get("swap_type", "loop_out") or "loop_out")
+            and (s.get("swap_type") or "loop_out") == "loop_in"
+        ]
+
+        total_sent = sum(s.get("invoice_amount_sats", 0) for s in loop_out_completed)
+        total_received = sum(s.get("onchain_amount_sats", 0) for s in loop_out_completed)
+        total_cost = sum(s.get("total_cost_sats", 0) for s in loop_out_completed)
         return {
             "swaps": swaps,
             "totals": {
                 "count": len(swaps),
-                "completed": len(completed),
+                "completed": len(loop_out_completed) + len(loop_in_completed),
                 "total_sent": total_sent,
                 "total_received": total_received,
                 "total_cost": total_cost,
                 "avg_cost_ppm": int(total_cost * 1_000_000 / total_sent) if total_sent else 0,
+                "loop_in_completed": len(loop_in_completed),
+                "loop_in_lightning_received_sats": sum(s.get("invoice_amount_sats", 0) for s in loop_in_completed),
+                "loop_in_onchain_sent_sats": sum(s.get("onchain_amount_sats", 0) for s in loop_in_completed),
             }
         }

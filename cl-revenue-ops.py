@@ -3228,6 +3228,25 @@ def revenue_boltz_loop_out(
         return {"error": str(e)}
 
 
+@plugin.method("revenue-boltz-loop-in")
+def revenue_boltz_loop_in(
+    plugin: Plugin,
+    amount_sats: int,
+    channel_id: Optional[str] = None,
+    peer_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Execute a Boltz submarine swap (loop-in)."""
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    if channel_id and peer_id:
+        return {"error": "Provide either channel_id or peer_id, not both"}
+    try:
+        return boltz_swaps.loop_in(amount_sats, channel_id=channel_id, peer_id=peer_id)
+    except Exception as e:
+        plugin.log(f"Boltz loop-in error: {e}", level='error')
+        return {"error": str(e)}
+
+
 @plugin.method("revenue-boltz-status")
 def revenue_boltz_status(plugin: Plugin, swap_id: str) -> Dict[str, Any]:
     """Get status of a Boltz swap."""
