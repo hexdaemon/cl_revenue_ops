@@ -265,33 +265,41 @@ class RPCBreakerOpen(RpcError):
 
 class RpcBroker:
     """
-    A hardened RPC broker that executes lightningd RPC calls in a separate process.
+    A hardened RPC pool that executes lightningd RPC calls in separate processes.
 
     Why:
     - pyln-client RPC can hang indefinitely on certain transport / plugin interactions.
     - A thread timeout (ThreadPoolExecutor) does not stop a hung RPC call.
-    - By isolating RPC calls in a subprocess, we can terminate and restart the broker
+    - By isolating RPC calls in subprocesses, we can terminate and restart workers
       on timeout, guaranteeing bounded waiting for callers.
 
-    Design:
-    - One broker process + one request queue + one response queue
-    - Calls are serialized via an internal call lock (matches prior max_workers=1)
-    - On timeout: terminate broker, recreate queues, restart broker, raise TimeoutError
+    Design (Phase 2 — pool):
+    - N worker processes share one request queue and one response queue
+    - A dispatcher thread in the main process routes responses to per-request Events
+    - No call lock: callers block only on their own Event, not on each other
+    - On timeout: clean up the pending slot, restart entire pool, raise TimeoutError
+    - Dead workers are auto-respawned by the dispatcher's health check
     """
 
-    def __init__(self, socket_path: str, plugin_instance: Plugin):
+    def __init__(self, socket_path: str, plugin_instance: Plugin, pool_size: int = 3):
         self.socket_path = socket_path
         self._plugin = plugin_instance
+        self._pool_size = max(1, min(pool_size, 8))
 
         # Use spawn for safety (avoid forking a process after threads have started).
         self._ctx = multiprocessing.get_context("spawn")
 
-        self._proc: Optional[multiprocessing.Process] = None
+        self._workers: List[multiprocessing.Process] = []
         self._req_q: Any = None
         self._resp_q: Any = None
 
-        # Serialize calls (behaviorally equivalent to the old single-worker executor).
-        self._call_lock = threading.Lock()
+        # Per-request response routing: req_id → {"event": Event, "resp": dict|None}
+        self._pending: Dict[str, dict] = {}
+        self._pending_lock = threading.Lock()
+
+        self._dispatcher: Optional[threading.Thread] = None
+        self._dispatcher_stop = threading.Event()
+
         self._lifecycle_lock = threading.Lock()
 
         self.start()
@@ -345,44 +353,122 @@ class RpcBroker:
                     "traceback": _traceback.format_exc(),
                 })
 
+    def _dispatch_loop(self):
+        """Background thread: read resp_q, route to per-request Event slots."""
+        health_check_interval = 10.0  # seconds between worker health checks
+        last_health_check = time.time()
+
+        while not self._dispatcher_stop.is_set():
+            # Try to read a response (short timeout so we can check stop flag)
+            try:
+                resp = self._resp_q.get(timeout=1.0)
+            except (queue.Empty, OSError):
+                # OSError can happen if queue is closed during shutdown
+                resp = None
+
+            if resp is not None:
+                req_id = resp.get("id")
+                if req_id:
+                    with self._pending_lock:
+                        slot = self._pending.get(req_id)
+                    if slot is not None:
+                        slot["resp"] = resp
+                        slot["event"].set()
+
+            # Periodic health check: respawn dead workers
+            now = time.time()
+            if now - last_health_check >= health_check_interval:
+                last_health_check = now
+                self._check_worker_health()
+
+    def _check_worker_health(self):
+        """Respawn any dead worker processes."""
+        with self._lifecycle_lock:
+            if not self._req_q or self._dispatcher_stop.is_set():
+                return
+            for i, w in enumerate(self._workers):
+                if not w.is_alive():
+                    try:
+                        w.join(timeout=0.1)
+                    except Exception:
+                        pass
+                    new_w = self._ctx.Process(
+                        target=RpcBroker._broker_main,
+                        args=(self.socket_path, self._req_q, self._resp_q),
+                        daemon=True,
+                        name=f"rpc_pool_{i}",
+                    )
+                    new_w.start()
+                    self._workers[i] = new_w
+                    self._plugin.log(f"RPC pool: respawned dead worker {i}", level="warn")
+
     def start(self):
         with self._lifecycle_lock:
             # Fresh queues each start to avoid stale messages after restarts.
             self._req_q = self._ctx.Queue()
             self._resp_q = self._ctx.Queue()
 
-            self._proc = self._ctx.Process(
-                target=RpcBroker._broker_main,
-                args=(self.socket_path, self._req_q, self._resp_q),
+            self._workers = []
+            for i in range(self._pool_size):
+                w = self._ctx.Process(
+                    target=RpcBroker._broker_main,
+                    args=(self.socket_path, self._req_q, self._resp_q),
+                    daemon=True,
+                    name=f"rpc_pool_{i}",
+                )
+                w.start()
+                self._workers.append(w)
+
+            # Start dispatcher thread to route responses
+            self._dispatcher_stop.clear()
+            self._dispatcher = threading.Thread(
+                target=self._dispatch_loop,
                 daemon=True,
-                name="rpc_broker",
+                name="rpc_pool_dispatcher",
             )
-            self._proc.start()
+            self._dispatcher.start()
 
     def stop(self):
         with self._lifecycle_lock:
-            if self._proc is None:
-                return
-            try:
-                if self._req_q:
-                    self._req_q.put_nowait({"op": "stop"})
-            except Exception:
-                pass
+            # Signal dispatcher to stop
+            self._dispatcher_stop.set()
 
-            try:
-                if self._proc.is_alive():
-                    self._proc.terminate()
-                    self._proc.join(timeout=1.0)
-            except Exception:
-                pass
+            # Send stop signal to each worker
+            for _ in self._workers:
+                try:
+                    if self._req_q:
+                        self._req_q.put_nowait({"op": "stop"})
+                except Exception:
+                    pass
 
-            self._proc = None
+            # Terminate any still-alive workers
+            for w in self._workers:
+                try:
+                    if w.is_alive():
+                        w.terminate()
+                        w.join(timeout=1.0)
+                except Exception:
+                    pass
+
+            self._workers = []
+
+            # Wait for dispatcher to finish
+            if self._dispatcher and self._dispatcher.is_alive():
+                self._dispatcher.join(timeout=2.0)
+            self._dispatcher = None
+
             self._req_q = None
             self._resp_q = None
 
+            # Wake up any callers still waiting on pending slots
+            with self._pending_lock:
+                for slot in self._pending.values():
+                    slot["event"].set()
+                self._pending.clear()
+
     def restart(self, reason: str):
         # Keep logs rate-limited in caller layer; here we log once per restart.
-        self._plugin.log(f"RPC broker restart: {reason}", level="warn")
+        self._plugin.log(f"RPC pool restart ({self._pool_size} workers): {reason}", level="warn")
         self.stop()
         self.start()
 
@@ -390,58 +476,75 @@ class RpcBroker:
                 args: Optional[List[Any]] = None, kwargs: Optional[Dict[str, Any]] = None,
                 timeout: int = 15):
         """
-        Perform a single RPC request through the broker.
+        Perform a single RPC request through the pool.
+
+        Any available worker picks up the request. The caller blocks only on
+        its own Event — other threads' requests proceed concurrently.
 
         Raises:
-            TimeoutError: if the broker does not return within timeout.
-            RpcError: reconstructed from broker error payload.
+            TimeoutError: if no worker returns within timeout.
+            RpcError: reconstructed from worker error payload.
         """
         if not method:
             raise RpcError("request", {}, "Empty RPC method")
 
-        with self._call_lock:
-            # Broker may have died; restart defensively.
-            if self._proc is None or (hasattr(self._proc, "is_alive") and not self._proc.is_alive()):
-                self.restart("broker not running")
+        req_id = uuid.uuid4().hex
+        slot = {"event": threading.Event(), "resp": None}
 
-            req_id = uuid.uuid4().hex
-            req = {
-                "id": req_id,
-                "kind": kind,
-                "method": method,
-                "payload": payload,
-                "args": args or [],
-                "kwargs": kwargs or {},
-            }
+        with self._pending_lock:
+            self._pending[req_id] = slot
 
-            assert self._req_q is not None and self._resp_q is not None
+        req = {
+            "id": req_id,
+            "kind": kind,
+            "method": method,
+            "payload": payload,
+            "args": args or [],
+            "kwargs": kwargs or {},
+        }
+
+        try:
+            if self._req_q is None:
+                self.restart("pool not running")
 
             self._req_q.put(req)
 
-            try:
-                resp = self._resp_q.get(timeout=timeout)
-                # In normal operation (serialized), the first response is ours.
-                # If we ever see mismatch (stale message), drain until match.
-                while resp and resp.get("id") != req_id:
-                    resp = self._resp_q.get(timeout=timeout)
-            except queue.Empty:
-                # Hard guarantee: kill the hung broker, restart, and surface timeout.
+            # Block only this caller until its response arrives
+            if not slot["event"].wait(timeout=timeout):
+                # Timeout — clean up and restart pool
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
                 self.restart(f"timeout waiting for RPC response ({timeout}s) on {method}")
-                raise TimeoutError(f"RPC broker timeout on {method}")
+                raise TimeoutError(f"RPC pool timeout on {method}")
+        except (OSError, ValueError):
+            # Queue broken (e.g. during concurrent restart)
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            self.restart(f"queue error on {method}")
+            raise TimeoutError(f"RPC pool queue error on {method}")
 
-            if resp.get("ok"):
-                return resp.get("result")
+        # Retrieve and clean up
+        with self._pending_lock:
+            self._pending.pop(req_id, None)
 
-            # Reconstruct a compatible RpcError in the main process.
-            if resp.get("traceback"):
-                self._plugin.log(
-                    f"RPC broker exception in {method}: {resp.get('message')}\n{resp.get('traceback')}",
-                    level="error"
-                )
+        resp = slot["resp"]
+        if resp is None:
+            # Dispatcher was stopped (shutdown) before response arrived
+            raise TimeoutError(f"RPC pool shutdown during {method}")
 
-            err = resp.get("error")
-            msg = resp.get("message") or "RPC error"
-            raise RpcError(method, {} if payload is None else payload, err if err is not None else msg)
+        if resp.get("ok"):
+            return resp.get("result")
+
+        # Reconstruct a compatible RpcError in the main process.
+        if resp.get("traceback"):
+            self._plugin.log(
+                f"RPC pool exception in {method}: {resp.get('message')}\n{resp.get('traceback')}",
+                level="error"
+            )
+
+        err = resp.get("error")
+        msg = resp.get("message") or "RPC error"
+        raise RpcError(method, {} if payload is None else payload, err if err is not None else msg)
 
 
 class ThreadSafeRpcProxy:
@@ -910,9 +1013,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         ldir = configuration.get("lightning-dir") or "~/.lightning"
         rpc_socket_path = os.path.expanduser(os.path.join(ldir, "lightning-rpc"))
 
-    rpc_broker = RpcBroker(str(rpc_socket_path), plugin)
+    pool_size = config.rpc_pool_size if config else 3
+    rpc_broker = RpcBroker(str(rpc_socket_path), plugin, pool_size=pool_size)
     safe_plugin = ThreadSafePluginProxy(plugin, rpc_broker)
-    plugin.log(f"RPC broker initialized (socket={rpc_socket_path})", level="info")
+    plugin.log(f"RPC pool initialized (workers={pool_size}, socket={rpc_socket_path})", level="info")
 
     # =========================================================================
     # STARTUP DEPENDENCY CHECKS (Phase 4: Stability & Scaling)
