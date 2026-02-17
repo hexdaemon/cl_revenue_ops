@@ -801,7 +801,7 @@ class BoltzSwapManager:
 
         # Preimage + keypair
         preimage, preimage_hash = self._generate_preimage()
-        claim_priv, claim_pub = self._generate_secp256k1_keypair()
+        claim_priv, claim_pub = self._generate_secp256k1_keypair(pubkey_format="compressed")
 
         # Create reverse swap
         payload = {
