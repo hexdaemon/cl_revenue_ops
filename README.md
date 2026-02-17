@@ -1,6 +1,6 @@
 # cl-revenue-ops
 
-A Revenue Operations Plugin for Core Lightning that provides intelligent fee management, profit-aware rebalancing, and enterprise-grade observability.
+A Revenue Operations Plugin for Core Lightning that provides intelligent fee management, and profit-aware rebalancing.
 
 ## Overview
 
