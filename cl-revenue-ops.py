@@ -519,22 +519,21 @@ class RpcBroker:
         try:
             if self._req_q is None:
                 self.restart("pool not running")
-
             self._req_q.put(req)
-
-            # Block only this caller until its response arrives
-            if not slot["event"].wait(timeout=timeout):
-                # Timeout — clean up and restart pool
-                with self._pending_lock:
-                    self._pending.pop(req_id, None)
-                self.restart(f"timeout waiting for RPC response ({timeout}s) on {method}")
-                raise TimeoutError(f"RPC pool timeout on {method}")
-        except (OSError, ValueError):
-            # Queue broken (e.g. during concurrent restart)
+        except (OSError, ValueError, AttributeError):
+            # Queue broken (e.g. during concurrent restart or TOCTOU on _req_q)
             with self._pending_lock:
                 self._pending.pop(req_id, None)
             self.restart(f"queue error on {method}")
             raise TimeoutError(f"RPC pool queue error on {method}")
+
+        # Block only this caller until its response arrives
+        if not slot["event"].wait(timeout=timeout):
+            # Timeout — clean up and restart pool
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            self.restart(f"timeout waiting for RPC response ({timeout}s) on {method}")
+            raise TimeoutError(f"RPC pool timeout on {method}")
 
         # Retrieve and clean up
         with self._pending_lock:
