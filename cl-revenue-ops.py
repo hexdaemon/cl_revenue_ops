@@ -301,6 +301,7 @@ class RpcBroker:
         self._dispatcher_stop = threading.Event()
 
         self._lifecycle_lock = threading.Lock()
+        self._last_restart_time = 0.0
 
         self.start()
 
@@ -375,8 +376,9 @@ class RpcBroker:
             # Try to read a response (short timeout so we can check stop flag)
             try:
                 resp = self._resp_q.get(timeout=1.0)
-            except (queue.Empty, OSError):
+            except (queue.Empty, OSError, AttributeError, TypeError):
                 # OSError can happen if queue is closed during shutdown
+                # AttributeError/TypeError when _resp_q becomes None during shutdown
                 resp = None
 
             if resp is not None:
@@ -396,7 +398,11 @@ class RpcBroker:
 
     def _check_worker_health(self):
         """Respawn any dead worker processes."""
-        with self._lifecycle_lock:
+        # Non-blocking acquire: avoids deadlock when stop() holds this lock
+        # while joining the dispatcher thread (which calls this method).
+        if not self._lifecycle_lock.acquire(blocking=False):
+            return
+        try:
             if not self._req_q or self._dispatcher_stop.is_set():
                 return
             for i, w in enumerate(self._workers):
@@ -414,6 +420,8 @@ class RpcBroker:
                     new_w.start()
                     self._workers[i] = new_w
                     self._plugin.log(f"RPC pool: respawned dead worker {i}", level="warn")
+        finally:
+            self._lifecycle_lock.release()
 
     def start(self):
         with self._lifecycle_lock:
@@ -480,7 +488,12 @@ class RpcBroker:
                 self._pending.clear()
 
     def restart(self, reason: str):
-        # Keep logs rate-limited in caller layer; here we log once per restart.
+        # Thundering herd prevention: skip if restarted within last 5 seconds
+        now = time.time()
+        if now - self._last_restart_time < 5.0:
+            self._plugin.log(f"RPC pool restart skipped (cooldown): {reason}", level="info")
+            return
+        self._last_restart_time = now
         self._plugin.log(f"RPC pool restart ({self._pool_size} workers): {reason}", level="warn")
         self.stop()
         self.start()
@@ -517,32 +530,27 @@ class RpcBroker:
         }
 
         try:
-            if self._req_q is None:
-                self.restart("pool not running")
-            self._req_q.put(req)
-        except (OSError, ValueError, AttributeError):
-            # Queue broken (e.g. during concurrent restart or TOCTOU on _req_q)
+            try:
+                if self._req_q is None:
+                    self.restart("pool not running")
+                self._req_q.put(req)
+            except (OSError, ValueError, AttributeError):
+                # Queue broken (e.g. during concurrent restart or TOCTOU on _req_q)
+                self.restart(f"queue error on {method}")
+                raise TimeoutError(f"RPC pool queue error on {method}")
+
+            # Block only this caller until its response arrives
+            if not slot["event"].wait(timeout=timeout):
+                self.restart(f"timeout waiting for RPC response ({timeout}s) on {method}")
+                raise TimeoutError(f"RPC pool timeout on {method}")
+
+            resp = slot["resp"]
+            if resp is None:
+                # Dispatcher was stopped (shutdown) before response arrived
+                raise TimeoutError(f"RPC pool shutdown during {method}")
+        finally:
             with self._pending_lock:
                 self._pending.pop(req_id, None)
-            self.restart(f"queue error on {method}")
-            raise TimeoutError(f"RPC pool queue error on {method}")
-
-        # Block only this caller until its response arrives
-        if not slot["event"].wait(timeout=timeout):
-            # Timeout — clean up and restart pool
-            with self._pending_lock:
-                self._pending.pop(req_id, None)
-            self.restart(f"timeout waiting for RPC response ({timeout}s) on {method}")
-            raise TimeoutError(f"RPC pool timeout on {method}")
-
-        # Retrieve and clean up
-        with self._pending_lock:
-            self._pending.pop(req_id, None)
-
-        resp = slot["resp"]
-        if resp is None:
-            # Dispatcher was stopped (shutdown) before response arrived
-            raise TimeoutError(f"RPC pool shutdown during {method}")
 
         if resp.get("ok"):
             return resp.get("result")
