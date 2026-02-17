@@ -320,19 +320,18 @@ class RpcBroker:
                 break
 
             req_id = req.get("id")
-            kind = req.get("kind", "call")
             method = req.get("method")
             payload = req.get("payload")
-            args = req.get("args") or []
             kwargs = req.get("kwargs") or {}
 
             try:
-                if kind == "attr":
-                    # E.g. listpeers(), plugin("list"), listforwards(status="settled")
-                    result = getattr(rpc, method)(*args, **kwargs)
+                # Always use rpc.call() to bypass explicit LightningRpc method
+                # signatures (e.g. listnodes(node_id=) vs id=). The call()
+                # method sends kwargs directly as the JSON-RPC payload dict.
+                if payload is not None:
+                    result = rpc.call(method, payload)
                 else:
-                    # Generic rpc.call(method, payload)
-                    result = rpc.call(method, {} if payload is None else payload)
+                    result = rpc.call(method, kwargs if kwargs else {})
 
                 resp_q.put({"id": req_id, "ok": True, "result": result})
             except _RpcError as e:
