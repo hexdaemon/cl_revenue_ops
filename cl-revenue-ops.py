@@ -320,18 +320,32 @@ class RpcBroker:
                 break
 
             req_id = req.get("id")
+            kind = req.get("kind", "call")
             method = req.get("method")
             payload = req.get("payload")
+            args = req.get("args") or []
             kwargs = req.get("kwargs") or {}
 
             try:
-                # Always use rpc.call() to bypass explicit LightningRpc method
-                # signatures (e.g. listnodes(node_id=) vs id=). The call()
-                # method sends kwargs directly as the JSON-RPC payload dict.
-                if payload is not None:
+                if kind == "call":
+                    # Explicit rpc.call(method, payload_dict) — pass through
                     result = rpc.call(method, payload)
                 else:
-                    result = rpc.call(method, kwargs if kwargs else {})
+                    # kind == "attr": reproduce rpc.method(*args, **kwargs)
+                    # using getattr to match pyln-client's natural calling
+                    # convention (handles positional args, __getattr__ wrappers).
+                    # Fall back to rpc.call() on TypeError for methods where
+                    # pyln-client has explicit signatures with different param
+                    # names (e.g. listnodes(node_id=) vs caller passing id=).
+                    try:
+                        result = getattr(rpc, method)(*args, **kwargs)
+                    except TypeError:
+                        if kwargs:
+                            result = rpc.call(method, kwargs)
+                        elif args:
+                            result = rpc.call(method, args[0] if len(args) == 1 else args)
+                        else:
+                            result = rpc.call(method, {})
 
                 resp_q.put({"id": req_id, "ok": True, "result": result})
             except _RpcError as e:
