@@ -2073,3 +2073,89 @@ def test_chain_swap_no_address_uses_to_wallet():
             break
     else:
         assert False, "createchainswap call not found"
+
+
+# ── Backup tests ─────────────────────────────────────────────────
+
+
+def test_get_backup_info():
+    """get_backup_info returns swap mnemonic, wallets, pending swaps, boltzd info."""
+    manager, _ = _make_manager()
+
+    with patch.object(manager, '_run_boltzcli_raw', return_value="word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12\n"):
+        with patch.object(manager, '_run_boltzcli') as mock_cli:
+            mock_cli.side_effect = [
+                {"wallets": [{"name": "CLN", "currency": "BTC", "balance": {"confirmed": "100000"}}]},
+                {"allSwaps": [
+                    {"id": "abc", "type": "reverse", "state": "pending", "expectedAmount": 50000, "pair": {"to": "BTC"}},
+                    {"id": "def", "type": "submarine", "state": "successful", "expectedAmount": 25000, "pair": {"from": "BTC"}},
+                ]},
+                {"version": "v2.11.0", "nodePubkey": "03abc", "network": "mainnet"},
+            ]
+            result = manager.get_backup_info()
+
+    assert result["swap_mnemonic"] == "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12"
+    assert len(result["wallets"]["wallets"]) == 1
+    assert result["pending_swap_count"] == 1  # only "pending" one, not "successful"
+    assert result["pending_swaps"][0]["id"] == "abc"
+    assert "manual_backup_required" in result
+    assert result["manual_backup_required"]["command"] == ["boltzcli wallet credentials CLN"]
+
+
+def test_get_backup_info_mnemonic_error():
+    """get_backup_info handles swapmnemonic failure gracefully."""
+    manager, _ = _make_manager()
+
+    with patch.object(manager, '_run_boltzcli_raw', side_effect=RuntimeError("boltzd not running")):
+        with patch.object(manager, '_run_boltzcli') as mock_cli:
+            mock_cli.side_effect = [
+                {"wallets": []},
+                {"allSwaps": []},
+                {"version": "v2.11.0"},
+            ]
+            result = manager.get_backup_info()
+
+    assert result["swap_mnemonic"] is None
+    assert "swap_mnemonic_error" in result
+
+
+def test_verify_backup_match():
+    """verify_backup returns match=True when mnemonics match."""
+    manager, _ = _make_manager()
+
+    with patch.object(manager, '_run_boltzcli_raw', return_value="word1 word2 word3\n"):
+        result = manager.verify_backup("word1 word2 word3")
+    assert result["verified"] is True
+    assert result["match"] is True
+
+
+def test_verify_backup_mismatch():
+    """verify_backup returns match=False when mnemonics differ."""
+    manager, _ = _make_manager()
+
+    with patch.object(manager, '_run_boltzcli_raw', return_value="word1 word2 word3\n"):
+        result = manager.verify_backup("wrong wrong wrong")
+    assert result["verified"] is True
+    assert result["match"] is False
+
+
+def test_verify_backup_empty():
+    """verify_backup rejects empty mnemonic."""
+    manager, _ = _make_manager()
+    result = manager.verify_backup("")
+    assert result["verified"] is False
+    assert "error" in result
+
+
+def test_get_backup_info_audit_event():
+    """get_backup_info records an audit event."""
+    manager, _ = _make_manager()
+
+    with patch.object(manager, '_run_boltzcli_raw', return_value="mnemonic words\n"):
+        with patch.object(manager, '_run_boltzcli', return_value={}):
+            with patch.object(manager, '_record_audit_event') as mock_audit:
+                manager.get_backup_info()
+    mock_audit.assert_called_once_with(
+        "backup_info_accessed",
+        "Boltzd backup information was retrieved (includes swap mnemonic)",
+    )

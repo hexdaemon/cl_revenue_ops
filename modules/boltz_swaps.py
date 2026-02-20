@@ -1893,3 +1893,91 @@ class BoltzSwapManager:
             "invoice.settled",
             "transaction.claimed",
         )
+
+    # ── Backup & recovery ───────────────────────────────────────────
+
+    def get_backup_info(self) -> Dict[str, Any]:
+        """Retrieve boltzd backup information.
+
+        Returns swap mnemonic, wallet list, pending swaps, and node identity.
+        Wallet BIP39 credentials require manual interactive backup.
+        """
+        result: Dict[str, Any] = {}
+
+        # 1. Swap mnemonic (raw text, no --json support)
+        try:
+            mnemonic = self._run_boltzcli_raw("swapmnemonic", "get").strip()
+            result["swap_mnemonic"] = mnemonic
+        except Exception as e:
+            result["swap_mnemonic"] = None
+            result["swap_mnemonic_error"] = str(e)
+
+        # 2. Wallet list with balances
+        try:
+            result["wallets"] = self._run_boltzcli("wallet", "list")
+        except Exception as e:
+            result["wallets"] = {"error": str(e)}
+
+        # 3. Pending swaps (at-risk if DB lost)
+        try:
+            swaps = self._run_boltzcli("listswaps")
+            pending = []
+            for s in swaps.get("allSwaps", []):
+                state = s.get("state", "").lower()
+                if state not in ("successful", "refunded", "cancelled"):
+                    pending.append({
+                        "id": s.get("id"),
+                        "type": s.get("type"),
+                        "state": s.get("state"),
+                        "amount": s.get("expectedAmount") or s.get("onchainAmount"),
+                        "currency": s.get("pair", {}).get("to") or s.get("pair", {}).get("from"),
+                    })
+            result["pending_swaps"] = pending
+            result["pending_swap_count"] = len(pending)
+        except Exception as e:
+            result["pending_swaps"] = []
+            result["pending_swap_error"] = str(e)
+
+        # 4. Node identity (for context)
+        try:
+            result["boltzd_info"] = self._run_boltzcli("getinfo")
+        except Exception as e:
+            result["boltzd_info"] = {"error": str(e)}
+
+        # 5. Manual backup reminder
+        wallet_names = []
+        for w in result.get("wallets", {}).get("wallets", []):
+            wallet_names.append(w.get("name", "unknown"))
+        result["manual_backup_required"] = {
+            "description": "BIP39 wallet credentials must be backed up interactively",
+            "command": [f"boltzcli wallet credentials {n}" for n in wallet_names],
+        }
+
+        self._record_audit_event(
+            "backup_info_accessed",
+            "Boltzd backup information was retrieved (includes swap mnemonic)",
+        )
+
+        return result
+
+    def verify_backup(self, swap_mnemonic: str) -> Dict[str, Any]:
+        """Verify a backup swap mnemonic matches the current one.
+
+        Read-only check — does NOT modify the current mnemonic.
+        """
+        if not swap_mnemonic or not isinstance(swap_mnemonic, str):
+            return {"verified": False, "error": "swap_mnemonic is required"}
+
+        try:
+            current = self._run_boltzcli_raw("swapmnemonic", "get").strip()
+        except Exception as e:
+            return {"verified": False, "error": f"Could not retrieve current mnemonic: {e}"}
+
+        match = swap_mnemonic.strip() == current
+
+        self._record_audit_event(
+            "backup_verified",
+            f"Swap mnemonic backup verification: {'MATCH' if match else 'MISMATCH'}",
+        )
+
+        return {"verified": True, "match": match}

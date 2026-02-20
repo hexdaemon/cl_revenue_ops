@@ -3660,6 +3660,37 @@ def revenue_boltz_deposit(plugin: Plugin, currency: str = "lbtc") -> Dict[str, A
         return {"error": str(e)}
 
 
+@plugin.method("revenue-boltz-backup")
+def revenue_boltz_backup(plugin: Plugin) -> Dict[str, Any]:
+    """Retrieve boltzd backup info: swap mnemonic, wallet list, pending swaps.
+
+    WARNING: Response contains the swap mnemonic in plaintext.
+    Wallet BIP39 credentials require manual interactive backup via boltzcli.
+    """
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.get_backup_info()
+    except Exception as e:
+        plugin.log(f"Boltz backup error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-backup-verify")
+def revenue_boltz_backup_verify(plugin: Plugin, swap_mnemonic: str) -> Dict[str, Any]:
+    """Verify a swap mnemonic backup matches the current boltzd mnemonic.
+
+    Read-only. Does not modify the current mnemonic.
+    """
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.verify_backup(swap_mnemonic)
+    except Exception as e:
+        plugin.log(f"Boltz backup verify error: {e}", level='error')
+        return {"error": str(e)}
+
+
 @plugin.method("revenue-cleanup-closed")
 def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
     """
