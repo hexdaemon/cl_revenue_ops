@@ -284,7 +284,7 @@ class RpcBroker:
     def __init__(self, socket_path: str, plugin_instance: Plugin, pool_size: int = 3):
         self.socket_path = socket_path
         self._plugin = plugin_instance
-        self._pool_size = max(1, min(pool_size, 8))
+        self._pool_size = max(1, min(pool_size, 16))
 
         # Use spawn for safety (avoid forking a process after threads have started).
         self._ctx = multiprocessing.get_context("spawn")
@@ -429,7 +429,7 @@ class RpcBroker:
             # Last-resort stall detection: if no response has been produced
             # in 3× the configured timeout AND there are pending requests,
             # the entire pool may be wedged — restart it.
-            timeout = 15
+            timeout = 30
             if config:
                 timeout = config.rpc_timeout_seconds
             stall_threshold = timeout * 3
@@ -684,7 +684,7 @@ class ThreadSafeRpcProxy:
             raise RPCBreakerOpen(group, until)
 
         # 2. Timeouts from config
-        timeout = 15
+        timeout = 30
         breaker_window = 60
         if config:
             timeout = config.rpc_timeout_seconds

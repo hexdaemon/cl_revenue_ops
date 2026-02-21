@@ -161,7 +161,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_min_profit_ppm': (0, 100000),
     'rpc_timeout_seconds': (1, 300),
     'rpc_circuit_breaker_seconds': (0, 3600),
-    'rpc_pool_size': (1, 8),
+    'rpc_pool_size': (1, 16),
     'reservation_timeout_hours': (1, 24),
     # Issue #28: Revenue rate smoothing
     'ema_smoothing_alpha': (0.1, 0.9),
@@ -277,9 +277,9 @@ class Config:
                                                # Default 30% of 24h revenue
     
     # Phase 1: Operational Hardening
-    rpc_timeout_seconds: int = 15
+    rpc_timeout_seconds: int = 30
     rpc_circuit_breaker_seconds: int = 60
-    rpc_pool_size: int = 5             # Number of RPC worker processes (Phase 2)
+    rpc_pool_size: int = 8             # Number of RPC worker processes (Phase 2)
     reservation_timeout_hours: int = 4  # Hours before stale budget reservations auto-release
     
     # HTLC Congestion threshold
