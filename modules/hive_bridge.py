@@ -221,10 +221,15 @@ class HiveFeeIntelligenceBridge:
                     self._availability_check_time = now
                     return False
 
-                # Plugin is loaded - now check if we're actually a hive member
-                # This enables hive mode only when we have membership status
+                # Plugin is loaded - now check if we're actually a hive member.
+                # Use a short timeout (3s) and call the broker directly so a
+                # slow cl-hive init doesn't burn 15s AND doesn't trip the hive
+                # group breaker.  This is a health probe, not a production call.
                 try:
-                    status = self.plugin.rpc.call("hive-status")
+                    rpc_proxy = self.plugin.rpc
+                    status = rpc_proxy._broker.request(
+                        kind="call", method="hive-status", timeout=3,
+                    )
                     tier = status.get("membership", {}).get("tier")
 
                     # Only activate hive mode if we're a member or neophyte
