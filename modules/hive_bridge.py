@@ -207,61 +207,38 @@ class HiveFeeIntelligenceBridge:
                     (now - self._availability_check_time) < self._availability_ttl):
                 return self._hive_available
 
-            # Run the probe in a disposable daemon thread with its own RPC
-            # connection so we NEVER consume pool workers.  If cl-hive's
-            # init is stuck, the thread stays parked (harmless daemon)
-            # instead of permanently removing a pool worker.
-            result: Dict[str, Any] = {}
+            # Check plugin list first (via pool — works during and after init)
+            try:
+                plugins = self.plugin.rpc.plugin("list")
+                hive_loaded = False
+                for p in plugins.get("plugins", []):
+                    if "cl-hive" in p.get("name", "") and p.get("active", False):
+                        hive_loaded = True
+                        break
 
-            def _probe():
-                try:
-                    from pyln.client import LightningRpc
-                    socket_path = self.plugin.rpc._broker.socket_path
-                    rpc = LightningRpc(socket_path)
+                if not hive_loaded:
+                    self._hive_available = False
+                    self._availability_check_time = now
+                    return False
 
-                    plugins = rpc.plugin("list")
-                    hive_loaded = any(
-                        "cl-hive" in p.get("name", "") and p.get("active", False)
-                        for p in plugins.get("plugins", [])
-                    )
-                    if not hive_loaded:
-                        result["available"] = False
-                        return
+                # cl-hive is loaded and active — assume available.
+                # We intentionally do NOT call hive-status here because:
+                # 1. During init: CLN blocks plugin-to-plugin RPCs
+                # 2. After init: queued hive-status requests can exhaust
+                #    cl-hive's RPC_LOCK, deadlocking it
+                # Instead, we trust the plugin list. If cl-hive is active
+                # but we're not a member, hive RPC calls will fail
+                # gracefully via the circuit breaker in production code.
+                self._hive_available = True
+                self._availability_check_time = now
+                self._log("Hive available: cl-hive plugin active")
+                return True
 
-                    status = rpc.call("hive-status")
-                    tier = status.get("membership", {}).get("tier")
-                    result["tier"] = tier
-                    result["available"] = tier in ("member", "neophyte", "admin")
-                except Exception as e:
-                    result["error"] = str(e)
-
-            probe_thread = threading.Thread(target=_probe, daemon=True)
-            probe_thread.start()
-            probe_thread.join(timeout=3.0)
-
-            if probe_thread.is_alive():
-                # Probe hung (cl-hive init not finished) — abandon it
-                self._log("hive-status probe timed out (3s)", level="debug")
+            except Exception as e:
+                self._log(f"Error checking cl-hive availability: {e}", level="warn")
                 self._hive_available = False
-                self._availability_check_time = now - (self._availability_ttl - 10)
+                self._availability_check_time = now - (self._availability_ttl - 5)
                 return False
-
-            if "error" in result:
-                self._log(f"hive probe failed: {result['error']}", level="debug")
-                self._hive_available = False
-                self._availability_check_time = now - (self._availability_ttl - 10)
-                return False
-
-            available = result.get("available", False)
-            self._hive_available = available
-            self._availability_check_time = now
-            if available:
-                self._log(f"Hive mode active: tier={result.get('tier')}")
-            else:
-                tier = result.get("tier")
-                if tier is not None:
-                    self._log(f"cl-hive loaded but not a member (tier={tier})")
-            return available
         finally:
             self._availability_lock.release()
 

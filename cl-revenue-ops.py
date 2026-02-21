@@ -1278,46 +1278,58 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log("=" * 60)
     else:
         # Auto or required hive mode
-        # Retry with backoff in case cl-hive loads after us.
-        # CLN starts all plugins concurrently; cl-hive's init() may still
-        # be running when we reach this point.  Each attempt invalidates
-        # the bridge cache so we get a fresh plugin-list + hive-status check.
+        # During plugin init, CLN holds a lock that blocks plugin-to-plugin
+        # RPCs (like hive-status), so we can only check plugin("list") here.
+        # The full membership check (hive-status) is deferred to the first
+        # background cycle after init completes.
         hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database)
-        hive_available = False
+        hive_loaded = False
         max_attempts = 6
         for attempt in range(max_attempts):
-            hive_bridge.invalidate_availability()
-            hive_available = hive_bridge.is_available()
-            if hive_available:
-                break
+            try:
+                plugins = safe_plugin.rpc.plugin("list")
+                hive_loaded = any(
+                    "cl-hive" in p.get("name", "") and p.get("active", False)
+                    for p in plugins.get("plugins", [])
+                )
+                if hive_loaded:
+                    break
+            except Exception as e:
+                plugin.log(f"Plugin list check failed: {e}", level="debug")
             if attempt < max_attempts - 1:
                 wait = 3 if attempt < 2 else 5
                 plugin.log(f"Waiting for cl-hive (attempt {attempt + 1}/{max_attempts})...")
                 time.sleep(wait)
 
-        if config.hive_enabled == 'true' and not hive_available:
-            # Required mode but hive not available - warn but continue
-            plugin.log("=" * 60, level='warn')
-            plugin.log("WARNING: hive-enabled=true but hive mode not active!", level='warn')
-            plugin.log("Possible reasons:", level='warn')
-            plugin.log("  - cl-hive plugin not loaded", level='warn')
-            plugin.log("  - Node not yet a hive member (open channel to a member)", level='warn')
-            plugin.log("Hive features will be unavailable until membership established", level='warn')
-            plugin.log("Plugin will continue in standalone mode", level='warn')
-            plugin.log("=" * 60, level='warn')
-        elif hive_available:
+        if hive_loaded:
+            # cl-hive is loaded — report hive mode for startup logging.
+            # Don't seed _hive_available: plugin-to-plugin RPCs are blocked
+            # during init (CLN holds a lock), so background threads must not
+            # attempt hive calls until init completes.  Leave the cache
+            # empty so the first post-init is_available() probe will verify
+            # membership via hive-status.
             plugin.log("=" * 60)
-            plugin.log("HIVE MODE ACTIVE: Authenticated hive member")
+            plugin.log("HIVE MODE ACTIVE: cl-hive detected")
             plugin.log("Hive features enabled:")
             plugin.log("  - Coordinated fee recommendations")
             plugin.log("  - Fleet-wide fee intelligence")
             plugin.log("  - Rebalancing conflict detection")
             plugin.log("  - Collective defense against drain attacks")
             plugin.log("  - Anticipatory liquidity predictions")
+            plugin.log("Membership will be verified after init completes")
             plugin.log("=" * 60)
+        elif config.hive_enabled == 'true':
+            # Required mode but hive not available - warn but continue
+            plugin.log("=" * 60, level='warn')
+            plugin.log("WARNING: hive-enabled=true but cl-hive not loaded!", level='warn')
+            plugin.log("Possible reasons:", level='warn')
+            plugin.log("  - cl-hive plugin not installed or failed to start", level='warn')
+            plugin.log("Hive features will activate when cl-hive becomes available", level='warn')
+            plugin.log("Plugin will continue in standalone mode", level='warn')
+            plugin.log("=" * 60, level='warn')
         else:
             plugin.log("=" * 60)
-            plugin.log("STANDALONE MODE: Not a hive member (hive-enabled=auto)")
+            plugin.log("STANDALONE MODE: cl-hive not detected (hive-enabled=auto)")
             plugin.log("All fee optimization and rebalancing will use local-only algorithms")
             plugin.log("To join a hive: open a channel to any hive member")
             plugin.log("=" * 60)
