@@ -151,11 +151,16 @@ class HiveFeeIntelligenceBridge:
         self._availability_check_time: float = 0
         self._availability_ttl: float = 60.0  # Re-check every 60 seconds
         self._availability_lock = threading.Lock()  # Prevent stampede on cache refresh
+        self._init_complete = True  # Gate: False during plugin init, set True after
 
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
             self.plugin.log(f"HIVE_BRIDGE: {message}", level=level)
+
+    def mark_init_complete(self) -> None:
+        """Signal that plugin init has finished and hive calls are safe."""
+        self._init_complete = True
 
     # =========================================================================
     # AVAILABILITY CHECK
@@ -175,6 +180,11 @@ class HiveFeeIntelligenceBridge:
             True if cl-hive is active AND we are a member/neophyte, False otherwise
         """
         now = time.time()
+
+        # Block all hive calls until plugin init completes — CLN holds a
+        # lock during plugin start that blocks plugin-to-plugin RPCs.
+        if not self._init_complete:
+            return False
 
         # Quick check: if hive RPC breaker is tripped, don't waste a worker
         try:
