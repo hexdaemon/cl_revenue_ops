@@ -186,17 +186,7 @@ class HiveFeeIntelligenceBridge:
         if not self._init_complete:
             return False
 
-        # Quick check: if hive RPC breaker is tripped, don't waste a worker
-        try:
-            rpc_proxy = self.plugin.rpc
-            if hasattr(rpc_proxy, '_breakers'):
-                until = rpc_proxy._breakers.get("hive", 0)
-                if until > now:
-                    return self._hive_available if self._hive_available is not None else False
-        except Exception:
-            pass
-
-        # Also short-circuit if our own bridge circuit breaker is open
+        # Short-circuit if our own bridge circuit breaker is open
         if self._is_circuit_open():
             return self._hive_available if self._hive_available is not None else False
 
@@ -262,14 +252,6 @@ class HiveFeeIntelligenceBridge:
         """
         self._hive_available = None
         self._availability_check_time = 0
-        # Clear the hive group breaker so the next is_available() can make
-        # real RPC calls instead of hitting the short-circuit.
-        try:
-            rpc_proxy = self.plugin.rpc
-            if hasattr(rpc_proxy, '_breakers'):
-                rpc_proxy._breakers.pop("hive", None)
-        except Exception:
-            pass
 
     # =========================================================================
     # CIRCUIT BREAKER
