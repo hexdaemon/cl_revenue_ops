@@ -277,7 +277,7 @@ class RpcBroker:
     - N worker processes share one request queue and one response queue
     - A dispatcher thread in the main process routes responses to per-request Events
     - No call lock: callers block only on their own Event, not on each other
-    - On timeout: clean up the pending slot, restart entire pool, raise TimeoutError
+    - On timeout: clean up the pending slot, raise TimeoutError (pool preserved)
     - Dead workers are auto-respawned by the dispatcher's health check
     """
 
@@ -302,6 +302,7 @@ class RpcBroker:
 
         self._lifecycle_lock = threading.Lock()
         self._last_restart_time = 0.0
+        self._last_pool_activity = time.time()  # Track when pool last produced a response
 
         self.start()
 
@@ -382,6 +383,7 @@ class RpcBroker:
                 resp = None
 
             if resp is not None:
+                self._last_pool_activity = time.time()
                 req_id = resp.get("id")
                 if req_id:
                     with self._pending_lock:
@@ -397,14 +399,17 @@ class RpcBroker:
                 self._check_worker_health()
 
     def _check_worker_health(self):
-        """Respawn any dead worker processes."""
+        """Respawn dead workers; restart pool only if completely stalled."""
         # Non-blocking acquire: avoids deadlock when stop() holds this lock
         # while joining the dispatcher thread (which calls this method).
         if not self._lifecycle_lock.acquire(blocking=False):
             return
+        released = False
         try:
             if not self._req_q or self._dispatcher_stop.is_set():
                 return
+
+            # Respawn individually dead workers
             for i, w in enumerate(self._workers):
                 if not w.is_alive():
                     try:
@@ -420,8 +425,28 @@ class RpcBroker:
                     new_w.start()
                     self._workers[i] = new_w
                     self._plugin.log(f"RPC pool: respawned dead worker {i}", level="warn")
+
+            # Last-resort stall detection: if no response has been produced
+            # in 3× the configured timeout AND there are pending requests,
+            # the entire pool may be wedged — restart it.
+            timeout = 15
+            if config:
+                timeout = config.rpc_timeout_seconds
+            stall_threshold = timeout * 3
+            with self._pending_lock:
+                has_pending = len(self._pending) > 0
+            if has_pending and (time.time() - self._last_pool_activity) > stall_threshold:
+                self._plugin.log(
+                    f"RPC pool stall detected: no response in {stall_threshold}s with pending requests",
+                    level="warn",
+                )
+                # Release lifecycle lock before restart (which acquires it)
+                self._lifecycle_lock.release()
+                released = True
+                self.restart("pool stall detected")
         finally:
-            self._lifecycle_lock.release()
+            if not released:
+                self._lifecycle_lock.release()
 
     def start(self):
         with self._lifecycle_lock:
@@ -539,9 +564,15 @@ class RpcBroker:
                 self.restart(f"queue error on {method}")
                 raise TimeoutError(f"RPC pool queue error on {method}")
 
-            # Block only this caller until its response arrives
+            # Block only this caller until its response arrives.
+            # On timeout: abandon this request (pending slot cleaned up in finally)
+            # but do NOT restart the pool — that kills every in-flight request.
+            # The stall detector in _check_worker_health() handles truly wedged pools.
             if not slot["event"].wait(timeout=timeout):
-                self.restart(f"timeout waiting for RPC response ({timeout}s) on {method}")
+                self._plugin.log(
+                    f"RPC timeout after {timeout}s on {method} (request abandoned, pool preserved)",
+                    level="info",
+                )
                 raise TimeoutError(f"RPC pool timeout on {method}")
 
             resp = slot["resp"]
