@@ -608,10 +608,16 @@ class ThreadSafeRpcProxy:
     - Broker restart on timeout (guarantees forward progress)
     """
 
+    # Number of consecutive timeouts required before tripping the circuit breaker.
+    # A single timeout is transient (slow cycle, large gossip sync); only sustained
+    # failure should block the entire group.
+    BREAKER_TRIP_THRESHOLD = 3
+
     def __init__(self, broker: RpcBroker, plugin_instance: Plugin):
         self._broker = broker
         self._plugin = plugin_instance
         self._breakers: Dict[str, float] = {}
+        self._breaker_failures: Dict[str, int] = {}   # consecutive timeout count per group
         self._log_history: Dict[Tuple[str, str], float] = {}
 
     def _get_group(self, method_name: str) -> str:
@@ -647,8 +653,8 @@ class ThreadSafeRpcProxy:
 
     def __getattr__(self, name):
         # Internal attribute access
-        if name in ("_broker", "_plugin", "_breakers", "_log_history",
-                    "call", "_get_group", "_should_log"):
+        if name in ("_broker", "_plugin", "_breakers", "_breaker_failures",
+                    "_log_history", "call", "_get_group", "_should_log"):
             return super().__getattribute__(name)
 
         # Expose a callable wrapper matching pyln-client's LightningRpc style.
@@ -689,30 +695,45 @@ class ThreadSafeRpcProxy:
             # rpc.plugin("list") or rpc.listforwards(status="settled").
             if isinstance(payload, list) or (payload is None and kwargs):
                 args = payload if isinstance(payload, list) else []
-                return self._broker.request(
+                result = self._broker.request(
                     kind="attr",
                     method=method_name,
                     args=args,
                     kwargs=kwargs,
                     timeout=timeout,
                 )
+            else:
+                # Otherwise treat it as generic rpc.call(method, payload_dict).
+                result = self._broker.request(
+                    kind="call",
+                    method=method_name,
+                    payload={} if payload is None else payload,
+                    timeout=timeout,
+                )
 
-            # Otherwise treat it as generic rpc.call(method, payload_dict).
-            return self._broker.request(
-                kind="call",
-                method=method_name,
-                payload={} if payload is None else payload,
-                timeout=timeout,
-            )
+            # Success — reset consecutive failure count for this group
+            if group in self._breaker_failures:
+                del self._breaker_failures[group]
+            return result
 
         except TimeoutError:
-            # Trip breaker on timeout and surface RPCTimeoutError
-            self._breakers[group] = time.time() + breaker_window
-            self._plugin.log(
-                f"RPC TIMEOUT after {timeout}s on {method_name}. "
-                f"Group '{group}' breaker tripped for {breaker_window}s.",
-                level="warn",
-            )
+            # Count consecutive timeouts — only trip breaker after threshold
+            count = self._breaker_failures.get(group, 0) + 1
+            self._breaker_failures[group] = count
+            if count >= self.BREAKER_TRIP_THRESHOLD:
+                self._breakers[group] = time.time() + breaker_window
+                self._breaker_failures[group] = 0
+                self._plugin.log(
+                    f"RPC TIMEOUT after {timeout}s on {method_name} "
+                    f"({count} consecutive). Group '{group}' breaker tripped for {breaker_window}s.",
+                    level="warn",
+                )
+            else:
+                self._plugin.log(
+                    f"RPC TIMEOUT after {timeout}s on {method_name} "
+                    f"({count}/{self.BREAKER_TRIP_THRESHOLD} before breaker trips).",
+                    level="info",
+                )
             raise RPCTimeoutError(method_name)
         except RpcError:
             raise
@@ -1282,6 +1303,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # RPCs (like hive-status), so we can only check plugin("list") here.
         # Membership is verified lazily by background threads after init.
         hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database)
+        hive_bridge._init_complete = False  # Block hive calls until init finishes
         hive_loaded = False
         max_attempts = 6
         for attempt in range(max_attempts):
@@ -1690,6 +1712,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=swap_monitor_loop, daemon=True, name="swap-monitor").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
+
+    # Signal that init is complete — hive bridge can now make plugin-to-plugin
+    # RPCs safely (CLN releases its lock after init returns).
+    if hive_bridge:
+        hive_bridge.mark_init_complete()
 
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None
