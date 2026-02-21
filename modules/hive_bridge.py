@@ -259,9 +259,23 @@ class HiveFeeIntelligenceBridge:
             self._availability_lock.release()
 
     def invalidate_availability(self) -> None:
-        """Force a fresh availability check on next is_available() call."""
+        """Force a fresh availability check on next is_available() call.
+
+        Also clears the hive RPC breaker so the retry actually reaches CLN
+        instead of being short-circuited.  This is safe because invalidate is
+        only called when we *want* a fresh probe (startup retries, explicit
+        reset) — not on every call.
+        """
         self._hive_available = None
         self._availability_check_time = 0
+        # Clear the hive group breaker so the next is_available() can make
+        # real RPC calls instead of hitting the short-circuit.
+        try:
+            rpc_proxy = self.plugin.rpc
+            if hasattr(rpc_proxy, '_breakers'):
+                rpc_proxy._breakers.pop("hive", None)
+        except Exception:
+            pass
 
     # =========================================================================
     # CIRCUIT BREAKER
