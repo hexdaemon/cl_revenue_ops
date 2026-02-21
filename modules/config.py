@@ -279,7 +279,7 @@ class Config:
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int = 15
     rpc_circuit_breaker_seconds: int = 60
-    rpc_pool_size: int = 3             # Number of RPC worker processes (Phase 2)
+    rpc_pool_size: int = 5             # Number of RPC worker processes (Phase 2)
     reservation_timeout_hours: int = 4  # Hours before stale budget reservations auto-release
     
     # HTLC Congestion threshold

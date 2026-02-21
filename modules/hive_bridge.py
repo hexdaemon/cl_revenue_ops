@@ -50,6 +50,7 @@ Yield Metrics:
 Author: Lightning Goats Team
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -149,6 +150,7 @@ class HiveFeeIntelligenceBridge:
         self._hive_available: Optional[bool] = None
         self._availability_check_time: float = 0
         self._availability_ttl: float = 60.0  # Re-check every 60 seconds
+        self._availability_lock = threading.Lock()  # Prevent stampede on cache refresh
 
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
@@ -166,64 +168,95 @@ class HiveFeeIntelligenceBridge:
         Returns cached result if within TTL to avoid expensive RPC calls.
         Membership is verified by checking our tier via hive-status RPC.
 
+        Uses a non-blocking lock to prevent multiple threads from refreshing
+        the cache simultaneously (stampede prevention).
+
         Returns:
             True if cl-hive is active AND we are a member/neophyte, False otherwise
         """
         now = time.time()
+
+        # Quick check: if hive RPC breaker is tripped, don't waste a worker
+        try:
+            rpc_proxy = self.plugin.rpc
+            if hasattr(rpc_proxy, '_breakers'):
+                until = rpc_proxy._breakers.get("hive", 0)
+                if until > now:
+                    return self._hive_available if self._hive_available is not None else False
+        except Exception:
+            pass
+
+        # Also short-circuit if our own bridge circuit breaker is open
+        if self._is_circuit_open():
+            return self._hive_available if self._hive_available is not None else False
 
         # Return cached result if within TTL
         if (self._hive_available is not None and
                 (now - self._availability_check_time) < self._availability_ttl):
             return self._hive_available
 
-        # Check plugin list first
+        # Cache expired — try to acquire the refresh lock (non-blocking)
+        if not self._availability_lock.acquire(blocking=False):
+            # Another thread is already refreshing; return stale cached value
+            return self._hive_available if self._hive_available is not None else False
+
         try:
-            plugins = self.plugin.rpc.plugin("list")
-            hive_loaded = False
-            for p in plugins.get("plugins", []):
-                if "cl-hive" in p.get("name", "") and p.get("active", False):
-                    hive_loaded = True
-                    break
+            # Double-check cache inside lock (another thread may have just refreshed)
+            now = time.time()
+            if (self._hive_available is not None and
+                    (now - self._availability_check_time) < self._availability_ttl):
+                return self._hive_available
 
-            if not hive_loaded:
-                self._hive_available = False
-                self._availability_check_time = now
-                return False
-
-            # Plugin is loaded - now check if we're actually a hive member
-            # This enables hive mode only when we have membership status
+            # Check plugin list first
             try:
-                status = self.plugin.rpc.call("hive-status")
-                tier = status.get("membership", {}).get("tier")
+                plugins = self.plugin.rpc.plugin("list")
+                hive_loaded = False
+                for p in plugins.get("plugins", []):
+                    if "cl-hive" in p.get("name", "") and p.get("active", False):
+                        hive_loaded = True
+                        break
 
-                # Only activate hive mode if we're a member or neophyte
-                # Note: Admin tier was removed in permissionless join update
-                # but we still accept it for backward compatibility with existing DBs
-                if tier in ["member", "neophyte", "admin"]:
-                    self._hive_available = True
-                    self._availability_check_time = now
-                    self._log(f"Hive mode active: tier={tier}")
-                    return True
-                else:
-                    # cl-hive is loaded but we're not a member yet
+                if not hive_loaded:
                     self._hive_available = False
                     self._availability_check_time = now
-                    self._log(f"cl-hive loaded but not a member (tier={tier})")
+                    return False
+
+                # Plugin is loaded - now check if we're actually a hive member
+                # This enables hive mode only when we have membership status
+                try:
+                    status = self.plugin.rpc.call("hive-status")
+                    tier = status.get("membership", {}).get("tier")
+
+                    # Only activate hive mode if we're a member or neophyte
+                    # Note: Admin tier was removed in permissionless join update
+                    # but we still accept it for backward compatibility with existing DBs
+                    if tier in ["member", "neophyte", "admin"]:
+                        self._hive_available = True
+                        self._availability_check_time = now
+                        self._log(f"Hive mode active: tier={tier}")
+                        return True
+                    else:
+                        # cl-hive is loaded but we're not a member yet
+                        self._hive_available = False
+                        self._availability_check_time = now
+                        self._log(f"cl-hive loaded but not a member (tier={tier})")
+                        return False
+
+                except Exception as e:
+                    # hive-status RPC failed - cl-hive might be starting up
+                    self._log(f"hive-status check failed: {e}", level="debug")
+                    self._hive_available = False
+                    self._availability_check_time = now - (self._availability_ttl - 10)
                     return False
 
             except Exception as e:
-                # hive-status RPC failed - cl-hive might be starting up
-                self._log(f"hive-status check failed: {e}", level="debug")
+                self._log(f"Error checking cl-hive availability: {e}", level="warn")
+                # Cache negative result with shorter TTL
                 self._hive_available = False
-                self._availability_check_time = now - (self._availability_ttl - 10)
+                self._availability_check_time = now - (self._availability_ttl - 5)
                 return False
-
-        except Exception as e:
-            self._log(f"Error checking cl-hive availability: {e}", level="warn")
-            # Cache negative result with shorter TTL
-            self._hive_available = False
-            self._availability_check_time = now - (self._availability_ttl - 5)
-            return False
+        finally:
+            self._availability_lock.release()
 
     def invalidate_availability(self) -> None:
         """Force a fresh availability check on next is_available() call."""
